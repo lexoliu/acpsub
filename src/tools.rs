@@ -856,16 +856,15 @@ impl Tool for ForgetTool {
         if let Some(sub) = &sub {
             close_sub(sub).await;
         }
-        let registered = self
-            .0
-            .registry
-            .lock()
-            .expect("registry poisoned")
-            .remove(&args.name);
+        let mut registered = false;
+        self.0
+            .update_registry(|registry| {
+                registered = registry.remove(&args.name);
+            })
+            .await?;
         if sub.is_none() && !registered {
             return Err(Error::UnknownSubagent(args.name).into());
         }
-        self.0.save_registry().await?;
         Ok(json!({"name": args.name, "forgotten": true}))
     }
 }

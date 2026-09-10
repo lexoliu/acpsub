@@ -1,7 +1,7 @@
 //! The subagent model: per-subagent runtime state, the shared app state, and
 //! the spawn/turn machinery.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,8 +37,14 @@ pub struct AppState {
     pub config: Config,
     /// Live subagents by name.
     pub live: Mutex<HashMap<String, Arc<Subagent>>>,
+    /// Names reserved by an in-flight `spawn`, before the subagent is live.
+    /// Locked after `live` wherever both are held.
+    pub reserved: Mutex<HashSet<String>>,
     /// The persisted name → session registry.
     pub registry: Mutex<Registry>,
+    /// Serializes registry mutations with their `persist` so the file can
+    /// never be overwritten by an older snapshot out of order.
+    pub registry_write: tokio::sync::Mutex<()>,
     /// Path of the registry file (`config.defaults.registry`).
     pub registry_path: PathBuf,
 }
@@ -58,7 +64,9 @@ impl AppState {
         Ok(Arc::new(Self {
             config,
             live: Mutex::new(HashMap::new()),
+            reserved: Mutex::new(HashSet::new()),
             registry: Mutex::new(Registry::load(&registry_path)?),
+            registry_write: tokio::sync::Mutex::new(()),
             registry_path,
         }))
     }
@@ -81,7 +89,11 @@ impl AppState {
             .ok_or_else(|| Error::UnknownSubagent(name.to_string()))
     }
 
-    /// Write the current registry to disk.
+    /// Mutate the registry, then persist the result.
+    ///
+    /// `registry_write` is held across both steps, so concurrent tool calls
+    /// can interleave freely without an older snapshot landing on disk after
+    /// a newer one.
     ///
     /// # Errors
     ///
@@ -90,12 +102,13 @@ impl AppState {
     /// # Panics
     ///
     /// Panics if the registry mutex is poisoned.
-    pub async fn save_registry(&self) -> Result<()> {
-        let snapshot = self
-            .registry
-            .lock()
-            .expect("registry poisoned")
-            .snapshot()?;
+    pub async fn update_registry(&self, mutate: impl FnOnce(&mut Registry)) -> Result<()> {
+        let _write = self.registry_write.lock().await;
+        let snapshot = {
+            let mut registry = self.registry.lock().expect("registry poisoned");
+            mutate(&mut registry);
+            registry.snapshot()
+        }?;
         persist(&self.registry_path, snapshot).await
     }
 }
@@ -343,6 +356,27 @@ pub struct Launch {
 /// Panics if a state mutex is poisoned.
 pub async fn launch(state: &Arc<AppState>, args: Launch) -> Result<Arc<Subagent>> {
     let (agent_cfg, cwd, prior) = preflight(state, &args)?;
+    // `preflight` reserved the name; release the reservation on any failure.
+    let result = launch_reserved(state, &args, agent_cfg, cwd, prior).await;
+    if result.is_err() {
+        state
+            .reserved
+            .lock()
+            .expect("reserved poisoned")
+            .remove(&args.name);
+    }
+    result
+}
+
+/// Everything `launch` does once the name is reserved: open the transcript,
+/// spawn the process, run the handshake, go live, start the first turn.
+async fn launch_reserved(
+    state: &Arc<AppState>,
+    args: &Launch,
+    agent_cfg: AgentConfig,
+    cwd: PathBuf,
+    prior: Option<RegistryEntry>,
+) -> Result<Arc<Subagent>> {
     let permission = args
         .permission
         .or(agent_cfg.permission)
@@ -389,7 +423,7 @@ pub async fn launch(state: &Arc<AppState>, args: Launch) -> Result<Arc<Subagent>
         connect(&agent_cfg, &cwd, handler, rt.clone(), args.name.clone())?;
 
     // On any handshake failure, kill the child before returning the error.
-    let result = handshake(state, &client, &rt, &args, &agent_cfg, prior).await;
+    let result = handshake(state, &client, &rt, args, &agent_cfg, prior).await;
     if let Err(error) = result {
         rt.closing.store(true, Ordering::Relaxed);
         client.close();
@@ -409,12 +443,19 @@ pub async fn launch(state: &Arc<AppState>, args: Launch) -> Result<Arc<Subagent>
         stderr_pump: Mutex::new(Some(stderr_pump)),
         rt,
     });
+    // Once the name is in `live`, `preflight` reports it taken even before
+    // the reservation is released — order matters.
     state
         .live
         .lock()
         .expect("live poisoned")
         .insert(args.name.clone(), sub.clone());
-    if let Err(error) = start_turn(state.clone(), &sub, args.prompt).await {
+    state
+        .reserved
+        .lock()
+        .expect("reserved poisoned")
+        .remove(&args.name);
+    if let Err(error) = start_turn(state.clone(), &sub, args.prompt.clone()).await {
         state.live.lock().expect("live poisoned").remove(&args.name);
         return Err(error);
     }
@@ -443,13 +484,15 @@ fn preflight(
     let cwd = args.cwd.canonicalize().map_err(|source| {
         Error::io(format!("cannot resolve cwd {}", args.cwd.display()), source)
     })?;
-    if state
-        .live
-        .lock()
-        .expect("live poisoned")
-        .contains_key(&args.name)
+    // Claim the name atomically across the live and in-flight maps: the MCP
+    // server runs `tools/call`s concurrently, so two `spawn`s of one name can
+    // interleave between this check and `live.insert` in `launch_reserved`.
     {
-        return Err(Error::NameTaken(args.name.clone()));
+        let live = state.live.lock().expect("live poisoned");
+        let mut reserved = state.reserved.lock().expect("reserved poisoned");
+        if live.contains_key(&args.name) || !reserved.insert(args.name.clone()) {
+            return Err(Error::NameTaken(args.name.clone()));
+        }
     }
     let prior = if args.replace {
         None
@@ -587,18 +630,17 @@ async fn handshake(
     // Only a fresh session writes a new entry; a resumed one keeps its
     // `created` timestamp and turn count.
     if prior.is_none() {
-        state.registry.lock().expect("registry poisoned").insert(
-            args.name.clone(),
-            RegistryEntry {
-                agent: args.agent.clone(),
-                session_id: session_id.clone(),
-                cwd: args.cwd.clone(),
-                created: now(),
-                last_turn: None,
-                turns: 0,
-            },
-        );
-        state.save_registry().await?;
+        let entry = RegistryEntry {
+            agent: args.agent.clone(),
+            session_id: session_id.clone(),
+            cwd: args.cwd.clone(),
+            created: now(),
+            last_turn: None,
+            turns: 0,
+        };
+        state
+            .update_registry(|registry| registry.insert(args.name.clone(), entry))
+            .await?;
     }
     debug!(name = %args.name, %session_id, "subagent session established");
     Ok(())
@@ -771,17 +813,15 @@ async fn turn_task(
         let inner = rt.inner.lock().expect("inner poisoned");
         inner.turn_offset + inner.turns.len() as u64
     };
-    let snapshot = {
-        let mut registry = state.registry.lock().expect("registry poisoned");
-        if let Some(entry) = registry.get_mut(&name) {
-            entry.turns = turns;
-            entry.last_turn = Some(now());
-        }
-        registry.snapshot()
-    };
-    if let Ok(snapshot) = snapshot
-        && let Err(error) = persist(&state.registry_path, snapshot).await
-    {
+    let result = state
+        .update_registry(|registry| {
+            if let Some(entry) = registry.get_mut(&name) {
+                entry.turns = turns;
+                entry.last_turn = Some(now());
+            }
+        })
+        .await;
+    if let Err(error) = result {
         warn!(%error, "registry persist failed");
     }
     rt.notify.notify_waiters();
