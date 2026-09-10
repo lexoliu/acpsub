@@ -11,9 +11,9 @@ keywords = ["acp", "mcp", "agent", "subagent"]
 categories = ["api-bindings", "command-line-utilities"]
 
 [dependencies]
-aither-core = { git = "https://github.com/lexoliu/aither", branch = "feat/acp-client" }
-aither-mcp = { git = "https://github.com/lexoliu/aither", branch = "feat/acp-client", default-features = false, features = ["server", "client"] }
-aither-acp = { git = "https://github.com/lexoliu/aither", branch = "feat/acp-client" }
+aither-core = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-mcp = { git = "https://github.com/lexoliu/aither", branch = "dev", default-features = false, features = ["server", "client"] }
+aither-acp = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1.2"

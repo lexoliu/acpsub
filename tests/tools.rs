@@ -75,6 +75,32 @@ async fn cancel_mid_turn() {
     assert_eq!(done["stop_reason"], "cancelled");
 }
 
+/// The MCP server runs `tools/call`s concurrently: a blocked `wait` must
+/// return when a `cancel` from another call lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_returns_when_cancel_runs_concurrently() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let tools = std::sync::Arc::new(tools);
+    call_json(&tools, "spawn", spawn_args("w", dir.path(), "wait")).await;
+
+    let waiter = {
+        let tools = tools.clone();
+        tokio::spawn(async move { wait(&tools, "w", 30).await })
+    };
+    // Let the prompt reach the agent so the cancel answers it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    call_json(&tools, "cancel", json!({"name": "w"})).await;
+
+    let done = waiter.await.expect("wait task panicked");
+    assert_eq!(done["state"], "cancelled", "{done}");
+    assert_eq!(done["stop_reason"], "cancelled");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn permission_ask_then_permit() {
     if !python3() {

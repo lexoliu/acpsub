@@ -43,7 +43,7 @@ dependencies = [
 [[package]]
 name = "aither-acp"
 version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=feat%2Facp-client#84124021b7e0bfb993ecdf8b76b4303877ea022d"
+source = "git+https://github.com/lexoliu/aither?branch=dev#ae505f3c41f5d8f7ee47ddea6a360d340b48f13f"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -62,7 +62,7 @@ dependencies = [
 [[package]]
 name = "aither-agent"
 version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=feat%2Facp-client#84124021b7e0bfb993ecdf8b76b4303877ea022d"
+source = "git+https://github.com/lexoliu/aither?branch=dev#ae505f3c41f5d8f7ee47ddea6a360d340b48f13f"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -95,7 +95,7 @@ dependencies = [
 [[package]]
 name = "aither-attachments"
 version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=feat%2Facp-client#84124021b7e0bfb993ecdf8b76b4303877ea022d"
+source = "git+https://github.com/lexoliu/aither?branch=dev#ae505f3c41f5d8f7ee47ddea6a360d340b48f13f"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "aither-core"
 version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=feat%2Facp-client#84124021b7e0bfb993ecdf8b76b4303877ea022d"
+source = "git+https://github.com/lexoliu/aither?branch=dev#ae505f3c41f5d8f7ee47ddea6a360d340b48f13f"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -124,7 +124,7 @@ dependencies = [
 [[package]]
 name = "aither-derive"
 version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=feat%2Facp-client#84124021b7e0bfb993ecdf8b76b4303877ea022d"
+source = "git+https://github.com/lexoliu/aither?branch=dev#ae505f3c41f5d8f7ee47ddea6a360d340b48f13f"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro2",
@@ -135,7 +135,7 @@ dependencies = [
 [[package]]
 name = "aither-mcp"
 version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=feat%2Facp-client#84124021b7e0bfb993ecdf8b76b4303877ea022d"
+source = "git+https://github.com/lexoliu/aither?branch=dev#ae505f3c41f5d8f7ee47ddea6a360d340b48f13f"
 dependencies = [
  "aither-core",
  "aither-sandbox",
@@ -144,6 +144,7 @@ dependencies = [
  "async-process",
  "blocking",
  "futures-lite",
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -154,7 +155,7 @@ dependencies = [
 [[package]]
 name = "aither-sandbox"
 version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=feat%2Facp-client#84124021b7e0bfb993ecdf8b76b4303877ea022d"
+source = "git+https://github.com/lexoliu/aither?branch=dev#ae505f3c41f5d8f7ee47ddea6a360d340b48f13f"
 dependencies = [
  "aither-core",
  "anyhow",
