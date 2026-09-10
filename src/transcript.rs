@@ -5,7 +5,10 @@ use std::fmt::Write;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use aither_acp::{ContentBlock, SessionUpdate, ToolCallContent, ToolCallStatus, ToolKind};
+use aither_acp::{
+    ContentBlock, CurrentModeUpdate, Plan, PlanEntryStatus, SessionUpdate, ToolCall,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
@@ -114,13 +117,7 @@ pub fn render(text: &str, options: &RenderOptions) -> String {
         if let (Some(label), Some(update)) = (label, &chunk)
             && let Some(text) = chunk_text(update)
         {
-            match &mut pending {
-                Some((pending_label, buf)) if *pending_label == label => buf.push_str(&text),
-                _ => {
-                    flush(&mut pending, &mut out, options.full);
-                    pending = Some((label, text));
-                }
-            }
+            merge_chunk(label, text, &mut pending, &mut out, options.full);
             continue;
         }
         flush(&mut pending, &mut out, options.full);
@@ -128,6 +125,24 @@ pub fn render(text: &str, options: &RenderOptions) -> String {
     }
     flush(&mut pending, &mut out, options.full);
     out
+}
+
+/// Merge one chunk's text into the pending merged section, starting a new
+/// section when the chunk kind changed.
+fn merge_chunk(
+    label: &'static str,
+    text: String,
+    pending: &mut Option<(&'static str, String)>,
+    out: &mut String,
+    full: bool,
+) {
+    match pending {
+        Some((pending_label, buf)) if *pending_label == label => buf.push_str(&text),
+        _ => {
+            flush(pending, out, full);
+            *pending = Some((label, text));
+        }
+    }
 }
 
 /// Emit a pending merged chunk section.
@@ -153,119 +168,145 @@ fn chunk_text(update: &SessionUpdate) -> Option<String> {
     }
 }
 
-/// Render one non-chunk record.
+/// Render one non-chunk record: a prompt, a turn end, or a session update.
 fn render_record(
     record: &Value,
     update: Option<&SessionUpdate>,
     out: &mut String,
     options: &RenderOptions,
 ) {
-    let turn = record.get("turn").and_then(Value::as_u64).unwrap_or(0);
     if let Some(prompt) = record.get("prompt").and_then(Value::as_str) {
-        let _ = writeln!(
-            out,
-            "=== [turn {turn}] USER\n{}",
-            clip(prompt, options.full)
-        );
+        render_user(record, prompt, out, options.full);
         return;
     }
-    if let Some(stop) = record.get("stop_reason") {
-        let reason = stop.as_str().unwrap_or("unknown");
-        let _ = writeln!(out, "=== [turn {turn}] END {reason}");
-        if let Some(error) = record.get("error").and_then(Value::as_str) {
-            let _ = writeln!(out, "    error: {}", clip(error, options.full));
-        }
+    if record.get("stop_reason").is_some() {
+        render_turn_end(record, out, options.full);
         return;
     }
     let Some(update) = update else {
         // Unparsable line or an update shape with no record structure.
-        let raw = record
-            .get("update")
-            .map_or_else(|| record.to_string(), ToString::to_string);
-        let _ = writeln!(
-            out,
-            "--- UPDATE unparsable\n    {}",
-            clip(&raw, options.full)
-        );
+        render_unparsable(record, out, options.full);
         return;
     };
     match update {
-        SessionUpdate::ToolCall(call) => {
-            let kind = call.kind.map_or("other", kind_str);
-            let status = call.status.map_or("pending", status_str);
-            let _ = writeln!(
-                out,
-                "--- CALL {kind} {} ({}) [{status}]",
-                clip(&call.title, options.full),
-                call.tool_call_id
-            );
-            for location in &call.locations {
-                match location.line {
-                    Some(line) => {
-                        let _ = writeln!(out, "    {}:{line}", location.path.display());
-                    }
-                    None => {
-                        let _ = writeln!(out, "    {}", location.path.display());
-                    }
-                }
+        SessionUpdate::ToolCall(call) => render_call(call, out, options),
+        SessionUpdate::ToolCallUpdate(call) => render_result(call, out, options),
+        SessionUpdate::Plan(plan) => render_plan(plan, out, options.full),
+        SessionUpdate::CurrentModeUpdate(mode) => render_mode(mode, out),
+        other => render_unknown(other, out, options.full),
+    }
+}
+
+/// `=== [turn n] USER` + the prompt text.
+fn render_user(record: &Value, prompt: &str, out: &mut String, full: bool) {
+    let turn = record.get("turn").and_then(Value::as_u64).unwrap_or(0);
+    let _ = writeln!(out, "=== [turn {turn}] USER\n{}", clip(prompt, full));
+}
+
+/// `=== [turn n] END <reason>` + an optional error line.
+fn render_turn_end(record: &Value, out: &mut String, full: bool) {
+    let turn = record.get("turn").and_then(Value::as_u64).unwrap_or(0);
+    let reason = record
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let _ = writeln!(out, "=== [turn {turn}] END {reason}");
+    if let Some(error) = record.get("error").and_then(Value::as_str) {
+        let _ = writeln!(out, "    error: {}", clip(error, full));
+    }
+}
+
+/// `--- UPDATE unparsable` for lines that are not valid update records.
+fn render_unparsable(record: &Value, out: &mut String, full: bool) {
+    let raw = record
+        .get("update")
+        .map_or_else(|| record.to_string(), ToString::to_string);
+    let _ = writeln!(out, "--- UPDATE unparsable\n    {}", clip(&raw, full));
+}
+
+/// `--- CALL <kind> <title> (<id>) [status]` + locations, raw input, content.
+fn render_call(call: &ToolCall, out: &mut String, options: &RenderOptions) {
+    let kind = call.kind.map_or("other", kind_str);
+    let status = call.status.map_or("pending", status_str);
+    let _ = writeln!(
+        out,
+        "--- CALL {kind} {} ({}) [{status}]",
+        clip(&call.title, options.full),
+        call.tool_call_id
+    );
+    for location in &call.locations {
+        match location.line {
+            Some(line) => {
+                let _ = writeln!(out, "    {}:{line}", location.path.display());
             }
-            if let Some(input) = &call.raw_input {
-                let _ = writeln!(out, "    input: {}", clip(&input.to_string(), options.full));
+            None => {
+                let _ = writeln!(out, "    {}", location.path.display());
             }
-            render_tool_content(&call.content, out, options);
-        }
-        SessionUpdate::ToolCallUpdate(call) => {
-            match call.status {
-                Some(status) => {
-                    let _ = writeln!(
-                        out,
-                        "--- RESULT ({}) [{}]",
-                        call.tool_call_id,
-                        status_str(status)
-                    );
-                }
-                None => {
-                    let _ = writeln!(out, "--- RESULT ({})", call.tool_call_id);
-                }
-            }
-            if let Some(content) = &call.content {
-                render_tool_content(content, out, options);
-            }
-            if let Some(output) = &call.raw_output {
-                let _ = writeln!(
-                    out,
-                    "    output: {}",
-                    clip(&output.to_string(), options.full)
-                );
-            }
-        }
-        SessionUpdate::Plan(plan) => {
-            let _ = writeln!(out, "--- PLAN");
-            for entry in &plan.entries {
-                let status = match entry.status {
-                    aither_acp::PlanEntryStatus::Pending => "pending",
-                    aither_acp::PlanEntryStatus::InProgress => "in_progress",
-                    aither_acp::PlanEntryStatus::Completed => "completed",
-                };
-                let _ = writeln!(out, "    [{status}] {}", clip(&entry.content, options.full));
-            }
-        }
-        SessionUpdate::CurrentModeUpdate(mode) => {
-            let _ = writeln!(out, "--- MODE {}", mode.current_mode_id);
-        }
-        other => {
-            let value = serde_json::to_value(other).unwrap_or_default();
-            let tag = value
-                .get("sessionUpdate")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let _ = writeln!(
-                out,
-                "--- UPDATE {tag}\n    {}",
-                clip(&value.to_string(), options.full)
-            );
         }
     }
+    if let Some(input) = &call.raw_input {
+        let _ = writeln!(out, "    input: {}", clip(&input.to_string(), options.full));
+    }
+    render_tool_content(&call.content, out, options);
+}
+
+/// `--- RESULT (<id>) [status]` + content and raw output.
+fn render_result(call: &ToolCallUpdate, out: &mut String, options: &RenderOptions) {
+    match call.status {
+        Some(status) => {
+            let _ = writeln!(
+                out,
+                "--- RESULT ({}) [{}]",
+                call.tool_call_id,
+                status_str(status)
+            );
+        }
+        None => {
+            let _ = writeln!(out, "--- RESULT ({})", call.tool_call_id);
+        }
+    }
+    if let Some(content) = &call.content {
+        render_tool_content(content, out, options);
+    }
+    if let Some(output) = &call.raw_output {
+        let _ = writeln!(
+            out,
+            "    output: {}",
+            clip(&output.to_string(), options.full)
+        );
+    }
+}
+
+/// `--- PLAN` + one `[status] entry` line per plan entry.
+fn render_plan(plan: &Plan, out: &mut String, full: bool) {
+    let _ = writeln!(out, "--- PLAN");
+    for entry in &plan.entries {
+        let status = match entry.status {
+            PlanEntryStatus::Pending => "pending",
+            PlanEntryStatus::InProgress => "in_progress",
+            PlanEntryStatus::Completed => "completed",
+        };
+        let _ = writeln!(out, "    [{status}] {}", clip(&entry.content, full));
+    }
+}
+
+/// `--- MODE <id>` for a `current_mode_update`.
+fn render_mode(mode: &CurrentModeUpdate, out: &mut String) {
+    let _ = writeln!(out, "--- MODE {}", mode.current_mode_id);
+}
+
+/// `--- UPDATE <tag>` with the clipped JSON for updates without a section.
+fn render_unknown(update: &SessionUpdate, out: &mut String, full: bool) {
+    let value = serde_json::to_value(update).unwrap_or_default();
+    let tag = value
+        .get("sessionUpdate")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let _ = writeln!(
+        out,
+        "--- UPDATE {tag}\n    {}",
+        clip(&value.to_string(), full)
+    );
 }
 
 /// Render tool call content blocks, one clipped line each.
