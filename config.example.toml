@@ -1,0 +1,24 @@
+# Copy to ~/.config/acpsub/config.toml (or pass --config PATH).
+
+[defaults]
+# Permission policy applied when an agent asks to run a tool call:
+#   allow - pick the first allow_once/allow_always option
+#   deny  - pick the first reject_once/reject_always option
+#   ask   - queue the request; the `permit` tool answers it
+permission = "allow"
+transcript_dir = "~/.local/share/acpsub/transcripts"
+registry = "~/.local/share/acpsub/registry.json"
+
+[agents.devin]
+command = "devin"
+args = ["acp"]
+mode = "bypass"                          # session/set_mode after session/new
+config = { model = "swe-2-max" }         # session/set_config_option id -> value
+allow_outside_cwd = false                # refuse fs/* paths outside cwd
+# env = { API_KEY = "..." }              # extra environment for the process
+# permission = "ask"                     # per-agent override of the default
+
+[agents.claude]
+command = "npx"
+args = ["-y", "@zed-industries/claude-code-acp"]
+mode = "bypassPermissions"
