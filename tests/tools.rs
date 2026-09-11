@@ -3,6 +3,9 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+
+use acpsub::config::AgentConfig;
 use common::*;
 use serde_json::json;
 
@@ -427,4 +430,347 @@ async fn agents_tool_reports_initialized() {
     assert_eq!(fake["modes"]["current"], "bypass", "{fake}");
     assert_eq!(fake["config_options"][0]["id"], "model", "{fake}");
     assert_eq!(fake["subagents"], json!(["ag"]));
+}
+
+/// The `die` prompt makes the agent exit mid-turn: the turn fails, the
+/// subagent reports `failed`, and the registry entry survives so the session
+/// can be resumed after `close`.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_death_mid_turn_marks_failed() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("d", dir.path(), "die")).await;
+    let done = wait(&tools, "d", 30).await;
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(
+        done["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{done}"
+    );
+
+    let status = call_json(&tools, "status", json!({"name": "d"})).await;
+    assert_eq!(status["state"], "failed");
+    assert_eq!(status["live"], true);
+
+    // The registry entry outlives the process: after `close` the name resumes
+    // its session via session/load.
+    call_json(&tools, "close", json!({"name": "d"})).await;
+    let resumed = call_json(&tools, "spawn", spawn_args("d", dir.path(), "hi")).await;
+    assert_eq!(resumed["session_id"], "sess-1");
+    let done = wait(&tools, "d", 30).await;
+    assert_eq!(done["state"], "done");
+}
+
+/// `KILL <cmd>` has the agent create a terminal running `sleep 60`, call
+/// `terminal/kill`, then `wait_for_exit`: the signal exit reaches the reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_kill_reports_signal_exit() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(
+        &tools,
+        "spawn",
+        spawn_args("k", dir.path(), "KILL sleep 60"),
+    )
+    .await;
+    let done = wait(&tools, "k", 30).await;
+    assert_eq!(done["state"], "done", "{done}");
+    let reply = done["reply"].as_str().unwrap();
+    assert!(reply.contains("exit:None"), "{reply}");
+    assert!(reply.contains("signal:9"), "{reply}");
+}
+
+/// `close` ends the process but keeps the registry entry: the name still
+/// lists as `closed`, and `send` to it errors.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_keeps_name_registered() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("cl", dir.path(), "hi")).await;
+    wait(&tools, "cl", 30).await;
+
+    let closed = call_json(&tools, "close", json!({"name": "cl"})).await;
+    assert_eq!(closed["closed"], true);
+
+    let status = call_json(&tools, "status", json!({"name": "cl"})).await;
+    assert_eq!(status["live"], false);
+    assert_eq!(status["state"], "closed");
+    let list = call_json(&tools, "list", json!({})).await;
+    let entry = list["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "cl")
+        .expect("cl still listed");
+    assert_eq!(entry["live"], false);
+    assert_eq!(entry["state"], "closed");
+
+    let err = call_err(&tools, "send", json!({"name": "cl", "prompt": "again"})).await;
+    assert!(err.contains("unknown subagent"), "{err}");
+}
+
+/// `WRITE <path>` has the agent call `fs/write_text_file`: writes inside the
+/// session cwd succeed, writes outside are refused unless the agent sets
+/// `allow_outside_cwd`.
+#[tokio::test(flavor = "multi_thread")]
+async fn fs_write_inside_and_outside_cwd() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let inside = nested.join("written.txt");
+    let (_state, tools) = test_state(dir.path());
+
+    call_json(
+        &tools,
+        "spawn",
+        spawn_args("wi", dir.path(), &format!("WRITE {}", inside.display())),
+    )
+    .await;
+    let done = wait(&tools, "wi", 30).await;
+    assert!(done["reply"].as_str().unwrap().contains("fsw:ok"), "{done}");
+    assert_eq!(
+        std::fs::read_to_string(&inside).unwrap(),
+        "written-by-fake-agent"
+    );
+
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("nope.txt");
+    call_json(
+        &tools,
+        "spawn",
+        spawn_args(
+            "wo",
+            dir.path(),
+            &format!("WRITE {}", outside_file.display()),
+        ),
+    )
+    .await;
+    let done = wait(&tools, "wo", 30).await;
+    let reply = done["reply"].as_str().unwrap();
+    assert!(reply.contains("fswerr:"), "{reply}");
+    assert!(reply.contains("outside the session cwd"), "{reply}");
+    assert!(!outside_file.exists());
+
+    // The wideopen agent may write outside its cwd.
+    call_json(
+        &tools,
+        "spawn",
+        json!({"name": "ww", "agent": "wideopen", "cwd": dir.path(),
+               "prompt": format!("WRITE {}", outside_file.display())}),
+    )
+    .await;
+    let done = wait(&tools, "ww", 30).await;
+    assert!(done["reply"].as_str().unwrap().contains("fsw:ok"), "{done}");
+    assert_eq!(
+        std::fs::read_to_string(&outside_file).unwrap(),
+        "written-by-fake-agent"
+    );
+}
+
+/// A name held by a live subagent cannot be spawned again; once `forget`
+/// releases it, the name is reusable.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_live_name_rejected_until_forgotten() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("dup", dir.path(), "hi")).await;
+    wait(&tools, "dup", 30).await;
+
+    let err = call_err(&tools, "spawn", spawn_args("dup", dir.path(), "again")).await;
+    assert!(err.contains("already running"), "{err}");
+
+    call_json(&tools, "forget", json!({"name": "dup"})).await;
+    let spawned = call_json(&tools, "spawn", spawn_args("dup", dir.path(), "again")).await;
+    assert_eq!(spawned["state"], "running");
+    let done = wait(&tools, "dup", 30).await;
+    assert_eq!(done["state"], "done");
+}
+
+/// `send` only accepts `idle`/`done`/`cancelled` subagents; a `running` one
+/// rejects the prompt.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_to_running_subagent_rejected() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("run", dir.path(), "wait")).await;
+
+    let err = call_err(
+        &tools,
+        "send",
+        json!({"name": "run", "prompt": "more work"}),
+    )
+    .await;
+    assert!(err.contains("cannot accept a prompt"), "{err}");
+
+    call_json(&tools, "cancel", json!({"name": "run"})).await;
+}
+
+/// An agent whose command does not exist fails `spawn` cleanly and releases
+/// the name it reserved.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_with_missing_command_fails() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let agents = BTreeMap::from([
+        ("fake".to_string(), fake_agent_config()),
+        (
+            "missing".to_string(),
+            AgentConfig {
+                command: "acpsub-no-such-binary".to_string(),
+                ..fake_agent_config()
+            },
+        ),
+    ]);
+    let (_state, tools) = test_state_with_agents(dir.path(), agents);
+
+    let err = call_err(
+        &tools,
+        "spawn",
+        json!({"name": "b", "agent": "missing", "cwd": dir.path(), "prompt": "hi"}),
+    )
+    .await;
+    assert!(err.contains("cannot spawn agent"), "{err}");
+
+    // The failed spawn released the name: a working agent can take it.
+    let spawned = call_json(&tools, "spawn", spawn_args("b", dir.path(), "hi")).await;
+    assert_eq!(spawned["state"], "running");
+    wait(&tools, "b", 30).await;
+}
+
+/// Two concurrent `spawn` calls for one name: the reservation is atomic, so
+/// exactly one succeeds and the other is told the name is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_spawn_same_name_runs_once() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let tools = std::sync::Arc::new(tools);
+    let cwd = dir.path().to_path_buf();
+    let first = {
+        let tools = tools.clone();
+        let cwd = cwd.clone();
+        tokio::spawn(async move { call(&tools, "spawn", spawn_args("cc", &cwd, "hi")).await })
+    };
+    let second = {
+        let tools = tools.clone();
+        tokio::spawn(async move { call(&tools, "spawn", spawn_args("cc", &cwd, "hi")).await })
+    };
+
+    let mut succeeded = 0;
+    let mut errors = Vec::new();
+    for outcome in [first.await.expect("task"), second.await.expect("task")] {
+        match outcome {
+            Ok(result) if result.is_error() => {
+                errors.push(result.error_message().unwrap_or("?").to_string());
+            }
+            Ok(_) => succeeded += 1,
+            Err(error) => errors.push(error),
+        }
+    }
+    assert_eq!(succeeded, 1, "{errors:?}");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("already running"), "{}", errors[0]);
+
+    let done = wait(&tools, "cc", 30).await;
+    assert_eq!(done["state"], "done");
+}
+
+/// `seq 1 5000` emits ~23 KB, over the 4096-byte `outputByteLimit` the fake
+/// agent requests: `terminal/output` reports `truncated` and retains the
+/// newest bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_output_truncates_to_tail() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(
+        &tools,
+        "spawn",
+        spawn_args("big", dir.path(), "RUNLINE seq 1 5000"),
+    )
+    .await;
+    let done = wait(&tools, "big", 30).await;
+    let reply = done["reply"].as_str().unwrap();
+    assert!(reply.contains("trunc"), "{reply}");
+    assert!(reply.contains("5000"), "{reply}");
+    // The oldest bytes were evicted: the retained tail starts mid-sequence.
+    assert!(!reply.contains("term:1\n2\n3"), "{reply}");
+}
+
+/// After `cancel`, `result` still returns the turn and `transcript` renders
+/// its `cancelled` end record.
+#[tokio::test(flavor = "multi_thread")]
+async fn result_and_transcript_after_cancel() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("cx", dir.path(), "wait")).await;
+    wait(&tools, "cx", 2).await;
+    call_json(&tools, "cancel", json!({"name": "cx"})).await;
+    let done = wait(&tools, "cx", 30).await;
+    assert_eq!(done["state"], "cancelled");
+
+    let result = call_json(&tools, "result", json!({"name": "cx"})).await;
+    assert_eq!(result["turn"], 1);
+    assert_eq!(result["reply"], "Hello ");
+    assert_eq!(result["stop_reason"], "cancelled");
+
+    let text = call_text(&tools, "transcript", json!({"name": "cx"})).await;
+    assert!(text.contains("=== [turn 1] END cancelled"), "{text}");
+}
+
+/// `permit` with a request id that is not pending errors cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn permit_with_unknown_request_id() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("p", dir.path(), "hi")).await;
+    wait(&tools, "p", 30).await;
+
+    let err = call_err(
+        &tools,
+        "permit",
+        json!({"name": "p", "request_id": "perm-99", "option_id": "allow-1"}),
+    )
+    .await;
+    assert!(err.contains("no pending permission request"), "{err}");
 }

@@ -9,8 +9,13 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
   outcome is recorded into the reply.
 - "READ <path>" in the prompt -> an fs/read_text_file request; the content's
   first 40 chars (or the error) are recorded into the reply.
-- "RUN <cmd>" in the prompt -> terminal/create, wait_for_exit, output; the
-  output and exit code are recorded into the reply.
+- "WRITE <path>" in the prompt -> an fs/write_text_file request; "fsw:ok" or
+  the error is recorded into the reply.
+- "RUN <cmd>" / "RUNLINE <cmd>" in the prompt -> terminal/create,
+  wait_for_exit, output; the output, exit code, signal, and truncation flag
+  are recorded into the reply.
+- "KILL <cmd>" -> terminal/create, terminal/kill, then wait_for_exit and
+  output; the kill's signal exit is recorded into the reply.
 - "wait" -> the prompt never completes until session/cancel.
 - "die" -> the process exits mid-turn with status 3.
 
@@ -47,7 +52,9 @@ pending_prompt = None
 session_id = ""
 session_count = 0
 next_req = 0
-outbound = {}       # request id -> kind: perm | fs | term-create | term-wait | term-output
+outbound = {}       # request id -> kind: perm | fs | fsw | term-create |
+                    #   term-kill-create | term-kill | term-wait |
+                    #   term-output | term-release
 terminal_id = None
 collected = []      # markers appended to the final reply
 
@@ -155,6 +162,28 @@ def on_prompt(request_id, params):
             {"sessionId": session_id, "path": path},
             "fs",
         )
+    if text.startswith("WRITE "):
+        new_request(
+            "fs/write_text_file",
+            {
+                "sessionId": session_id,
+                "path": text[6:].strip(),
+                "content": "written-by-fake-agent",
+            },
+            "fsw",
+        )
+    if text.startswith("KILL "):
+        argv = shlex.split(text[5:].strip())
+        new_request(
+            "terminal/create",
+            {
+                "sessionId": session_id,
+                "command": argv[0],
+                "args": argv[1:],
+                "outputByteLimit": 4096,
+            },
+            "term-kill-create",
+        )
     if text.startswith("RUNLINE "):
         new_request(
             "terminal/create",
@@ -204,6 +233,11 @@ def on_response(msg):
             collected.append("fs:" + msg["result"].get("content", "")[:40].replace("\n", "\\n"))
         else:
             collected.append("fserr:" + msg.get("error", {}).get("message", "?")[:60])
+    elif kind == "fsw":
+        if "result" in msg:
+            collected.append("fsw:ok")
+        else:
+            collected.append("fswerr:" + msg.get("error", {}).get("message", "?"))
     elif kind == "term-create":
         if "result" in msg:
             terminal_id = msg["result"]["terminalId"]
@@ -214,17 +248,42 @@ def on_response(msg):
             )
         else:
             collected.append("termerr:" + msg.get("error", {}).get("message", "?"))
+    elif kind == "term-kill-create":
+        if "result" in msg:
+            terminal_id = msg["result"]["terminalId"]
+            new_request(
+                "terminal/kill",
+                {"sessionId": session_id, "terminalId": terminal_id},
+                "term-kill",
+            )
+        else:
+            collected.append("termerr:" + msg.get("error", {}).get("message", "?"))
+    elif kind == "term-kill":
+        if "result" in msg:
+            new_request(
+                "terminal/wait_for_exit",
+                {"sessionId": session_id, "terminalId": terminal_id},
+                "term-wait",
+            )
+        else:
+            collected.append("killerr:" + msg.get("error", {}).get("message", "?"))
     elif kind == "term-wait":
-        code = msg.get("result", {}).get("exitCode")
-        collected.append("exit:" + str(code))
+        result = msg.get("result", {})
+        collected.append("exit:" + str(result.get("exitCode")))
+        if result.get("signal") is not None:
+            collected.append("signal:" + str(result["signal"]))
         new_request(
             "terminal/output",
             {"sessionId": session_id, "terminalId": terminal_id},
             "term-output",
         )
     elif kind == "term-output":
-        output = msg.get("result", {}).get("output", "")
+        result = msg.get("result", {})
+        output = result.get("output", "")
         collected.append("term:" + output.strip()[:40])
+        if result.get("truncated"):
+            collected.append("trunc")
+            collected.append("tail:" + output.strip()[-40:])
         new_request(
             "terminal/release",
             {"sessionId": session_id, "terminalId": terminal_id},
