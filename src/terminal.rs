@@ -193,9 +193,19 @@ pub async fn create(
     params: TerminalCreateParams,
     cwd: &std::path::Path,
 ) -> Result<TerminalCreateResult, JsonRpcError> {
-    let mut command = tokio::process::Command::new(&params.command);
+    // With no `args`, `command` is a shell command line (agents like `devin
+    // acp` send e.g. "cd /repo && cargo test"), so run it through a shell.
+    // With `args`, `command` is the executable per the ACP wire contract.
+    let mut command = if params.args.is_empty() {
+        let mut shell = tokio::process::Command::new("bash");
+        shell.arg("-c").arg(&params.command);
+        shell
+    } else {
+        let mut direct = tokio::process::Command::new(&params.command);
+        direct.args(&params.args);
+        direct
+    };
     command
-        .args(&params.args)
         .envs(
             params
                 .env

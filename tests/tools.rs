@@ -229,6 +229,28 @@ async fn terminal_run() {
     assert!(reply.contains("exit:0"), "{reply}");
 }
 
+/// `devin acp` sends the whole shell command line as `command` with no
+/// `args`; it must run through a shell, not be spawned as an executable.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_run_shell_line() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(
+        &tools,
+        "spawn",
+        spawn_args("t", dir.path(), "RUNLINE echo shell-$((40 + 2))"),
+    )
+    .await;
+    let done = wait(&tools, "t", 30).await;
+    let reply = done["reply"].as_str().unwrap().to_string();
+    assert!(reply.contains("term:shell-42"), "{reply}");
+    assert!(reply.contains("exit:0"), "{reply}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn transcript_rendering() {
     if !python3() {

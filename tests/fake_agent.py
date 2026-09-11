@@ -155,7 +155,17 @@ def on_prompt(request_id, params):
             {"sessionId": session_id, "path": path},
             "fs",
         )
-    if text.startswith("RUN "):
+    if text.startswith("RUNLINE "):
+        new_request(
+            "terminal/create",
+            {
+                "sessionId": session_id,
+                "command": text[8:].strip(),
+                "outputByteLimit": 4096,
+            },
+            "term-create",
+        )
+    elif text.startswith("RUN "):
         argv = shlex.split(text[4:].strip())
         new_request(
             "terminal/create",
