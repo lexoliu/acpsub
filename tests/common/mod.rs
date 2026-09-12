@@ -24,21 +24,26 @@ pub fn python3() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Build an app state rooted at `dir`, with a `fake` agent (loadSession,
-/// accepts `set_mode`/`set_config_option`), a `noload` agent (same script with
-/// `FAKE_NO_LOAD=1`), and a `wideopen` agent allowed outside its cwd.
-pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
-    let script = fake_agent_script();
-    let mut agents = BTreeMap::new();
-    let fake = AgentConfig {
+/// The `fake` agent config: `python3 tests/fake_agent.py` in `bypass` mode
+/// with `model` set to `b`.
+pub fn fake_agent_config() -> AgentConfig {
+    AgentConfig {
         command: "python3".to_string(),
-        args: vec![script.to_string_lossy().into_owned()],
+        args: vec![fake_agent_script().to_string_lossy().into_owned()],
         env: BTreeMap::new(),
         mode: Some("bypass".to_string()),
         config: BTreeMap::from([("model".to_string(), ConfigValue::Select("b".to_string()))]),
         allow_outside_cwd: false,
         permission: None,
-    };
+    }
+}
+
+/// Build an app state rooted at `dir`, with a `fake` agent (loadSession,
+/// accepts `set_mode`/`set_config_option`), a `noload` agent (same script with
+/// `FAKE_NO_LOAD=1`), and a `wideopen` agent allowed outside its cwd.
+pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
+    let mut agents = BTreeMap::new();
+    let fake = fake_agent_config();
     agents.insert("fake".to_string(), fake.clone());
     agents.insert(
         "noload".to_string(),
@@ -54,6 +59,14 @@ pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
             ..fake
         },
     );
+    test_state_with_agents(dir, agents)
+}
+
+/// Build an app state rooted at `dir` over an explicit agent map.
+pub fn test_state_with_agents(
+    dir: &Path,
+    agents: BTreeMap<String, AgentConfig>,
+) -> (Arc<AppState>, Tools) {
     let config = Config {
         defaults: Defaults {
             permission: PermissionPolicy::Allow,
