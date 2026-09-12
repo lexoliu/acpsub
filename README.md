@@ -130,5 +130,6 @@ Python-dependent tests skip themselves when `python3` is absent.
 
 ## Releases
 
-`release-plz` runs on pushes to `main` (`.github/workflows/release.yml`). It
-needs a `CARGO_REGISTRY_TOKEN` repository secret for crates.io publishing.
+`release-plz` runs on pushes to `main` (`.github/workflows/release.yml`). The
+crate's crates.io Trusted Publishing configuration names this workflow, so
+publishing authenticates with GitHub OIDC and no token secret is needed.
