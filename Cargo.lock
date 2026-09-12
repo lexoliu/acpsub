@@ -42,8 +42,9 @@ dependencies = [
 
 [[package]]
 name = "aither-acp"
-version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#1579137386dfed1ff10242f7f8f08b9fd6d2e39f"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f8e9dc83fd9234deb2d5e7e967c812bd970d9e32ad7d31bfa932d330571dc0d"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -61,8 +62,9 @@ dependencies = [
 
 [[package]]
 name = "aither-agent"
-version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#1579137386dfed1ff10242f7f8f08b9fd6d2e39f"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8913268d6983df1ff9001697dee7725d7618b3e4adc61c065f4d2b5bda136559"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -94,8 +96,9 @@ dependencies = [
 
 [[package]]
 name = "aither-attachments"
-version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#1579137386dfed1ff10242f7f8f08b9fd6d2e39f"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1662054889ea745dff9d5a21a360695f8c18dac5b052f2347c51a6a43410b43c"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -107,8 +110,9 @@ dependencies = [
 
 [[package]]
 name = "aither-core"
-version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#1579137386dfed1ff10242f7f8f08b9fd6d2e39f"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47da031904fe9599caa4e8dfe95db811daec80b681153127cdd6fda3c969d7d0"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -123,8 +127,9 @@ dependencies = [
 
 [[package]]
 name = "aither-derive"
-version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#1579137386dfed1ff10242f7f8f08b9fd6d2e39f"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f4548f55e5f10a2a9690560781aa54a8be645e9f52c7782d9e276bf4f0d7b21"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro2",
@@ -134,8 +139,9 @@ dependencies = [
 
 [[package]]
 name = "aither-mcp"
-version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#1579137386dfed1ff10242f7f8f08b9fd6d2e39f"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68e2393cd457791cd87bee63dc3cd9287643ba9f7820d567a5a272cc0af2f4b9"
 dependencies = [
  "aither-core",
  "aither-sandbox",
@@ -154,8 +160,9 @@ dependencies = [
 
 [[package]]
 name = "aither-sandbox"
-version = "0.2.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#1579137386dfed1ff10242f7f8f08b9fd6d2e39f"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13410744e47abd7ab18f7243c08898b61b14c5d2dc24801a2a5419c85ab4df0a"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -2001,9 +2008,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libredox"
-version = "0.1.23"
+version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d8f1ea3f21fd3405dcaf6c9b5c1630af9afc422d9073ea39c5f6d6c772e08ed"
+checksum = "6480ccc157a1389bb2e4891b24751b0f798ba640d22386f23143fbcc89da195a"
 dependencies = [
  "libc",
 ]
@@ -3032,9 +3039,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.0"
+version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
+checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 
 [[package]]
 name = "smol"
