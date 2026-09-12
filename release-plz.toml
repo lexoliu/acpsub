@@ -1,0 +1,2 @@
+# Single-crate release config: release PRs, changelog, crates.io publish.
+[workspace]
