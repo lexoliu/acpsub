@@ -60,6 +60,8 @@ jobs:
         with:
           tool: release-plz
       - uses: release-plz/git-config@v0.1.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Update the release PR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -95,6 +97,8 @@ jobs:
         with:
           tool: release-plz
       - uses: release-plz/git-config@v0.1.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish and tag
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
