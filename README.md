@@ -1,18 +1,29 @@
 # acpsub
 
-Any [ACP](https://agentclientprotocol.com) agent as a named, resumable subagent
+Any [ACP](https://agentclientprotocol.com) agent as a resumable subagent
 over [MCP](https://modelcontextprotocol.io).
 
 `acpsub` serves a set of MCP tools that let an orchestrating agent spawn
 long-lived subagents backed by ACP agents (`devin acp`,
 `claude-code-acp`, ...). Each subagent keeps its own ACP session, transcript
-file, and a registry entry, so sessions survive server restarts via
+file, and a registry entry keyed by its session id, so sessions survive
+server restarts and externally created sessions can be adopted via
 `session/load`.
 
 ## Install
 
+Prebuilt binaries for macOS, Linux, and Windows ship on every GitHub
+release; the installer puts `acpsub` on your `PATH`:
+
 ```sh
-cargo install acpsub
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/lexoliu/acpsub/releases/latest/download/acpsub-installer.sh | sh
+```
+
+From source instead:
+
+```sh
+cargo install acpsub --locked
 ```
 
 ## Wire it into your orchestrating agent
@@ -32,6 +43,7 @@ stderr (stdout is the MCP channel); add `--log-file PATH` for a copy.
 
 ```toml
 [defaults]
+agent = "devin"                            # default backend for spawn/adopt
 permission = "allow"                       # allow | deny | ask
 transcript_dir = "~/.local/share/acpsub/transcripts"
 registry = "~/.local/share/acpsub/registry.json"
@@ -42,6 +54,7 @@ args = ["acp"]
 mode = "bypass"                            # session/set_mode after session/new
 config = { model = "swe-2-max" }           # session/set_config_option id → value
 allow_outside_cwd = false                  # refuse fs/* paths outside cwd
+# sessions_db = "~/Library/Application Support/devin/sessions.db"
 
 [agents.claude]
 command = "npx"
@@ -58,32 +71,48 @@ with no `[agents.*]` entries serves no agents.
 
 | tool | arguments | behaviour |
 |---|---|---|
-| `spawn` | `name, agent, cwd, prompt, mode?, config?, permission?, replace?` | Start the process (`session/load` for a resumable registered name), `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{name, session_id, agent, state}` at once. |
-| `send` | `name, prompt` | Next turn on the same session. Errors unless the subagent is `idle`, `done`, or `cancelled`. |
-| `wait` | `name, timeout_secs` (default 600, max 3600) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, stop_reason?, reply, tool_calls, elapsed_secs, pending_permission?}`. |
-| `wait_any` | `names, timeout_secs` | First of them to leave `running`. |
-| `status` | `name` | State, session id, cwd, agent, turns, transcript path. |
-| `result` | `name, turn?` | The reply of the last (or nth) turn. |
-| `cancel` | `name` | Answer pending permissions `cancelled`, send `session/cancel`. |
-| `permit` | `name, request_id, option_id` | Answer a queued `ask`-policy permission request. |
-| `transcript` | `name, from?, tail?, full?, thinking?` | Rendered transcript (same output as the CLI). |
+| `spawn` | `cwd, prompt, agent?, mode?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{session_id, agent, state}` at once — the session id is the handle for every other call. |
+| `adopt` | `session_id, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, or an external one such as a Devin session created elsewhere. Returns `{session_id, agent, state}`; with `prompt` the first turn starts immediately. |
+| `send` | `session_id, prompt` | Next turn on the same session. Errors unless the subagent is `idle`, `done`, or `cancelled`. |
+| `wait` | `session_id, timeout_secs` (default 600, min 60, max 3600; prefer 300–1800) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, stop_reason?, reply, tool_calls, elapsed_secs, pending_permission?}`. |
+| `wait_any` | `session_ids, timeout_secs` | First of them to leave `running`. |
+| `status` | `session_id` | State, cwd, agent, turns, transcript path — instant check. |
+| `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
+| `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
+| `permit` | `session_id, request_id, option_id` | Answer a queued `ask`-policy permission request. |
+| `transcript` | `session_id, from?, tail?, full?, thinking?` | Rendered transcript (same output as the CLI). |
 | `list` | — | Live and registered subagents with state. |
-| `close` | `name` | End the process; keep the registry entry (still resumable). |
-| `forget` | `name` | Remove the registry entry (and the process if live). |
+| `close` | `session_id` | End the process; keep the registry entry (still adoptable). |
+| `forget` | `session_id` | Remove the registry entry (and the process if live). |
 | `agents` | — | Configured agents; for initialised ones their `agentInfo`, modes, config options. |
+
+`agent` may be omitted anywhere it appears: the `[defaults].agent` setting
+wins, then a single configured agent is used implicitly; with several agents
+and no default the call errors asking for one.
+
+`adopt` resolves `agent` and `cwd` from the registry for known session ids;
+for unknown ones it asks the agent's session database (`sessions_db`) for the
+session's working directory, and errors asking for an explicit `cwd` when the
+lookup finds nothing.
+
+The wait is event-driven: a long `timeout_secs` costs nothing while the
+subagent runs and returns early on any state change, but every expiry costs
+the orchestrator a model turn to re-issue the wait on a still-`running`
+result. Prefer 300–1800s (5–30 min), staying under the 30-min prompt-cache
+TTL. Timeouts under 60s are rejected — use `status` for an instant check.
 
 ## Model
 
-- A **subagent** = `name` (`[A-Za-z0-9._-]+`) + one process + one ACP session +
-  a transcript file. States: `idle | running | needs_permission |
-  done(stop_reason) | cancelled | failed`.
-- **Registry** (`registry.json`): `name → {agent, session_id, cwd, created,
-  last_turn, turns}`, written atomically. `spawn` of a registered name whose
-  agent advertised `loadSession` runs `session/load`; otherwise it errors
-  (`replace=true` forgets the old entry instead).
+- A **subagent** = one process + one ACP session + a transcript file,
+  addressed by its `session_id`. States: `idle | running | needs_permission |
+  done(stop_reason) | cancelled | failed | closed`.
+- **Registry** (`registry.json`): `session_id → {agent, cwd, created,
+  last_turn, turns}`, written atomically. `adopt` on a registered (or
+  externally created) session id whose agent advertised `loadSession` runs
+  `session/load` to resume it.
 - **Transcript**: every `session/update`, prompt, and turn end is appended to
-  `<transcript_dir>/<name>.jsonl` as a verbatim JSON record. A turn's `reply`
-  is that turn's concatenated `agent_message_chunk` text.
+  `<transcript_dir>/<session_id>.jsonl` as a verbatim JSON record. A turn's
+  `reply` is that turn's concatenated `agent_message_chunk` text.
 - **Permissions**: `permission = allow|deny` answers requests by option kind;
   `ask` queues the request and flips the state to `needs_permission` until
   `permit` answers it.
@@ -95,7 +124,7 @@ with no `[agents.*]` entries serves no agents.
 ```sh
 acpsub serve [--config PATH] [--log-file PATH]   # MCP over stdio
 acpsub agents [--config PATH]                    # list configured agents
-acpsub transcript <name> [--from N] [--tail N] [--full] [--thinking]
+acpsub transcript <session_id> [--from N] [--tail N] [--full] [--thinking]
 ```
 
 `acpsub transcript` renders a session's JSONL file:

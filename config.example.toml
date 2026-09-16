@@ -8,6 +8,10 @@
 permission = "allow"
 transcript_dir = "~/.local/share/acpsub/transcripts"
 registry = "~/.local/share/acpsub/registry.json"
+# agent = "devin"                        # default backend for spawn/adopt
+                                       # (a single configured agent is the
+                                       #  implicit default; omitting `agent`
+                                       #  with several configured errors)
 
 [agents.devin]
 command = "devin"
@@ -17,6 +21,9 @@ config = { model = "swe-2-max" }         # session/set_config_option id -> value
 allow_outside_cwd = false                # refuse fs/* paths outside cwd
 # env = { API_KEY = "..." }              # extra environment for the process
 # permission = "ask"                     # per-agent override of the default
+# sessions_db = "~/path/sessions.db"     # sqlite db mapping session id -> cwd
+                                       # for `adopt` without an explicit cwd
+                                       # (devin defaults to its own store)
 
 [agents.claude]
 command = "npx"

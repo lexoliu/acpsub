@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// Any ACP agent as a named, resumable subagent over MCP.
+/// Any ACP agent as a resumable subagent over MCP.
 #[derive(Parser)]
 #[command(name = "acpsub", version, about)]
 struct Cli {
@@ -40,8 +40,8 @@ enum Command {
     },
     /// Render a subagent's transcript.
     Transcript {
-        /// Subagent name.
-        name: String,
+        /// Session id.
+        session_id: String,
         /// Start at record N (skip the first N records).
         #[arg(long)]
         from: Option<usize>,
@@ -76,13 +76,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve { config, log_file } => serve(config, log_file).await,
         Command::Agents { config } => agents(config),
         Command::Transcript {
-            name,
+            session_id,
             from,
             tail,
             full,
             thinking,
             config,
-        } => transcript(&name, config, from, tail, full, thinking),
+        } => transcript(&session_id, config, from, tail, full, thinking),
     }
 }
 
@@ -170,9 +170,9 @@ fn agents(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `acpsub transcript <name>`: render the JSONL transcript.
+/// `acpsub transcript <session_id>`: render the JSONL transcript.
 fn transcript(
-    name: &str,
+    session_id: &str,
     config: Option<PathBuf>,
     from: Option<usize>,
     tail: Option<usize>,
@@ -180,7 +180,10 @@ fn transcript(
     thinking: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(config)?;
-    let path = config.defaults.transcript_dir.join(format!("{name}.jsonl"));
+    let path = config
+        .defaults
+        .transcript_dir
+        .join(format!("{session_id}.jsonl"));
     let text =
         std::fs::read_to_string(&path).map_err(|_| acpsub::Error::NoTranscript(path.clone()))?;
     let rendered = render(

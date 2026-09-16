@@ -24,21 +24,27 @@ pub fn python3() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Build an app state rooted at `dir`, with a `fake` agent (loadSession,
-/// accepts `set_mode`/`set_config_option`), a `noload` agent (same script with
-/// `FAKE_NO_LOAD=1`), and a `wideopen` agent allowed outside its cwd.
-pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
-    let script = fake_agent_script();
-    let mut agents = BTreeMap::new();
-    let fake = AgentConfig {
+/// The `fake` agent config: `python3 tests/fake_agent.py` in `bypass` mode
+/// with `model` set to `b`.
+pub fn fake_agent_config() -> AgentConfig {
+    AgentConfig {
         command: "python3".to_string(),
-        args: vec![script.to_string_lossy().into_owned()],
+        args: vec![fake_agent_script().to_string_lossy().into_owned()],
         env: BTreeMap::new(),
         mode: Some("bypass".to_string()),
         config: BTreeMap::from([("model".to_string(), ConfigValue::Select("b".to_string()))]),
         allow_outside_cwd: false,
         permission: None,
-    };
+        sessions_db: None,
+    }
+}
+
+/// Build an app state rooted at `dir`, with a `fake` agent (loadSession,
+/// accepts `set_mode`/`set_config_option`), a `noload` agent (same script with
+/// `FAKE_NO_LOAD=1`), and a `wideopen` agent allowed outside its cwd.
+pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
+    let mut agents = BTreeMap::new();
+    let fake = fake_agent_config();
     agents.insert("fake".to_string(), fake.clone());
     agents.insert(
         "noload".to_string(),
@@ -54,8 +60,26 @@ pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
             ..fake
         },
     );
+    test_state_with_agents(dir, agents)
+}
+
+/// Build an app state rooted at `dir` over an explicit agent map.
+pub fn test_state_with_agents(
+    dir: &Path,
+    agents: BTreeMap<String, AgentConfig>,
+) -> (Arc<AppState>, Tools) {
+    test_state_full(dir, None, agents)
+}
+
+/// Build an app state with an explicit default agent (or none).
+pub fn test_state_full(
+    dir: &Path,
+    default_agent: Option<&str>,
+    agents: BTreeMap<String, AgentConfig>,
+) -> (Arc<AppState>, Tools) {
     let config = Config {
         defaults: Defaults {
+            agent: default_agent.map(str::to_string),
             permission: PermissionPolicy::Allow,
             transcript_dir: dir.join("transcripts"),
             registry: dir.join("registry.json"),
@@ -110,21 +134,29 @@ pub async fn call_text(tools: &Tools, name: &str, args: Value) -> String {
 }
 
 /// Spawn args for the fake agent rooted at `cwd`.
-pub fn spawn_args(name: &str, cwd: &Path, prompt: &str) -> Value {
+pub fn spawn_args(cwd: &Path, prompt: &str) -> Value {
     json!({
-        "name": name,
         "agent": "fake",
         "cwd": cwd,
         "prompt": prompt,
     })
 }
 
+/// Spawn and return the assigned session id.
+pub async fn spawn_id(tools: &Tools, args: Value) -> String {
+    let spawned = call_json(tools, "spawn", args).await;
+    spawned["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string()
+}
+
 /// `wait` with a bounded timeout.
-pub async fn wait(tools: &Tools, name: &str, timeout_secs: u64) -> Value {
+pub async fn wait(tools: &Tools, session_id: &str, timeout_secs: u64) -> Value {
     call_json(
         tools,
         "wait",
-        json!({"name": name, "timeout_secs": timeout_secs}),
+        json!({"session_id": session_id, "timeout_secs": timeout_secs}),
     )
     .await
 }

@@ -136,6 +136,7 @@ args = ["{script}"]
         .collect();
     for expected in [
         "spawn",
+        "adopt",
         "send",
         "wait",
         "wait_any",
@@ -155,20 +156,23 @@ args = ["{script}"]
         );
     }
 
+    // One configured agent: `agent` may be omitted — the only choice is the
+    // implicit default.
     let spawned = server.request(
         "tools/call",
         &json!({
             "name": "spawn",
-            "arguments": {"name": "e2e", "agent": "fake", "cwd": dir.path(), "prompt": "hi"},
+            "arguments": {"cwd": dir.path(), "prompt": "hi"},
         }),
     );
     let spawned = tool_json(&spawned);
     assert_eq!(spawned["state"], "running");
-    assert_eq!(spawned["session_id"], "sess-1");
+    let session_id = spawned["session_id"].as_str().expect("session_id");
+    assert!(session_id.starts_with("sess-"), "{session_id}");
 
     let waited = server.request(
         "tools/call",
-        &json!({"name": "wait", "arguments": {"name": "e2e", "timeout_secs": 30}}),
+        &json!({"name": "wait", "arguments": {"session_id": session_id, "timeout_secs": 60}}),
     );
     let waited = tool_json(&waited);
     assert_eq!(waited["state"], "done", "{waited}");
@@ -176,5 +180,5 @@ args = ["{script}"]
 
     let list = server.request("tools/call", &json!({"name": "list", "arguments": {}}));
     let list = tool_json(&list);
-    assert_eq!(list["subagents"][0]["name"], "e2e");
+    assert_eq!(list["subagents"][0]["session_id"], session_id);
 }

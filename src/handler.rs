@@ -24,8 +24,6 @@ use crate::terminal::{self, Terminal};
 /// Handles one subagent's agent-to-client traffic.
 #[derive(Debug)]
 pub struct SubagentHandler {
-    /// Subagent name (for diagnostics).
-    name: String,
     /// Shared mutable state.
     rt: Arc<SubRuntime>,
     /// Session working directory; fs paths must stay under it unless
@@ -41,14 +39,12 @@ impl SubagentHandler {
     /// Construct the handler for a subagent being launched.
     #[must_use]
     pub const fn new(
-        name: String,
         rt: Arc<SubRuntime>,
         cwd: PathBuf,
         permission: PermissionPolicy,
         allow_outside_cwd: bool,
     ) -> Self {
         Self {
-            name,
             rt,
             cwd,
             permission,
@@ -88,7 +84,7 @@ impl ClientHandler for SubagentHandler {
             "update": notification.update,
         });
         if let Err(error) = self.rt.transcript.lock().await.append(&record).await {
-            warn!(subagent = %self.name, %error, "transcript append failed");
+            warn!(subagent = %self.rt.session_label(), %error, "transcript append failed");
         }
         let mut inner = self.rt.inner.lock().expect("inner poisoned");
         let Some(turn) = inner.current.as_mut() else {
@@ -281,7 +277,7 @@ impl SubagentHandler {
             inner.status = Status::NeedsPermission;
             id
         };
-        debug!(subagent = %self.name, %request_id, "permission request queued");
+        debug!(subagent = %self.rt.session_label(), %request_id, "permission request queued");
         self.rt.notify.notify_waiters();
         let outcome = rx.await.unwrap_or(RequestPermissionOutcome::Cancelled);
         {

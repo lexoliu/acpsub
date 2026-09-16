@@ -24,6 +24,8 @@ use crate::registry::RegistryEntry;
 use crate::state::{AppState, Launch, Status, Subagent, launch, start_turn};
 use crate::transcript::{RenderOptions, render};
 
+/// `wait`'s minimum timeout: shorter polls belong to `status`.
+const MIN_WAIT_SECS: u64 = 60;
 /// `wait`'s default timeout.
 const DEFAULT_WAIT_SECS: u64 = 600;
 /// `wait`'s maximum timeout.
@@ -40,6 +42,7 @@ const WAIT_ANY_POLL: Duration = Duration::from_millis(50);
 pub fn build_tools(state: Arc<AppState>) -> aither_core::Result<Tools> {
     let mut tools = Tools::new();
     tools.register(SpawnTool(state.clone()))?;
+    tools.register(AdoptTool(state.clone()))?;
     tools.register(SendTool(state.clone()))?;
     tools.register(WaitTool(state.clone()))?;
     tools.register(WaitAnyTool(state.clone()))?;
@@ -55,16 +58,12 @@ pub fn build_tools(state: Arc<AppState>) -> aither_core::Result<Tools> {
     Ok(tools)
 }
 
-/// The `spawn` tool's state summary.
+/// The `spawn`/`adopt` tool's state summary.
 fn spawned_view(sub: &Subagent) -> Value {
-    let (session_id, state) = {
-        let inner = sub.rt.inner.lock().expect("inner poisoned");
-        (inner.session_id.clone(), inner.status.name())
-    };
+    let state = sub.rt.inner.lock().expect("inner poisoned").status.name();
     json!({
-        "name": sub.name,
+        "session_id": sub.session_id,
         "agent": sub.agent,
-        "session_id": session_id,
         "state": state,
         "cwd": sub.cwd,
         "transcript": sub.transcript_path,
@@ -72,7 +71,7 @@ fn spawned_view(sub: &Subagent) -> Value {
 }
 
 /// A `wait`-style result for one subagent.
-fn wait_view(name: &str, sub: &Subagent, started: Instant) -> Value {
+fn wait_view(sub: &Subagent, started: Instant) -> Value {
     let (status, reply, tool_calls, pending) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
         let turn = inner.current.as_ref().or_else(|| inner.turns.last());
@@ -102,7 +101,7 @@ fn wait_view(name: &str, sub: &Subagent, started: Instant) -> Value {
         )
     };
     let mut view = json!({
-        "name": name,
+        "session_id": sub.session_id,
         "state": status.name(),
         "reply": reply,
         "tool_calls": tool_calls,
@@ -152,24 +151,21 @@ async fn close_sub(sub: &Subagent) {
 }
 
 // ---------------------------------------------------------------------------
-// spawn
+// spawn / adopt
 // ---------------------------------------------------------------------------
 
-/// Spawn a named subagent: start the configured agent process, open an ACP
+/// Spawn a subagent: start the configured agent process, open a new ACP
 /// session in `cwd`, and send `prompt` as its first turn.
 ///
-/// Returns immediately with the session id; the turn runs in the background.
-/// Use `wait` for the reply, `send` for follow-ups, `transcript` for the full
-/// log. Spawning a name that is registered to a previous session resumes it
-/// with `session/load` when the agent supports it; otherwise it errors —
-/// pass `replace: true` to start over.
+/// Returns immediately with `session_id` — the handle every other tool
+/// addresses (`wait` for the reply, `send` for follow-ups, `transcript` for
+/// the full log). The turn runs in the background. To take over an existing
+/// session instead of starting a new one, use `adopt`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SpawnArgs {
-    /// Name for this subagent (`[A-Za-z0-9._-]+`). Unique while alive; a
-    /// registered name resumes its session.
-    name: String,
-    /// Configured agent key (`[agents.<key>]` in the config file).
-    agent: String,
+    /// Configured agent key (`[agents.<key>]` in the config file). Optional:
+    /// falls back to `[defaults] agent`, then to the only configured agent.
+    agent: Option<String>,
     /// Working directory of the session. Agent fs/terminal access is confined
     /// to it unless the agent config sets `allow_outside_cwd`.
     cwd: PathBuf,
@@ -184,8 +180,6 @@ struct SpawnArgs {
     /// Permission policy for this subagent: `allow` auto-approves, `deny`
     /// auto-rejects, `ask` queues requests for the `permit` tool.
     permission: Option<PermissionPolicy>,
-    /// Forget the registered session under `name` and start fresh.
-    replace: Option<bool>,
 }
 
 struct SpawnTool(Arc<AppState>);
@@ -198,17 +192,119 @@ impl Tool for SpawnTool {
     type Res = Value;
 
     async fn call(&self, args: SpawnArgs) -> aither_core::Result<Value> {
+        let (agent, _) = self.0.config.resolve_agent(args.agent.as_deref())?;
         let sub = launch(
             &self.0,
             Launch {
-                name: args.name,
-                agent: args.agent,
+                agent: agent.clone(),
                 cwd: args.cwd,
-                prompt: args.prompt,
+                prompt: Some(args.prompt),
                 mode: args.mode,
                 config: args.config.unwrap_or_default(),
                 permission: args.permission,
-                replace: args.replace.unwrap_or(false),
+                load: None,
+            },
+        )
+        .await?;
+        Ok(spawned_view(&sub))
+    }
+}
+
+/// Adopt an existing session: start the agent process and bind it to a
+/// session created earlier (by `spawn`, or outside acpsub — e.g. a `devin`
+/// CLI session) via `session/load`.
+///
+/// The session becomes a live subagent addressed by `session_id` — `send`,
+/// `wait`, `transcript`, and the rest work as usual. When `prompt` is given
+/// its turn starts immediately; otherwise the session idles until `send`.
+///
+/// `cwd` is optional: it is taken from the registry for sessions acpsub
+/// knows, or discovered from the agent's session database (e.g. devin's
+/// local store). Only pass it when discovery cannot find the session.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AdoptArgs {
+    /// The existing ACP session id to take over.
+    session_id: String,
+    /// First turn's prompt after adopting. Omit to bind the session without
+    /// starting a turn — direct it later with `send`.
+    prompt: Option<String>,
+    /// Configured agent key. Optional: a registered session resolves to the
+    /// agent that created it; otherwise `[defaults] agent`, then the only
+    /// configured agent.
+    agent: Option<String>,
+    /// Session working directory. Usually omitted — read from the registry
+    /// or the agent's session database. Required only when neither knows the
+    /// session.
+    cwd: Option<PathBuf>,
+    /// Permission policy override, as in `spawn`.
+    permission: Option<PermissionPolicy>,
+}
+
+struct AdoptTool(Arc<AppState>);
+
+impl Tool for AdoptTool {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("adopt")
+    }
+    type Arguments = AdoptArgs;
+    type Res = Value;
+
+    async fn call(&self, args: AdoptArgs) -> aither_core::Result<Value> {
+        let registered = self
+            .0
+            .registry
+            .lock()
+            .expect("registry poisoned")
+            .get(&args.session_id)
+            .cloned();
+        if let (Some(requested), Some(entry)) = (&args.agent, &registered)
+            && *requested != entry.agent
+        {
+            return Err(Error::AgentMismatch {
+                session_id: args.session_id,
+                registered: entry.agent.clone(),
+                requested: requested.clone(),
+            }
+            .into());
+        }
+        let requested = args
+            .agent
+            .as_deref()
+            .or_else(|| registered.as_ref().map(|entry| entry.agent.as_str()));
+        let (agent, agent_cfg) = self.0.config.resolve_agent(requested)?;
+        let cwd = if let Some(cwd) = args
+            .cwd
+            .or_else(|| registered.as_ref().map(|entry| entry.cwd.clone()))
+        {
+            cwd
+        } else {
+            let unknown = |reason: String| Error::SessionCwdUnknown {
+                session_id: args.session_id.clone(),
+                reason,
+            };
+            match agent_cfg.session_db_path() {
+                Some(db) => match crate::state::discover_session_cwd(&db, &args.session_id) {
+                    Ok(Some(cwd)) => cwd,
+                    Ok(None) => {
+                        return Err(unknown(format!("not found in {}", db.display())).into());
+                    }
+                    Err(error) => return Err(unknown(error.to_string()).into()),
+                },
+                None => {
+                    return Err(unknown("no session database configured".to_string()).into());
+                }
+            }
+        };
+        let sub = launch(
+            &self.0,
+            Launch {
+                agent: agent.clone(),
+                cwd,
+                prompt: args.prompt,
+                mode: None,
+                config: BTreeMap::new(),
+                permission: args.permission,
+                load: Some(args.session_id),
             },
         )
         .await?;
@@ -227,8 +323,8 @@ impl Tool for SpawnTool {
 /// Returns immediately; use `wait` for the reply.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SendArgs {
-    /// Subagent name.
-    name: String,
+    /// Session id, as returned by `spawn`/`adopt`.
+    session_id: String,
     /// The prompt for the next turn.
     prompt: String,
 }
@@ -243,9 +339,9 @@ impl Tool for SendTool {
     type Res = Value;
 
     async fn call(&self, args: SendArgs) -> aither_core::Result<Value> {
-        let sub = self.0.get(&args.name)?;
+        let sub = self.0.get(&args.session_id)?;
         start_turn(self.0.clone(), &sub, args.prompt).await?;
-        Ok(json!({"name": args.name, "state": "running"}))
+        Ok(json!({"session_id": args.session_id, "state": "running"}))
     }
 }
 
@@ -262,10 +358,15 @@ impl Tool for SendTool {
 /// `pending_permission` request to answer with `permit`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitArgs {
-    /// Subagent name.
-    name: String,
-    /// Seconds to wait (default 600, max 3600). On expiry the result reports
-    /// the still-current state.
+    /// Session id, as returned by `spawn`/`adopt`.
+    session_id: String,
+    /// Seconds to wait (default 600, min 60, max 3600). Prefer long waits —
+    /// 300–1800 (5–30 min): the block is event-driven and returns early on
+    /// any state change, so a generous timeout is free, while every expiry
+    /// costs a model turn just to re-issue the wait on a still-`running`
+    /// result. Keep it under 1800 to stay inside the 30-min prompt-cache
+    /// TTL. On expiry the result reports the still-current state. For an
+    /// instant check use `status` — timeouts under 60 are rejected.
     timeout_secs: Option<u64>,
 }
 
@@ -279,7 +380,12 @@ impl Tool for WaitTool {
     type Res = Value;
 
     async fn call(&self, args: WaitArgs) -> aither_core::Result<Value> {
-        let sub = self.0.get(&args.name)?;
+        if let Some(secs) = args.timeout_secs
+            && secs < MIN_WAIT_SECS
+        {
+            return Err(Error::TimeoutBelowMin { got: secs }.into());
+        }
+        let sub = self.0.get(&args.session_id)?;
         let timeout = Duration::from_secs(
             args.timeout_secs
                 .unwrap_or(DEFAULT_WAIT_SECS)
@@ -302,7 +408,7 @@ impl Tool for WaitTool {
                 () = tokio::time::sleep(remaining.min(Duration::from_millis(250))) => {},
             }
         }
-        Ok(wait_view(&args.name, &sub, started))
+        Ok(wait_view(&sub, started))
     }
 }
 
@@ -310,9 +416,12 @@ impl Tool for WaitTool {
 /// that one's wait-style result.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitAnyArgs {
-    /// Subagent names to watch.
-    names: Vec<String>,
-    /// Seconds to wait (default 600, max 3600).
+    /// Session ids to watch.
+    session_ids: Vec<String>,
+    /// Seconds to wait (default 600, min 60, max 3600). Prefer 300–1800
+    /// (5–30 min), as with `wait`: early return on the first finisher is
+    /// free, but each expiry burns a model turn re-issuing the wait.
+    /// Timeouts under 60 are rejected — use `status` for instant checks.
     timeout_secs: Option<u64>,
 }
 
@@ -326,10 +435,15 @@ impl Tool for WaitAnyTool {
     type Res = Value;
 
     async fn call(&self, args: WaitAnyArgs) -> aither_core::Result<Value> {
+        if let Some(secs) = args.timeout_secs
+            && secs < MIN_WAIT_SECS
+        {
+            return Err(Error::TimeoutBelowMin { got: secs }.into());
+        }
         let subs = args
-            .names
+            .session_ids
             .iter()
-            .map(|name| self.0.get(name).map(|sub| (name.clone(), sub)))
+            .map(|session_id| self.0.get(session_id))
             .collect::<Result<Vec<_>>>()?;
         let timeout = Duration::from_secs(
             args.timeout_secs
@@ -338,19 +452,19 @@ impl Tool for WaitAnyTool {
         );
         let started = Instant::now();
         loop {
-            for (name, sub) in &subs {
+            for sub in &subs {
                 let done = {
                     let inner = sub.rt.inner.lock().expect("inner poisoned");
                     !matches!(inner.status, Status::Running)
                 };
                 if done {
-                    return Ok(wait_view(name, sub, started));
+                    return Ok(wait_view(sub, started));
                 }
             }
             if timeout.saturating_sub(started.elapsed()).is_zero() {
                 return Ok(json!({
                     "state": "running",
-                    "names": args.names,
+                    "session_ids": args.session_ids,
                     "elapsed_secs": started.elapsed().as_secs_f64(),
                 }));
             }
@@ -363,12 +477,12 @@ impl Tool for WaitAnyTool {
 // status / result
 // ---------------------------------------------------------------------------
 
-/// Report a subagent's state: live status, session id, turn count, last stop
-/// reason, transcript path; or its registry entry when closed.
+/// Report a subagent's state: live status, turn count, last stop reason,
+/// transcript path; or its registry entry when closed.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct StatusArgs {
-    /// Subagent name.
-    name: String,
+    /// Session id, as returned by `spawn`/`adopt`.
+    session_id: String,
 }
 
 struct StatusTool(Arc<AppState>);
@@ -393,14 +507,13 @@ impl StatusTool {
             .live
             .lock()
             .expect("live poisoned")
-            .get(&args.name)
+            .get(&args.session_id)
             .cloned();
         if let Some(sub) = sub {
-            let (status, session_id, turns, last_stop, pending) = {
+            let (status, turns, last_stop, pending) = {
                 let inner = sub.rt.inner.lock().expect("inner poisoned");
                 (
                     inner.status.clone(),
-                    inner.session_id.clone(),
                     inner.turn_offset + inner.turns.len() as u64,
                     inner.turns.last().and_then(|turn| turn.stop_reason),
                     inner
@@ -411,11 +524,10 @@ impl StatusTool {
                 )
             };
             let mut view = json!({
-                "name": sub.name,
+                "session_id": sub.session_id,
                 "agent": sub.agent,
                 "live": true,
                 "state": status.name(),
-                "session_id": session_id,
                 "cwd": sub.cwd,
                 "turns": turns,
                 "transcript": sub.transcript_path,
@@ -435,30 +547,29 @@ impl StatusTool {
             .registry
             .lock()
             .expect("registry poisoned")
-            .get(&args.name)
+            .get(&args.session_id)
             .cloned();
         if let Some(entry) = entry {
             return Ok(json!({
-                "name": args.name,
+                "session_id": args.session_id,
                 "agent": entry.agent,
                 "live": false,
                 "state": "closed",
-                "session_id": entry.session_id,
                 "cwd": entry.cwd,
                 "turns": entry.turns,
                 "created": entry.created,
                 "last_turn": entry.last_turn,
             }));
         }
-        Err(Error::UnknownSubagent(args.name))
+        Err(Error::UnknownSession(args.session_id))
     }
 }
 
 /// Return a turn's reply: the last turn by default, or turn `n` (1-based).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ResultArgs {
-    /// Subagent name.
-    name: String,
+    /// Session id, as returned by `spawn`/`adopt`.
+    session_id: String,
     /// 1-based turn number; defaults to the latest turn.
     turn: Option<u64>,
 }
@@ -473,14 +584,14 @@ impl Tool for ResultTool {
     type Res = Value;
 
     fn call(&self, args: ResultArgs) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        std::future::ready(self.result(args).map_err(Into::into))
+        std::future::ready(self.result(&args).map_err(Into::into))
     }
 }
 
 impl ResultTool {
     /// Synchronous body: `result` only reads shared state.
-    fn result(&self, args: ResultArgs) -> Result<Value> {
-        let sub = self.0.get(&args.name)?;
+    fn result(&self, args: &ResultArgs) -> Result<Value> {
+        let sub = self.0.get(&args.session_id)?;
         let (n, reply, stop_reason) = {
             let inner = sub.rt.inner.lock().expect("inner poisoned");
             let turn = args.turn.map_or_else(
@@ -495,7 +606,7 @@ impl ResultTool {
                 Some(turn) => (turn.n, turn.reply.clone(), turn.stop_reason),
                 None => {
                     return Err(Error::NoSuchTurn {
-                        name: args.name,
+                        session_id: args.session_id.clone(),
                         turn: args.turn.unwrap_or(0),
                         have: inner.turn_offset + inner.turns.len() as u64,
                     });
@@ -503,7 +614,7 @@ impl ResultTool {
             }
         };
         let mut view = json!({
-            "name": args.name,
+            "session_id": args.session_id,
             "turn": n,
             "reply": reply,
         });
@@ -523,8 +634,8 @@ impl ResultTool {
 /// `cancelled` stop reason.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CancelArgs {
-    /// Subagent name.
-    name: String,
+    /// Session id, as returned by `spawn`/`adopt`.
+    session_id: String,
 }
 
 struct CancelTool(Arc<AppState>);
@@ -537,31 +648,24 @@ impl Tool for CancelTool {
     type Res = Value;
 
     async fn call(&self, args: CancelArgs) -> aither_core::Result<Value> {
-        let sub = self.0.get(&args.name)?;
+        let sub = self.0.get(&args.session_id)?;
         {
             let mut inner = sub.rt.inner.lock().expect("inner poisoned");
             if !matches!(inner.status, Status::Running | Status::NeedsPermission) {
-                return Err(Error::NotRunning(args.name).into());
+                return Err(Error::NotRunning(args.session_id.clone()).into());
             }
             for pending in inner.pending.drain(..) {
                 let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
             }
         }
-        let session_id = sub
-            .rt
-            .inner
-            .lock()
-            .expect("inner poisoned")
-            .session_id
-            .clone();
         sub.client
-            .cancel(&session_id)
+            .cancel(&sub.session_id)
             .await
             .map_err(|source| Error::Agent {
-                agent: args.name.clone(),
+                agent: args.session_id.clone(),
                 source,
             })?;
-        Ok(json!({"name": args.name, "cancelled": true}))
+        Ok(json!({"session_id": args.session_id, "cancelled": true}))
     }
 }
 
@@ -569,9 +673,10 @@ impl Tool for CancelTool {
 ///
 /// `request_id` and `option_id` come from `wait`'s `pending_permission` field.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[allow(clippy::struct_field_names)]
 struct PermitArgs {
-    /// Subagent name.
-    name: String,
+    /// Session id, as returned by `spawn`/`adopt`.
+    session_id: String,
     /// Pending permission request id (`perm-N`).
     request_id: String,
     /// The option id to select (one of the request's `options`).
@@ -595,7 +700,7 @@ impl Tool for PermitTool {
 impl PermitTool {
     /// Synchronous body: `permit` only touches shared state and a oneshot.
     fn permit(&self, args: &PermitArgs) -> Result<Value> {
-        let sub = self.0.get(&args.name)?;
+        let sub = self.0.get(&args.session_id)?;
         let pending = {
             let mut inner = sub.rt.inner.lock().expect("inner poisoned");
             let Some(position) = inner
@@ -604,7 +709,7 @@ impl PermitTool {
                 .position(|p| p.request_id == args.request_id)
             else {
                 return Err(Error::NoSuchPermission {
-                    name: args.name.clone(),
+                    session_id: args.session_id.clone(),
                     request: args.request_id.clone(),
                 });
             };
@@ -639,7 +744,7 @@ impl PermitTool {
         }
         sub.rt.notify.notify_waiters();
         Ok(json!({
-            "name": args.name,
+            "session_id": args.session_id,
             "request_id": args.request_id,
             "option_id": args.option_id,
         }))
@@ -655,8 +760,8 @@ impl PermitTool {
 /// order.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TranscriptArgs {
-    /// Subagent name.
-    name: String,
+    /// Session id, as returned by `spawn`/`adopt`.
+    session_id: String,
     /// Start rendering at record N (skip the first N records).
     from: Option<usize>,
     /// Show only the last N records.
@@ -677,14 +782,20 @@ impl Tool for TranscriptTool {
     type Res = String;
 
     async fn call(&self, args: TranscriptArgs) -> aither_core::Result<String> {
-        let path = match self.0.live.lock().expect("live poisoned").get(&args.name) {
+        let path = match self
+            .0
+            .live
+            .lock()
+            .expect("live poisoned")
+            .get(&args.session_id)
+        {
             Some(sub) => sub.transcript_path.clone(),
             None => self
                 .0
                 .config
                 .defaults
                 .transcript_dir
-                .join(format!("{}.jsonl", args.name)),
+                .join(format!("{}.jsonl", args.session_id)),
         };
         let text =
             tokio::fs::read_to_string(&path)
@@ -713,34 +824,31 @@ struct ListArgs {}
 struct ListTool(Arc<AppState>);
 
 /// `list` view of a live subagent.
-fn live_view(name: &str, sub: &Subagent) -> Value {
-    let (state, session_id, turns) = {
+fn live_view(sub: &Subagent) -> Value {
+    let (state, turns) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
         (
             inner.status.name(),
-            inner.session_id.clone(),
             inner.turn_offset + inner.turns.len() as u64,
         )
     };
     json!({
-        "name": name,
+        "session_id": sub.session_id,
         "agent": sub.agent,
         "live": true,
         "state": state,
-        "session_id": session_id,
         "cwd": sub.cwd,
         "turns": turns,
     })
 }
 
-/// `list` view of a registered but closed subagent.
-fn closed_view(name: &str, entry: &RegistryEntry) -> Value {
+/// `list` view of a registered but closed session.
+fn closed_view(session_id: &str, entry: &RegistryEntry) -> Value {
     json!({
-        "name": name,
+        "session_id": session_id,
         "agent": entry.agent,
         "live": false,
         "state": "closed",
-        "session_id": entry.session_id,
         "cwd": entry.cwd,
         "turns": entry.turns,
     })
@@ -766,29 +874,29 @@ impl ListTool {
             let registry = self.0.registry.lock().expect("registry poisoned");
             (
                 live.iter()
-                    .map(|(name, sub)| (name.clone(), live_view(name, sub)))
+                    .map(|(session_id, sub)| (session_id.clone(), live_view(sub)))
                     .collect::<BTreeMap<_, _>>(),
                 registry
                     .iter()
-                    .map(|(name, entry)| (name.clone(), entry.clone()))
+                    .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
                     .collect::<BTreeMap<_, _>>(),
             )
         };
-        let mut by_name: BTreeMap<String, Value> = registered
+        let mut by_session: BTreeMap<String, Value> = registered
             .iter()
-            .map(|(name, entry)| (name.clone(), closed_view(name, entry)))
+            .map(|(session_id, entry)| (session_id.clone(), closed_view(session_id, entry)))
             .collect();
-        by_name.extend(live_views);
-        json!({"subagents": by_name.into_values().collect::<Vec<_>>()})
+        by_session.extend(live_views);
+        json!({"subagents": by_session.into_values().collect::<Vec<_>>()})
     }
 }
 
 /// Close a subagent: end the agent process. The registry entry (and so the
-/// session's resumability) is kept; use `forget` to remove it.
+/// session's resumability via `adopt`) is kept; use `forget` to remove it.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CloseArgs {
-    /// Subagent name.
-    name: String,
+    /// Session id, as returned by `spawn`/`adopt`.
+    session_id: String,
 }
 
 struct CloseTool(Arc<AppState>);
@@ -806,24 +914,24 @@ impl Tool for CloseTool {
                 .live
                 .lock()
                 .expect("live poisoned")
-                .remove(&args.name)
+                .remove(&args.session_id)
         };
         match sub {
             Some(sub) => {
                 close_sub(&sub).await;
-                Ok(json!({"name": args.name, "closed": true}))
+                Ok(json!({"session_id": args.session_id, "closed": true}))
             }
             None if self
                 .0
                 .registry
                 .lock()
                 .expect("registry poisoned")
-                .get(&args.name)
+                .get(&args.session_id)
                 .is_some() =>
             {
-                Ok(json!({"name": args.name, "closed": true, "was_live": false}))
+                Ok(json!({"session_id": args.session_id, "closed": true, "was_live": false}))
             }
-            None => Err(Error::UnknownSubagent(args.name).into()),
+            None => Err(Error::UnknownSession(args.session_id).into()),
         }
     }
 }
@@ -832,8 +940,8 @@ impl Tool for CloseTool {
 /// transcript file is kept.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ForgetArgs {
-    /// Subagent name.
-    name: String,
+    /// Session id, as returned by `spawn`/`adopt`.
+    session_id: String,
 }
 
 struct ForgetTool(Arc<AppState>);
@@ -851,7 +959,7 @@ impl Tool for ForgetTool {
                 .live
                 .lock()
                 .expect("live poisoned")
-                .remove(&args.name)
+                .remove(&args.session_id)
         };
         if let Some(sub) = &sub {
             close_sub(sub).await;
@@ -859,13 +967,13 @@ impl Tool for ForgetTool {
         let mut registered = false;
         self.0
             .update_registry(|registry| {
-                registered = registry.remove(&args.name);
+                registered = registry.remove(&args.session_id);
             })
             .await?;
         if sub.is_none() && !registered {
-            return Err(Error::UnknownSubagent(args.name).into());
+            return Err(Error::UnknownSession(args.session_id).into());
         }
-        Ok(json!({"name": args.name, "forgotten": true}))
+        Ok(json!({"session_id": args.session_id, "forgotten": true}))
     }
 }
 
@@ -891,7 +999,7 @@ impl Tool for AgentsTool {
 impl AgentsTool {
     /// Synchronous body: `agents` only reads shared state.
     fn agents(&self) -> Value {
-        // Per-agent: names of its live subagents and the info the first such
+        // Per-agent: ids of its live subagents and the info the first such
         // process reported (agent_info, modes, config options).
         let live: Vec<Arc<Subagent>> = self
             .0
@@ -901,12 +1009,18 @@ impl AgentsTool {
             .values()
             .cloned()
             .collect();
+        let implicit_default = self
+            .0
+            .config
+            .resolve_agent(None)
+            .map(|(name, _)| name.clone())
+            .ok();
         let mut out = Vec::new();
         for (name, agent) in &self.0.config.agents {
             let subs: Vec<&str> = live
                 .iter()
                 .filter(|sub| sub.agent == *name)
-                .map(|sub| sub.name.as_str())
+                .map(|sub| sub.session_id.as_str())
                 .collect();
             let mut view = json!({
                 "name": name,
@@ -914,6 +1028,7 @@ impl AgentsTool {
                 "args": agent.args,
                 "mode": agent.mode,
                 "allow_outside_cwd": agent.allow_outside_cwd,
+                "default": implicit_default.as_ref() == Some(name),
                 "subagents": subs,
             });
             // Agent info is known only once a process initialized.

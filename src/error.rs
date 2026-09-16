@@ -45,44 +45,67 @@ pub enum Error {
         configured: Vec<String>,
     },
 
-    /// The named subagent is neither live nor registered.
-    #[error("unknown subagent '{0}'")]
-    UnknownSubagent(String),
+    /// No agent was passed and none could be inferred.
+    #[error("no agent specified{}", if configured.is_empty() { "; none are configured".to_string() } else { format!("; set 'agent' in [defaults] or pass one of: {}", configured.join(", ")) })]
+    AgentUnspecified {
+        /// Configured agent keys.
+        configured: Vec<String>,
+    },
 
-    /// The subagent name does not match `[A-Za-z0-9._-]+`.
-    #[error("invalid subagent name '{0}': expected [A-Za-z0-9._-]+")]
-    InvalidName(String),
+    /// The session id is neither live nor registered.
+    #[error("unknown session '{0}'")]
+    UnknownSession(String),
 
-    /// A live subagent already holds the name.
-    #[error("subagent '{0}' is already running; close it first")]
-    NameTaken(String),
+    /// The session id is empty.
+    #[error("session id must not be empty")]
+    EmptySessionId,
 
-    /// The name is registered to a past session and the agent cannot resume it.
-    #[error("name '{0}' already registered; pass replace=true to start over")]
-    NameRegistered(String),
+    /// A live subagent already holds the session id.
+    #[error("session '{0}' is already live; close it first")]
+    SessionLive(String),
+
+    /// The agent does not advertise the `loadSession` capability.
+    #[error("agent '{0}' does not support session/load; it cannot adopt sessions")]
+    LoadUnsupported(String),
+
+    /// The registry says the session belongs to a different agent.
+    #[error("session '{session_id}' is registered to agent '{registered}', not '{requested}'")]
+    AgentMismatch {
+        /// The session being adopted.
+        session_id: String,
+        /// The agent the registry recorded.
+        registered: String,
+        /// The agent the caller asked for.
+        requested: String,
+    },
+
+    /// `adopt` could not determine the session's working directory.
+    #[error("cannot determine cwd for session '{session_id}' ({reason}); pass `cwd` explicitly")]
+    SessionCwdUnknown {
+        /// The session being adopted.
+        session_id: String,
+        /// Why discovery failed.
+        reason: String,
+    },
 
     /// The subagent is not in a state that accepts a prompt.
-    #[error("subagent '{name}' is {status}; cannot accept a prompt now")]
+    #[error("session '{session_id}' is {status}; cannot accept a prompt now")]
     NotPromptable {
-        /// Subagent name.
-        name: String,
+        /// Session id.
+        session_id: String,
         /// Current status.
         status: String,
     },
 
-    /// The subagent has no live process (closed but still registered).
-    #[error("subagent '{0}' is not live (closed); use the transcript tool to inspect its history")]
-    NotLive(String),
-
     /// The subagent has no running turn to cancel.
-    #[error("subagent '{0}' has no running turn")]
+    #[error("session '{0}' has no running turn")]
     NotRunning(String),
 
     /// The named permission request is not pending on this subagent.
-    #[error("subagent '{name}' has no pending permission request '{request}'")]
+    #[error("session '{session_id}' has no pending permission request '{request}'")]
     NoSuchPermission {
-        /// Subagent name.
-        name: String,
+        /// Session id.
+        session_id: String,
         /// Permission request id.
         request: String,
     },
@@ -98,11 +121,18 @@ pub enum Error {
         offered: Vec<String>,
     },
 
+    /// `wait`/`wait_any` received a `timeout_secs` below the minimum.
+    #[error("timeout_secs {got} is below the 60s minimum; use `status` for an instant state check")]
+    TimeoutBelowMin {
+        /// The rejected timeout.
+        got: u64,
+    },
+
     /// The requested turn does not exist.
-    #[error("subagent '{name}' has no turn {turn} (has {have})")]
+    #[error("session '{session_id}' has no turn {turn} (has {have})")]
     NoSuchTurn {
-        /// Subagent name.
-        name: String,
+        /// Session id.
+        session_id: String,
         /// Requested 1-based turn number.
         turn: u64,
         /// Number of turns the subagent has completed.
