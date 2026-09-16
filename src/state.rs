@@ -37,12 +37,12 @@ const STDERR_QUOTE_LINES: usize = 20;
 pub struct AppState {
     /// The loaded config file.
     pub config: Config,
-    /// Live subagents by name.
+    /// Live subagents by session id.
     pub live: Mutex<HashMap<String, Arc<Subagent>>>,
-    /// Names reserved by an in-flight `spawn`, before the subagent is live.
-    /// Locked after `live` wherever both are held.
+    /// Session ids reserved by an in-flight `adopt`, before the subagent is
+    /// live. Locked after `live` wherever both are held.
     pub reserved: Mutex<HashSet<String>>,
-    /// The persisted name → session registry.
+    /// The persisted session id → session registry.
     pub registry: Mutex<Registry>,
     /// Serializes registry mutations with their `persist` so the file can
     /// never be overwritten by an older snapshot out of order.
@@ -73,22 +73,22 @@ impl AppState {
         }))
     }
 
-    /// Get a live subagent by name.
+    /// Get a live subagent by session id.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnknownSubagent`] when the name is not live.
+    /// Returns [`Error::UnknownSession`] when the session is not live.
     ///
     /// # Panics
     ///
     /// Panics if the live mutex is poisoned.
-    pub fn get(&self, name: &str) -> Result<Arc<Subagent>> {
+    pub fn get(&self, session_id: &str) -> Result<Arc<Subagent>> {
         self.live
             .lock()
             .expect("live poisoned")
-            .get(name)
+            .get(session_id)
             .cloned()
-            .ok_or_else(|| Error::UnknownSubagent(name.to_string()))
+            .ok_or_else(|| Error::UnknownSession(session_id.to_string()))
     }
 
     /// Mutate the registry, then persist the result.
@@ -271,13 +271,27 @@ impl SubRuntime {
             .cloned()
             .collect()
     }
+
+    /// The session id for log fields; empty until the session is
+    /// established.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned.
+    pub fn session_label(&self) -> String {
+        self.inner
+            .lock()
+            .expect("inner poisoned")
+            .session_id
+            .clone()
+    }
 }
 
 /// A live subagent: one agent process, one ACP session, one transcript.
 #[derive(Debug)]
 pub struct Subagent {
-    /// Caller-chosen name.
-    pub name: String,
+    /// ACP session id — the handle every other tool addresses.
+    pub session_id: String,
     /// Agent config key.
     pub agent: String,
     /// Session working directory.
@@ -305,98 +319,101 @@ pub fn now() -> String {
     jiff::Timestamp::now().to_string()
 }
 
-/// Enforce the `[A-Za-z0-9._-]+` name rule.
+/// Reject an empty session id.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidName`] for an empty or out-of-charset name.
-pub fn validate_name(name: &str) -> Result<()> {
-    if !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
-        Ok(())
+/// Returns [`Error::EmptySessionId`] for an empty id.
+pub const fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty() {
+        Err(Error::EmptySessionId)
     } else {
-        Err(Error::InvalidName(name.to_string()))
+        Ok(())
     }
 }
 
-/// Arguments for [`launch`], as given by the `spawn` tool.
+/// Arguments for [`launch`], as given by the `spawn` and `adopt` tools.
 #[derive(Debug)]
 pub struct Launch {
-    /// Subagent name.
-    pub name: String,
-    /// Agent config key.
+    /// Agent config key (already resolved).
     pub agent: String,
-    /// Session working directory.
+    /// Session working directory (already resolved).
     pub cwd: PathBuf,
-    /// First turn's prompt.
-    pub prompt: String,
+    /// First turn's prompt, if the launch should start one. `adopt` may bind
+    /// the session without prompting.
+    pub prompt: Option<String>,
     /// `session/set_mode` override; falls back to the agent's configured mode.
     pub mode: Option<String>,
     /// `session/set_config_option` overrides merged over the agent's `config`.
     pub config: BTreeMap<String, ConfigValue>,
     /// Permission policy override.
     pub permission: Option<PermissionPolicy>,
-    /// Forget a registered session of this name instead of resuming it.
-    pub replace: bool,
+    /// `adopt`: the existing session id to load instead of `session/new`.
+    pub load: Option<String>,
 }
 
-/// Spawn an agent process, run the ACP handshake, register the subagent, and
-/// start the first turn. Returns once the prompt is in flight.
+/// Spawn an agent process, run the ACP handshake, and register the subagent.
+///
+/// When `prompt` is set, starts the first turn. Returns once the session is
+/// established (and the prompt, if any, is in flight).
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidName`], [`Error::UnknownAgent`],
-/// [`Error::NameTaken`], [`Error::NameRegistered`], [`Error::SpawnFailed`], or
-/// [`Error::Agent`] when the ACP handshake fails. The spawned process is
-/// killed on any error.
+/// Returns [`Error::EmptySessionId`], [`Error::UnknownAgent`],
+/// [`Error::SessionLive`], [`Error::LoadUnsupported`],
+/// [`Error::SpawnFailed`], or [`Error::Agent`] when the ACP handshake fails.
+/// The spawned process is killed on any error.
 ///
 /// # Panics
 ///
 /// Panics if a state mutex is poisoned.
 pub async fn launch(state: &Arc<AppState>, args: Launch) -> Result<Arc<Subagent>> {
-    let (agent_cfg, cwd, prior) = preflight(state, &args)?;
-    // `preflight` reserved the name; release the reservation on any failure.
-    let result = launch_reserved(state, &args, agent_cfg, cwd, prior).await;
-    if result.is_err() {
+    let agent_cfg = state.config.agent(&args.agent)?.clone();
+    let cwd = args.cwd.canonicalize().map_err(|source| {
+        Error::io(format!("cannot resolve cwd {}", args.cwd.display()), source)
+    })?;
+    // Claim the session id atomically across the live and in-flight maps:
+    // the MCP server runs `tools/call`s concurrently, so two `adopt`s of one
+    // session could interleave between this check and `live.insert` below.
+    if let Some(session_id) = &args.load {
+        validate_session_id(session_id)?;
+        let live = state.live.lock().expect("live poisoned");
+        let mut reserved = state.reserved.lock().expect("reserved poisoned");
+        if live.contains_key(session_id) || !reserved.insert(session_id.clone()) {
+            return Err(Error::SessionLive(session_id.clone()));
+        }
+    }
+    let result = launch_inner(state, &args, agent_cfg, cwd).await;
+    if result.is_err()
+        && let Some(session_id) = &args.load
+    {
         state
             .reserved
             .lock()
             .expect("reserved poisoned")
-            .remove(&args.name);
+            .remove(session_id);
     }
     result
 }
 
-/// Everything `launch` does once the name is reserved: open the transcript,
-/// spawn the process, run the handshake, go live, start the first turn.
-async fn launch_reserved(
+/// Everything `launch` does once preflight passed: spawn the process, run
+/// the handshake, register and go live, start the first turn if prompted.
+async fn launch_inner(
     state: &Arc<AppState>,
     args: &Launch,
     agent_cfg: AgentConfig,
     cwd: PathBuf,
-    prior: Option<RegistryEntry>,
 ) -> Result<Arc<Subagent>> {
     let permission = args
         .permission
         .or(agent_cfg.permission)
         .unwrap_or(state.config.defaults.permission);
-    let transcript_path = state
-        .config
-        .defaults
-        .transcript_dir
-        .join(format!("{}.jsonl", args.name));
-    let transcript = TranscriptWriter::create(&transcript_path)
-        .await
-        .map_err(|source| {
-            Error::io(format!("cannot open {}", transcript_path.display()), source)
-        })?;
     let rt = Arc::new(SubRuntime {
         inner: Mutex::new(Inner {
             status: Status::Idle,
-            session_id: String::new(),
+            // `adopt` knows its session id up front; `spawn` fills it in
+            // during the handshake.
+            session_id: args.load.clone().unwrap_or_default(),
             agent_info: None,
             modes: None,
             config_options: Vec::new(),
@@ -406,7 +423,7 @@ async fn launch_reserved(
             pending: Vec::new(),
         }),
         notify: Notify::new(),
-        transcript: tokio::sync::Mutex::new(transcript),
+        transcript: tokio::sync::Mutex::new(TranscriptWriter::deferred()),
         terminals: Terminals::new(HashMap::new()),
         stderr_tail: Mutex::new(VecDeque::new()),
         next_perm: AtomicU64::new(1),
@@ -415,26 +432,41 @@ async fn launch_reserved(
     });
 
     let handler = SubagentHandler::new(
-        args.name.clone(),
         rt.clone(),
         cwd.clone(),
         permission,
         agent_cfg.allow_outside_cwd,
     );
-    let (client, conn, stderr_pump) =
-        connect(&agent_cfg, &cwd, handler, rt.clone(), args.name.clone())?;
+    let (client, conn, stderr_pump) = connect(&agent_cfg, &cwd, handler, rt.clone())?;
 
     // On any handshake failure, kill the child before returning the error.
-    let result = handshake(state, &client, &rt, args, &agent_cfg, prior).await;
-    if let Err(error) = result {
+    let session_id = match handshake(state, &client, &rt, args, &agent_cfg).await {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            rt.closing.store(true, Ordering::Relaxed);
+            client.close();
+            let _ = conn.await;
+            return Err(error);
+        }
+    };
+
+    let transcript_path = state
+        .config
+        .defaults
+        .transcript_dir
+        .join(format!("{session_id}.jsonl"));
+    if let Err(source) = rt.transcript.lock().await.bind(&transcript_path).await {
         rt.closing.store(true, Ordering::Relaxed);
         client.close();
         let _ = conn.await;
-        return Err(error);
+        return Err(Error::io(
+            format!("cannot open {}", transcript_path.display()),
+            source,
+        ));
     }
 
     let sub = Arc::new(Subagent {
-        name: args.name.clone(),
+        session_id: session_id.clone(),
         agent: args.agent.clone(),
         cwd,
         permission,
@@ -445,74 +477,51 @@ async fn launch_reserved(
         stderr_pump: Mutex::new(Some(stderr_pump)),
         rt,
     });
-    // Once the name is in `live`, `preflight` reports it taken even before
-    // the reservation is released — order matters.
-    state
-        .live
-        .lock()
-        .expect("live poisoned")
-        .insert(args.name.clone(), sub.clone());
-    state
-        .reserved
-        .lock()
-        .expect("reserved poisoned")
-        .remove(&args.name);
-    if let Err(error) = start_turn(state.clone(), &sub, args.prompt.clone()).await {
-        state.live.lock().expect("live poisoned").remove(&args.name);
+    go_live(state, &sub).await?;
+    if let Some(session_id) = &args.load {
+        state
+            .reserved
+            .lock()
+            .expect("reserved poisoned")
+            .remove(session_id);
+    }
+    if let Some(prompt) = &args.prompt
+        && let Err(error) = start_turn(state.clone(), &sub, prompt.clone()).await
+    {
+        state
+            .live
+            .lock()
+            .expect("live poisoned")
+            .remove(&session_id);
         return Err(error);
     }
     Ok(sub)
 }
 
-/// Everything checked before a process starts: name validity, agent lookup,
-/// cwd resolution, live-name collision, and the prior registry entry (unless
-/// `replace`). A registered name whose agent differs is rejected up front.
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidName`], [`Error::UnknownAgent`],
-/// [`Error::NameTaken`], [`Error::NameRegistered`], or an I/O error resolving
-/// `cwd`.
-///
-/// # Panics
-///
-/// Panics if a state mutex is poisoned.
-fn preflight(
-    state: &Arc<AppState>,
-    args: &Launch,
-) -> Result<(AgentConfig, PathBuf, Option<RegistryEntry>)> {
-    validate_name(&args.name)?;
-    let agent_cfg = state.config.agent(&args.agent)?.clone();
-    let cwd = args.cwd.canonicalize().map_err(|source| {
-        Error::io(format!("cannot resolve cwd {}", args.cwd.display()), source)
-    })?;
-    // Claim the name atomically across the live and in-flight maps: the MCP
-    // server runs `tools/call`s concurrently, so two `spawn`s of one name can
-    // interleave between this check and `live.insert` in `launch_reserved`.
-    {
-        let live = state.live.lock().expect("live poisoned");
-        let mut reserved = state.reserved.lock().expect("reserved poisoned");
-        if live.contains_key(&args.name) || !reserved.insert(args.name.clone()) {
-            return Err(Error::NameTaken(args.name.clone()));
+/// Insert the subagent into the live map, refusing (and killing its
+/// process) when an agent produced a session id that is already live.
+async fn go_live(state: &Arc<AppState>, sub: &Arc<Subagent>) -> Result<()> {
+    let collision = {
+        let mut live = state.live.lock().expect("live poisoned");
+        if live.contains_key(&sub.session_id) {
+            true
+        } else {
+            live.insert(sub.session_id.clone(), sub.clone());
+            false
         }
-    }
-    let prior = if args.replace {
-        None
-    } else {
-        state
-            .registry
-            .lock()
-            .expect("registry poisoned")
-            .get(&args.name)
-            .cloned()
     };
-    // A name registered to a different agent cannot resume that session.
-    if let Some(entry) = &prior
-        && entry.agent != args.agent
-    {
-        return Err(Error::NameRegistered(args.name.clone()));
+    if !collision {
+        return Ok(());
     }
-    Ok((agent_cfg, cwd, prior))
+    // A second live session with the same id (an agent reusing ids) would
+    // shadow the first; refuse and kill this process.
+    sub.rt.closing.store(true, Ordering::Relaxed);
+    sub.client.clone().close();
+    let conn = sub.conn.lock().expect("conn poisoned").take();
+    if let Some(conn) = conn {
+        let _ = conn.await;
+    }
+    Err(Error::SessionLive(sub.session_id.clone()))
 }
 
 /// Spawn the child process, capture its stderr, and connect the ACP client.
@@ -526,7 +535,6 @@ fn connect(
     cwd: &std::path::Path,
     handler: SubagentHandler,
     rt: Arc<SubRuntime>,
-    name: String,
 ) -> Result<(AcpClient<SubagentHandler>, JoinHandle<()>, JoinHandle<()>)> {
     let mut command = async_process::Command::new(&agent_cfg.command);
     command
@@ -559,38 +567,35 @@ fn connect(
         connection.await;
         on_disconnect(&conn_rt);
     });
-    let stderr_pump = tokio::spawn(pump_stderr(stderr, rt, name));
+    let stderr_pump = tokio::spawn(pump_stderr(stderr, rt));
     Ok((client, conn, stderr_pump))
 }
 
 /// `initialize`, `session/new` or `session/load`, `set_mode`, and the
-/// `set_config_option` calls. Also writes/refreshes the registry entry.
+/// `set_config_option` calls; upserts the registry entry. Returns the
+/// session id (agent-assigned for `session/new`, the adopted id for
+/// `session/load`).
 async fn handshake(
     state: &Arc<AppState>,
     client: &AcpClient<SubagentHandler>,
     rt: &SubRuntime,
     args: &Launch,
     agent_cfg: &AgentConfig,
-    prior: Option<RegistryEntry>,
-) -> Result<()> {
+) -> Result<String> {
     let agent_error = |source: ClientError| Error::Agent {
-        agent: args.name.clone(),
+        agent: args.agent.clone(),
         source,
     };
     let init = client.initialize().await.map_err(agent_error)?;
-    let (session_id, modes, config_options) = if let Some(entry) = &prior {
+    let (session_id, modes, config_options) = if let Some(load) = &args.load {
         if !init.agent_capabilities.load_session {
-            return Err(Error::NameRegistered(args.name.clone()));
+            return Err(Error::LoadUnsupported(args.agent.clone()));
         }
         let result = client
-            .load_session(&entry.session_id, args.cwd.clone(), vec![])
+            .load_session(load, args.cwd.clone(), vec![])
             .await
             .map_err(agent_error)?;
-        (
-            entry.session_id.clone(),
-            result.modes,
-            result.config_options,
-        )
+        (load.clone(), result.modes, result.config_options)
     } else {
         let result = client
             .new_session(args.cwd.clone(), vec![])
@@ -598,13 +603,19 @@ async fn handshake(
             .map_err(agent_error)?;
         (result.session_id, result.modes, result.config_options)
     };
+    let turn_offset = state
+        .registry
+        .lock()
+        .expect("registry poisoned")
+        .get(&session_id)
+        .map_or(0, |entry| entry.turns);
     {
         let mut inner = rt.inner.lock().expect("inner poisoned");
         inner.session_id.clone_from(&session_id);
         inner.agent_info = init.agent_info;
         inner.modes = modes;
         inner.config_options = config_options.unwrap_or_default();
-        inner.turn_offset = prior.as_ref().map_or(0, |entry| entry.turns);
+        inner.turn_offset = turn_offset;
     }
     if let Some(mode) = args.mode.clone().or_else(|| agent_cfg.mode.clone()) {
         client
@@ -629,23 +640,30 @@ async fn handshake(
             .map_err(agent_error)?;
         rt.inner.lock().expect("inner poisoned").config_options = updated;
     }
-    // Only a fresh session writes a new entry; a resumed one keeps its
-    // `created` timestamp and turn count.
-    if prior.is_none() {
-        let entry = RegistryEntry {
-            agent: args.agent.clone(),
-            session_id: session_id.clone(),
-            cwd: args.cwd.clone(),
-            created: now(),
-            last_turn: None,
-            turns: 0,
-        };
-        state
-            .update_registry(|registry| registry.insert(args.name.clone(), entry))
-            .await?;
-    }
-    debug!(name = %args.name, %session_id, "subagent session established");
-    Ok(())
+    // A registered session keeps its `created` timestamp and turn count;
+    // a new one gets a fresh entry.
+    let agent = args.agent.clone();
+    let cwd = args.cwd.clone();
+    state
+        .update_registry(|registry| match registry.get_mut(&session_id) {
+            Some(entry) => {
+                entry.agent.clone_from(&agent);
+                entry.cwd.clone_from(&cwd);
+            }
+            None => registry.insert(
+                session_id.clone(),
+                RegistryEntry {
+                    agent: agent.clone(),
+                    cwd: cwd.clone(),
+                    created: now(),
+                    last_turn: None,
+                    turns: 0,
+                },
+            ),
+        })
+        .await?;
+    debug!(%session_id, agent = %args.agent, "subagent session established");
+    Ok(session_id)
 }
 
 /// Connection task epilogue: a dead agent marks the subagent failed unless
@@ -666,13 +684,13 @@ fn on_disconnect(rt: &SubRuntime) {
 }
 
 /// Pump agent stderr into the tail buffer and tracing.
-async fn pump_stderr(stderr: async_process::ChildStderr, rt: Arc<SubRuntime>, name: String) {
+async fn pump_stderr(stderr: async_process::ChildStderr, rt: Arc<SubRuntime>) {
     use futures_lite::{AsyncBufReadExt, StreamExt};
     let mut lines = futures_lite::io::BufReader::new(stderr).lines();
     while let Some(line) = lines.next().await {
         match line {
             Ok(line) => {
-                debug!(subagent = %name, "agent stderr: {line}");
+                debug!(subagent = %rt.session_label(), "agent stderr: {line}");
                 let mut tail = rt.stderr_tail.lock().expect("stderr tail poisoned");
                 if tail.len() >= STDERR_TAIL_LINES {
                     tail.pop_front();
@@ -680,7 +698,7 @@ async fn pump_stderr(stderr: async_process::ChildStderr, rt: Arc<SubRuntime>, na
                 tail.push_back(line);
             }
             Err(error) => {
-                debug!(subagent = %name, %error, "agent stderr read failed");
+                debug!(subagent = %rt.session_label(), %error, "agent stderr read failed");
                 return;
             }
         }
@@ -706,7 +724,7 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         if !inner.status.accepts_prompt() {
             return Err(Error::NotPromptable {
-                name: sub.name.clone(),
+                session_id: sub.session_id.clone(),
                 status: inner.status.name().to_string(),
             });
         }
@@ -729,15 +747,9 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
     sub.rt.notify.notify_waiters();
 
     let client = sub.client.clone();
-    let session_id = sub
-        .rt
-        .inner
-        .lock()
-        .expect("inner poisoned")
-        .session_id
-        .clone();
+    let session_id = sub.session_id.clone();
     let rt = sub.rt.clone();
-    let name = sub.name.clone();
+    let task_session_id = session_id.clone();
     let mut prompt: PromptFut = Box::pin(async move {
         client
             .prompt(
@@ -762,7 +774,7 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
     // A synchronously-failed send resolves on the first poll; wrap the
     // outcome so the same turn-end path handles it.
     let prompt: PromptFut = ready.map_or(prompt, |outcome| Box::pin(async move { outcome }));
-    tokio::spawn(turn_task(state, prompt, turn_n, rt, name));
+    tokio::spawn(turn_task(state, prompt, turn_n, rt, task_session_id));
     Ok(())
 }
 
@@ -777,7 +789,7 @@ async fn turn_task(
     prompt: PromptFut,
     turn_n: u64,
     rt: Arc<SubRuntime>,
-    name: String,
+    session_id: String,
 ) {
     let outcome = prompt.await;
     match outcome {
@@ -833,7 +845,7 @@ async fn turn_task(
     };
     let result = state
         .update_registry(|registry| {
-            if let Some(entry) = registry.get_mut(&name) {
+            if let Some(entry) = registry.get_mut(&session_id) {
                 entry.turns = turns;
                 entry.last_turn = Some(now());
             }
@@ -843,4 +855,30 @@ async fn turn_task(
         warn!(%error, "registry persist failed");
     }
     rt.notify.notify_waiters();
+}
+
+/// Best-effort `cwd` discovery for `adopt`.
+///
+/// Reads the session's working directory out of the agent's local session
+/// database (devin CLI layout — a `sessions` table with `id` and
+/// `working_directory` columns). Returns `Ok(None)` when the database has
+/// no row for the session.
+///
+/// # Errors
+///
+/// Returns an error when the database cannot be opened or queried.
+pub fn discover_session_cwd(db: &std::path::Path, session_id: &str) -> Result<Option<PathBuf>> {
+    use rusqlite::OptionalExtension;
+    let context = || format!("cannot query {}", db.display());
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|source| Error::io(context(), std::io::Error::other(source)))?;
+    conn.query_row(
+        "SELECT working_directory FROM sessions WHERE id = ?1",
+        [session_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|cwd| cwd.map(PathBuf::from))
+    .map_err(|source| Error::io(context(), std::io::Error::other(source)))
 }

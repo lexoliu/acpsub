@@ -73,6 +73,34 @@ impl Config {
         })
     }
 
+    /// Resolve which agent a tool call should use: an explicit name wins,
+    /// then `[defaults] agent`, then — when exactly one agent is configured —
+    /// the only choice.
+    ///
+    /// Returns the agent's key and config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownAgent`] for a name (explicit or default) that
+    /// is not configured, or [`Error::AgentUnspecified`] when nothing was
+    /// requested and no unambiguous default exists.
+    pub fn resolve_agent(&self, requested: Option<&str>) -> Result<(&String, &AgentConfig)> {
+        let Some(name) = requested.or(self.defaults.agent.as_deref()) else {
+            return match (self.agents.first_key_value(), self.agents.len()) {
+                (Some(entry), 1) => Ok(entry),
+                _ => Err(Error::AgentUnspecified {
+                    configured: self.agent_names(),
+                }),
+            };
+        };
+        self.agents
+            .get_key_value(name)
+            .ok_or_else(|| Error::UnknownAgent {
+                name: name.to_string(),
+                configured: self.agent_names(),
+            })
+    }
+
     /// Sorted configured agent names.
     #[must_use]
     pub fn agent_names(&self) -> Vec<String> {
@@ -83,12 +111,15 @@ impl Config {
 /// Server-wide defaults.
 #[derive(Debug, Clone)]
 pub struct Defaults {
+    /// Agent key used when a tool call does not name one. When unset and
+    /// exactly one agent is configured, that agent is the implicit default.
+    pub agent: Option<String>,
     /// Permission policy used when neither the agent entry nor the spawn call
     /// overrides it.
     pub permission: PermissionPolicy,
-    /// Directory holding `<name>.jsonl` transcript files.
+    /// Directory holding `<session_id>.jsonl` transcript files.
     pub transcript_dir: PathBuf,
-    /// Path of the subagent registry JSON file.
+    /// Path of the session registry JSON file.
     pub registry: PathBuf,
 }
 
@@ -134,6 +165,32 @@ pub struct AgentConfig {
     pub allow_outside_cwd: bool,
     /// Per-agent permission policy override.
     pub permission: Option<PermissionPolicy>,
+    /// SQLite database mapping session ids to working directories, consulted
+    /// by `adopt` to discover `cwd` (devin CLI layout: a `sessions` table
+    /// with `id` and `working_directory` columns). When unset for a `devin`
+    /// agent, `~/.local/share/devin/cli/sessions.db` is tried automatically.
+    pub sessions_db: Option<PathBuf>,
+}
+
+impl AgentConfig {
+    /// The session database `adopt` should consult for `cwd` discovery.
+    ///
+    /// Beyond the configured path, a `devin` agent falls back to the devin
+    /// CLI's local store when that file exists.
+    #[must_use]
+    pub fn session_db_path(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.sessions_db {
+            return Some(path.clone());
+        }
+        let is_devin = Path::new(&self.command)
+            .file_name()
+            .is_some_and(|name| name == "devin");
+        if !is_devin {
+            return None;
+        }
+        let path = dirs::home_dir()?.join(".local/share/devin/cli/sessions.db");
+        path.exists().then_some(path)
+    }
 }
 
 /// A session config option value: a select value id or a boolean.
@@ -158,6 +215,7 @@ struct RawConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDefaults {
+    agent: Option<String>,
     permission: Option<PermissionPolicy>,
     transcript_dir: Option<String>,
     registry: Option<String>,
@@ -177,12 +235,14 @@ struct RawAgentConfig {
     #[serde(default)]
     allow_outside_cwd: bool,
     permission: Option<PermissionPolicy>,
+    sessions_db: Option<String>,
 }
 
 impl RawConfig {
     fn into_config(self) -> Config {
         Config {
             defaults: Defaults {
+                agent: self.defaults.agent,
                 permission: self.defaults.permission.unwrap_or_default(),
                 transcript_dir: expand_tilde(
                     self.defaults
@@ -216,6 +276,7 @@ impl RawAgentConfig {
             config: self.config,
             allow_outside_cwd: self.allow_outside_cwd,
             permission: self.permission,
+            sessions_db: self.sessions_db.as_deref().map(expand_tilde),
         }
     }
 }

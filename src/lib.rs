@@ -1,15 +1,16 @@
 //! # acpsub
 //!
-//! `acpsub` runs any [ACP](https://agentclientprotocol.com) agent as a named,
-//! resumable subagent behind MCP tools. An orchestrating agent (Claude Code,
-//! aither, …) calls `spawn` with a configured agent name; `acpsub` starts the
-//! process, opens an ACP session, streams every `session/update` to a
-//! per-subagent JSONL transcript, and serves the agent's `fs/*`, `terminal/*`,
-//! and permission requests under a configurable policy.
+//! `acpsub` runs any [ACP](https://agentclientprotocol.com) agent as a
+//! resumable subagent behind MCP tools. An orchestrating agent calls
+//! `spawn` with a configured agent key; `acpsub` starts the process, opens
+//! an ACP session, streams every `session/update` to a per-session JSONL
+//! transcript, and serves the agent's `fs/*`, `terminal/*`, and permission
+//! requests under a configurable policy.
 //!
-//! Subagents persist in a registry keyed by name, so a `spawn` on a
-//! previously-registered name resumes the session with `session/load` when
-//! the agent supports it.
+//! The agent-assigned `session_id` is the handle every tool addresses.
+//! Sessions persist in a registry keyed by that id, so `adopt` can resume
+//! one — whether acpsub spawned it or it was created elsewhere — with
+//! `session/load` when the agent supports it.
 
 pub mod config;
 pub mod error;

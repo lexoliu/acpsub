@@ -17,19 +17,20 @@ async fn spawn_wait_reply() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    let spawned = call_json(&tools, "spawn", spawn_args("a", dir.path(), "hi")).await;
-    assert_eq!(spawned["name"], "a");
+    let spawned = call_json(&tools, "spawn", spawn_args(dir.path(), "hi")).await;
     assert_eq!(spawned["state"], "running");
-    assert_eq!(spawned["session_id"], "sess-1");
+    let sid = spawned["session_id"].as_str().expect("session_id");
+    assert!(sid.starts_with("sess-"), "{sid}");
+    assert!(spawned.get("name").is_none(), "no name handle: {spawned}");
 
-    let done = wait(&tools, "a", 60).await;
+    let done = wait(&tools, sid, 60).await;
     assert_eq!(done["state"], "done");
     assert_eq!(done["stop_reason"], "end_turn");
     assert_eq!(done["reply"], "Hello abworld", "{done}");
     assert_eq!(done["tool_calls"][0]["id"], "tc-1");
     assert_eq!(done["tool_calls"][0]["status"], "completed");
 
-    let result = call_json(&tools, "result", json!({"name": "a"})).await;
+    let result = call_json(&tools, "result", json!({"session_id": sid})).await;
     assert_eq!(result["reply"], "Hello abworld");
     assert_eq!(result["turn"], 1);
 }
@@ -42,21 +43,36 @@ async fn send_followup_turn() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("b", dir.path(), "hi")).await;
-    wait(&tools, "b", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
 
-    call_json(&tools, "send", json!({"name": "b", "prompt": "again"})).await;
-    let done = wait(&tools, "b", 60).await;
+    call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "again"}),
+    )
+    .await;
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done");
 
-    let status = call_json(&tools, "status", json!({"name": "b"})).await;
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(status["turns"], 2);
     assert_eq!(status["state"], "done");
     assert_eq!(status["last_stop_reason"], "end_turn");
 
-    let first = call_json(&tools, "result", json!({"name": "b", "turn": 1})).await;
+    let first = call_json(
+        &tools,
+        "result",
+        json!({"session_id": sid.as_str(), "turn": 1}),
+    )
+    .await;
     assert_eq!(first["turn"], 1);
-    let missing = call_err(&tools, "result", json!({"name": "b", "turn": 9})).await;
+    let missing = call_err(
+        &tools,
+        "result",
+        json!({"session_id": sid.as_str(), "turn": 9}),
+    )
+    .await;
     assert!(missing.contains("no turn 9"), "{missing}");
 }
 
@@ -68,12 +84,12 @@ async fn cancel_mid_turn() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("c", dir.path(), "wait")).await;
-    let running = call_json(&tools, "status", json!({"name": "c"})).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+    let running = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(running["state"], "running");
 
-    call_json(&tools, "cancel", json!({"name": "c"})).await;
-    let done = wait(&tools, "c", 60).await;
+    call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "cancelled", "{done}");
     assert_eq!(done["stop_reason"], "cancelled");
 }
@@ -89,15 +105,16 @@ async fn wait_returns_when_cancel_runs_concurrently() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     let tools = std::sync::Arc::new(tools);
-    call_json(&tools, "spawn", spawn_args("w", dir.path(), "wait")).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
 
     let waiter = {
         let tools = tools.clone();
-        tokio::spawn(async move { wait(&tools, "w", 60).await })
+        let sid = sid.clone();
+        tokio::spawn(async move { wait(&tools, &sid, 60).await })
     };
     // Let the prompt reach the agent so the cancel answers it.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    call_json(&tools, "cancel", json!({"name": "w"})).await;
+    call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
 
     let done = waiter.await.expect("wait task panicked");
     assert_eq!(done["state"], "cancelled", "{done}");
@@ -114,14 +131,19 @@ async fn wait_rejects_timeout_below_min() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("s", dir.path(), "wait")).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
 
-    let err = call_err(&tools, "wait", json!({"name": "s", "timeout_secs": 30})).await;
+    let err = call_err(
+        &tools,
+        "wait",
+        json!({"session_id": sid.as_str(), "timeout_secs": 30}),
+    )
+    .await;
     assert!(err.contains("below the 60s minimum"), "{err}");
     let err = call_err(
         &tools,
         "wait_any",
-        json!({"names": ["s"], "timeout_secs": 1}),
+        json!({"session_ids": [sid.as_str()], "timeout_secs": 1}),
     )
     .await;
     assert!(err.contains("below the 60s minimum"), "{err}");
@@ -135,11 +157,11 @@ async fn permission_ask_then_permit() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    let mut args = spawn_args("d", dir.path(), "PERMISSION go");
+    let mut args = spawn_args(dir.path(), "PERMISSION go");
     args["permission"] = json!("ask");
-    call_json(&tools, "spawn", args).await;
+    let sid = spawn_id(&tools, args).await;
 
-    let waiting = wait(&tools, "d", 60).await;
+    let waiting = wait(&tools, &sid, 60).await;
     assert_eq!(waiting["state"], "needs_permission", "{waiting}");
     let pending = &waiting["pending_permission"];
     assert_eq!(pending["tool_call"]["id"], "tc-1");
@@ -148,7 +170,7 @@ async fn permission_ask_then_permit() {
     let bad = call_err(
         &tools,
         "permit",
-        json!({"name": "d", "request_id": request_id, "option_id": "nope"}),
+        json!({"session_id": sid.as_str(), "request_id": request_id, "option_id": "nope"}),
     )
     .await;
     assert!(bad.contains("not offered"), "{bad}");
@@ -156,10 +178,10 @@ async fn permission_ask_then_permit() {
     call_json(
         &tools,
         "permit",
-        json!({"name": "d", "request_id": request_id, "option_id": "allow-1"}),
+        json!({"session_id": sid.as_str(), "request_id": request_id, "option_id": "allow-1"}),
     )
     .await;
-    let done = wait(&tools, "d", 60).await;
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done", "{done}");
     assert!(
         done["reply"].as_str().unwrap().contains("perm:allow-1"),
@@ -175,10 +197,10 @@ async fn permission_deny_policy() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    let mut args = spawn_args("e", dir.path(), "PERMISSION go");
+    let mut args = spawn_args(dir.path(), "PERMISSION go");
     args["permission"] = json!("deny");
-    call_json(&tools, "spawn", args).await;
-    let done = wait(&tools, "e", 60).await;
+    let sid = spawn_id(&tools, args).await;
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done", "{done}");
     assert!(
         done["reply"].as_str().unwrap().contains("perm:deny-1"),
@@ -197,37 +219,30 @@ async fn fs_read_inside_and_outside_cwd() {
     std::fs::write(&inside, "inner-content").unwrap();
     let (_state, tools) = test_state(dir.path());
 
-    call_json(
+    let sid = spawn_id(
         &tools,
-        "spawn",
-        spawn_args("f", dir.path(), &format!("READ {}", inside.display())),
+        spawn_args(dir.path(), &format!("READ {}", inside.display())),
     )
     .await;
-    let done = wait(&tools, "f", 60).await;
+    let done = wait(&tools, &sid, 60).await;
     assert!(
         done["reply"].as_str().unwrap().contains("fs:inner-content"),
         "{done}"
     );
 
-    call_json(
-        &tools,
-        "spawn",
-        spawn_args("g", dir.path(), "READ /etc/hosts"),
-    )
-    .await;
-    let done = wait(&tools, "g", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "READ /etc/hosts")).await;
+    let done = wait(&tools, &sid, 60).await;
     let reply = done["reply"].as_str().unwrap();
     assert!(reply.contains("fserr:"), "{reply}");
     assert!(reply.contains("outside the session cwd"), "{reply}");
 
     // The wideopen agent may leave its cwd.
-    call_json(
+    let sid = spawn_id(
         &tools,
-        "spawn",
-        json!({"name": "h", "agent": "wideopen", "cwd": dir.path(), "prompt": "READ /etc/hosts"}),
+        json!({"agent": "wideopen", "cwd": dir.path(), "prompt": "READ /etc/hosts"}),
     )
     .await;
-    let done = wait(&tools, "h", 60).await;
+    let done = wait(&tools, &sid, 60).await;
     assert!(done["reply"].as_str().unwrap().contains("fs:"), "{done}");
     assert!(
         !done["reply"].as_str().unwrap().contains("fserr:"),
@@ -243,13 +258,8 @@ async fn terminal_run() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(
-        &tools,
-        "spawn",
-        spawn_args("t", dir.path(), "RUN echo hello-term"),
-    )
-    .await;
-    let done = wait(&tools, "t", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "RUN echo hello-term")).await;
+    let done = wait(&tools, &sid, 60).await;
     let reply = done["reply"].as_str().unwrap().to_string();
     assert!(reply.contains("term:hello-term"), "{reply}");
     assert!(reply.contains("exit:0"), "{reply}");
@@ -265,13 +275,12 @@ async fn terminal_run_shell_line() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(
+    let sid = spawn_id(
         &tools,
-        "spawn",
-        spawn_args("t", dir.path(), "RUNLINE echo shell-$((40 + 2))"),
+        spawn_args(dir.path(), "RUNLINE echo shell-$((40 + 2))"),
     )
     .await;
-    let done = wait(&tools, "t", 60).await;
+    let done = wait(&tools, &sid, 60).await;
     let reply = done["reply"].as_str().unwrap().to_string();
     assert!(reply.contains("term:shell-42"), "{reply}");
     assert!(reply.contains("exit:0"), "{reply}");
@@ -285,10 +294,10 @@ async fn transcript_rendering() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("tr", dir.path(), "hi")).await;
-    wait(&tools, "tr", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
 
-    let text = call_text(&tools, "transcript", json!({"name": "tr"})).await;
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
     assert!(text.contains("=== [turn 1] USER\nhi"), "{text}");
     assert!(text.contains("--- ASSISTANT\nHello"), "{text}");
     assert!(text.contains("--- ASSISTANT\nab"), "{text}");
@@ -302,7 +311,7 @@ async fn transcript_rendering() {
     let with_thinking = call_text(
         &tools,
         "transcript",
-        json!({"name": "tr", "thinking": true}),
+        json!({"session_id": sid.as_str(), "thinking": true}),
     )
     .await;
     assert!(
@@ -310,87 +319,337 @@ async fn transcript_rendering() {
         "{with_thinking}"
     );
 
-    let tail = call_text(&tools, "transcript", json!({"name": "tr", "tail": 1})).await;
+    let tail = call_text(
+        &tools,
+        "transcript",
+        json!({"session_id": sid.as_str(), "tail": 1}),
+    )
+    .await;
     assert!(tail.contains("END end_turn"), "{tail}");
     assert!(!tail.contains("USER"), "{tail}");
 }
 
+/// `adopt` on a registered session resumes it via `session/load` — the only
+/// resume path; `spawn` always starts fresh.
 #[tokio::test(flavor = "multi_thread")]
-async fn registry_resume_via_load() {
+async fn adopt_registered_session_resumes() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("res", dir.path(), "hi")).await;
-    wait(&tools, "res", 60).await;
-    call_json(&tools, "close", json!({"name": "res"})).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
 
-    // Registered but not live: the fake agent advertises loadSession, so the
-    // second spawn runs session/load and keeps the session id.
-    let resumed = call_json(&tools, "spawn", spawn_args("res", dir.path(), "again")).await;
-    assert_eq!(resumed["session_id"], "sess-1");
-    let done = wait(&tools, "res", 60).await;
+    // Registry knows the session: agent and cwd resolve without arguments.
+    let adopted = call_json(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "prompt": "again"}),
+    )
+    .await;
+    assert_eq!(adopted["session_id"], sid);
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done");
 
-    let status = call_json(&tools, "status", json!({"name": "res"})).await;
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(status["turns"], 2);
-    let text = call_text(&tools, "transcript", json!({"name": "res"})).await;
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
     assert!(text.contains("--- USER\nloaded user message"), "{text}");
 }
 
+/// `adopt` without `prompt` binds the session and leaves it idle; `send`
+/// starts the first turn.
 #[tokio::test(flavor = "multi_thread")]
-async fn registry_no_load_requires_replace() {
+async fn adopt_without_prompt_idles_until_send() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    let mut args = spawn_args("nl", dir.path(), "hi");
-    args["agent"] = json!("noload");
-    call_json(&tools, "spawn", args.clone()).await;
-    wait(&tools, "nl", 60).await;
-    call_json(&tools, "close", json!({"name": "nl"})).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
 
-    let err = call_err(&tools, "spawn", args.clone()).await;
-    assert!(err.contains("already registered"), "{err}");
+    let adopted = call_json(&tools, "adopt", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(adopted["state"], "idle", "{adopted}");
 
-    // replace=true starts a fresh session: the transcript gains a second turn
-    // but no session/load replay record.
-    args["replace"] = json!(true);
-    call_json(&tools, "spawn", args).await;
-    let done = wait(&tools, "nl", 60).await;
+    call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "again"}),
+    )
+    .await;
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done");
-    let text = call_text(&tools, "transcript", json!({"name": "nl"})).await;
-    assert_eq!(text.matches("=== [turn 1] USER").count(), 2, "{text}");
-    assert!(!text.contains("loaded user message"), "{text}");
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["turns"], 2);
+}
+
+/// An agent without `loadSession` cannot adopt.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_requires_load_capability() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let mut args = spawn_args(dir.path(), "hi");
+    args["agent"] = json!("noload");
+    let sid = spawn_id(&tools, args).await;
+    wait(&tools, &sid, 60).await;
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+
+    let err = call_err(&tools, "adopt", json!({"session_id": sid.as_str()})).await;
+    assert!(err.contains("does not support session/load"), "{err}");
+}
+
+/// `adopt` on a session acpsub never saw needs only an explicit `cwd`.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_external_session_with_explicit_cwd() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let adopted = call_json(
+        &tools,
+        "adopt",
+        json!({"session_id": "ext-42", "agent": "fake",
+               "cwd": dir.path(), "prompt": "hi"}),
+    )
+    .await;
+    assert_eq!(adopted["session_id"], "ext-42");
+    let done = wait(&tools, "ext-42", 60).await;
+    assert_eq!(done["state"], "done");
+}
+
+/// With no registry entry and no session database, `adopt` cannot guess the
+/// cwd and asks for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_without_discoverable_cwd_errors() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let err = call_err(
+        &tools,
+        "adopt",
+        json!({"session_id": "ghost", "agent": "fake"}),
+    )
+    .await;
+    assert!(err.contains("cannot determine cwd"), "{err}");
+    assert!(err.contains("pass `cwd` explicitly"), "{err}");
+}
+
+/// A `sessions_db` maps unknown session ids to their working directory, so
+/// `adopt` does not need `cwd`.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_discovers_cwd_from_sessions_db() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("sessions.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT NOT NULL)",
+            [],
+        )
+        .expect("create table");
+        conn.execute(
+            "INSERT INTO sessions (id, working_directory) VALUES (?1, ?2)",
+            rusqlite::params!["ext-9", dir.path().to_string_lossy()],
+        )
+        .expect("insert row");
+    }
+    let fake = AgentConfig {
+        sessions_db: Some(db_path),
+        ..fake_agent_config()
+    };
+    let (_state, tools) =
+        test_state_with_agents(dir.path(), BTreeMap::from([("fake".to_string(), fake)]));
+
+    let adopted = call_json(
+        &tools,
+        "adopt",
+        json!({"session_id": "ext-9", "prompt": "hi"}),
+    )
+    .await;
+    assert_eq!(adopted["session_id"], "ext-9");
+    let done = wait(&tools, "ext-9", 60).await;
+    assert_eq!(done["state"], "done");
+    let status = call_json(&tools, "status", json!({"session_id": "ext-9"})).await;
+    assert_eq!(
+        status["cwd"].as_str().map(std::path::Path::new),
+        Some(dir.path().canonicalize().unwrap().as_path()),
+        "{status}"
+    );
+}
+
+/// `adopt` on a live session id is refused; so is a second concurrent one.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_rejects_live_and_concurrent() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
+
+    let err = call_err(&tools, "adopt", json!({"session_id": sid.as_str()})).await;
+    assert!(err.contains("already live"), "{err}");
+
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+    let tools = std::sync::Arc::new(tools);
+    let first = {
+        let tools = tools.clone();
+        let sid = sid.clone();
+        tokio::spawn(
+            async move { call(&tools, "adopt", json!({"session_id": sid.as_str()})).await },
+        )
+    };
+    let second = {
+        let tools = tools.clone();
+        tokio::spawn(
+            async move { call(&tools, "adopt", json!({"session_id": sid.as_str()})).await },
+        )
+    };
+    let mut succeeded = 0;
+    let mut errors = Vec::new();
+    for outcome in [first.await.expect("task"), second.await.expect("task")] {
+        match outcome {
+            Ok(result) if result.is_error() => {
+                errors.push(result.error_message().unwrap_or("?").to_string());
+            }
+            Ok(_) => succeeded += 1,
+            Err(error) => errors.push(error),
+        }
+    }
+    assert_eq!(succeeded, 1, "{errors:?}");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("already live"), "{}", errors[0]);
+}
+
+/// The registry records which agent owns a session; an explicit `agent`
+/// that disagrees is rejected before any process starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_agent_mismatch_rejected() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+
+    let err = call_err(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "agent": "noload"}),
+    )
+    .await;
+    assert!(err.contains("registered to agent 'fake'"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn list_and_unknown_names() {
+async fn adopt_empty_session_id_rejected() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("l1", dir.path(), "hi")).await;
-    wait(&tools, "l1", 60).await;
+    let err = call_err(
+        &tools,
+        "adopt",
+        json!({"session_id": "", "agent": "fake", "cwd": dir.path()}),
+    )
+    .await;
+    assert!(err.contains("must not be empty"), "{err}");
+}
+
+/// `agent` is optional: `[defaults] agent` wins, then a single configured
+/// agent; several agents without a default is an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn default_agent_resolution() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+
+    // No default, three agents: omitting `agent` errors.
+    let (_state, tools) = test_state(dir.path());
+    let err = call_err(&tools, "spawn", json!({"cwd": dir.path(), "prompt": "hi"})).await;
+    assert!(err.contains("no agent specified"), "{err}");
+
+    // A configured default is used.
+    let (_state, tools) = test_state_full(
+        dir.path(),
+        Some("fake"),
+        BTreeMap::from([
+            ("fake".to_string(), fake_agent_config()),
+            (
+                "other".to_string(),
+                AgentConfig {
+                    command: "acpsub-no-such-binary".to_string(),
+                    ..fake_agent_config()
+                },
+            ),
+        ]),
+    );
+    let sid = spawn_id(&tools, json!({"cwd": dir.path(), "prompt": "hi"})).await;
+    wait(&tools, &sid, 60).await;
+
+    // A single configured agent is the implicit default.
+    let dir2 = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state_with_agents(
+        dir2.path(),
+        BTreeMap::from([("fake".to_string(), fake_agent_config())]),
+    );
+    let sid = spawn_id(&tools, json!({"cwd": dir2.path(), "prompt": "hi"})).await;
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_and_unknown_sessions() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
 
     let list = call_json(&tools, "list", json!({})).await;
     let subs = list["subagents"].as_array().unwrap();
-    assert!(subs.iter().any(|s| s["name"] == "l1" && s["live"] == true));
+    assert!(
+        subs.iter()
+            .any(|s| s["session_id"] == sid && s["live"] == true)
+    );
 
-    let err = call_err(&tools, "status", json!({"name": "nobody"})).await;
-    assert!(err.contains("unknown subagent"), "{err}");
-    let err = call_err(&tools, "spawn", spawn_args("bad name!", dir.path(), "hi")).await;
-    assert!(err.contains("invalid subagent name"), "{err}");
+    let err = call_err(&tools, "status", json!({"session_id": "nobody"})).await;
+    assert!(err.contains("unknown session"), "{err}");
     let err = call_err(
         &tools,
         "spawn",
-        json!({"name": "x", "agent": "nobody", "cwd": dir.path(), "prompt": "hi"}),
+        json!({"agent": "nobody", "cwd": dir.path(), "prompt": "hi"}),
     )
     .await;
     assert!(err.contains("unknown agent 'nobody'"), "{err}");
@@ -404,17 +663,17 @@ async fn wait_any_returns_first_done() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("w1", dir.path(), "wait")).await;
-    call_json(&tools, "spawn", spawn_args("w2", dir.path(), "hi")).await;
+    let sid1 = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+    let sid2 = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
     let first = call_json(
         &tools,
         "wait_any",
-        json!({"names": ["w1", "w2"], "timeout_secs": 60}),
+        json!({"session_ids": [sid1.as_str(), sid2.as_str()], "timeout_secs": 60}),
     )
     .await;
-    assert_eq!(first["name"], "w2", "{first}");
+    assert_eq!(first["session_id"], sid2, "{first}");
     assert_eq!(first["state"], "done");
-    call_json(&tools, "cancel", json!({"name": "w1"})).await;
+    call_json(&tools, "cancel", json!({"session_id": sid1})).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -425,11 +684,11 @@ async fn forget_removes_registry_entry() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("fg", dir.path(), "hi")).await;
-    wait(&tools, "fg", 60).await;
-    call_json(&tools, "forget", json!({"name": "fg"})).await;
-    let err = call_err(&tools, "status", json!({"name": "fg"})).await;
-    assert!(err.contains("unknown subagent"), "{err}");
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
+    call_json(&tools, "forget", json!({"session_id": sid.as_str()})).await;
+    let err = call_err(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert!(err.contains("unknown session"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -440,8 +699,8 @@ async fn agents_tool_reports_initialized() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("ag", dir.path(), "hi")).await;
-    wait(&tools, "ag", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
     let agents = call_json(&tools, "agents", json!({})).await;
     let fake = agents["agents"]
         .as_array()
@@ -452,12 +711,12 @@ async fn agents_tool_reports_initialized() {
     assert_eq!(fake["agent_info"]["name"], "fake-agent-py", "{fake}");
     assert_eq!(fake["modes"]["current"], "bypass", "{fake}");
     assert_eq!(fake["config_options"][0]["id"], "model", "{fake}");
-    assert_eq!(fake["subagents"], json!(["ag"]));
+    assert_eq!(fake["subagents"], json!([sid]));
 }
 
 /// The `die` prompt makes the agent exit mid-turn: the turn fails, the
 /// subagent reports `failed`, and the registry entry survives so the session
-/// can be resumed after `close`.
+/// can be adopted after `close`.
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_death_mid_turn_marks_failed() {
     if !python3() {
@@ -466,24 +725,29 @@ async fn agent_death_mid_turn_marks_failed() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("d", dir.path(), "die")).await;
-    let done = wait(&tools, "d", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "die")).await;
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "failed", "{done}");
     assert!(
         done["error"].as_str().is_some_and(|e| !e.is_empty()),
         "{done}"
     );
 
-    let status = call_json(&tools, "status", json!({"name": "d"})).await;
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(status["state"], "failed");
     assert_eq!(status["live"], true);
 
-    // The registry entry outlives the process: after `close` the name resumes
-    // its session via session/load.
-    call_json(&tools, "close", json!({"name": "d"})).await;
-    let resumed = call_json(&tools, "spawn", spawn_args("d", dir.path(), "hi")).await;
-    assert_eq!(resumed["session_id"], "sess-1");
-    let done = wait(&tools, "d", 60).await;
+    // The registry entry outlives the process: after `close` the session is
+    // adoptable again via session/load.
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+    let adopted = call_json(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "prompt": "hi"}),
+    )
+    .await;
+    assert_eq!(adopted["session_id"], sid);
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done");
 }
 
@@ -497,36 +761,31 @@ async fn terminal_kill_reports_signal_exit() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(
-        &tools,
-        "spawn",
-        spawn_args("k", dir.path(), "KILL sleep 60"),
-    )
-    .await;
-    let done = wait(&tools, "k", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "KILL sleep 60")).await;
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done", "{done}");
     let reply = done["reply"].as_str().unwrap();
     assert!(reply.contains("exit:None"), "{reply}");
     assert!(reply.contains("signal:9"), "{reply}");
 }
 
-/// `close` ends the process but keeps the registry entry: the name still
+/// `close` ends the process but keeps the registry entry: the session still
 /// lists as `closed`, and `send` to it errors.
 #[tokio::test(flavor = "multi_thread")]
-async fn close_keeps_name_registered() {
+async fn close_keeps_session_registered() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("cl", dir.path(), "hi")).await;
-    wait(&tools, "cl", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
 
-    let closed = call_json(&tools, "close", json!({"name": "cl"})).await;
+    let closed = call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
     assert_eq!(closed["closed"], true);
 
-    let status = call_json(&tools, "status", json!({"name": "cl"})).await;
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(status["live"], false);
     assert_eq!(status["state"], "closed");
     let list = call_json(&tools, "list", json!({})).await;
@@ -534,13 +793,18 @@ async fn close_keeps_name_registered() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|s| s["name"] == "cl")
-        .expect("cl still listed");
+        .find(|s| s["session_id"] == sid)
+        .expect("session still listed");
     assert_eq!(entry["live"], false);
     assert_eq!(entry["state"], "closed");
 
-    let err = call_err(&tools, "send", json!({"name": "cl", "prompt": "again"})).await;
-    assert!(err.contains("unknown subagent"), "{err}");
+    let err = call_err(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "again"}),
+    )
+    .await;
+    assert!(err.contains("unknown session"), "{err}");
 }
 
 /// `WRITE <path>` has the agent call `fs/write_text_file`: writes inside the
@@ -558,13 +822,12 @@ async fn fs_write_inside_and_outside_cwd() {
     let inside = nested.join("written.txt");
     let (_state, tools) = test_state(dir.path());
 
-    call_json(
+    let sid = spawn_id(
         &tools,
-        "spawn",
-        spawn_args("wi", dir.path(), &format!("WRITE {}", inside.display())),
+        spawn_args(dir.path(), &format!("WRITE {}", inside.display())),
     )
     .await;
-    let done = wait(&tools, "wi", 60).await;
+    let done = wait(&tools, &sid, 60).await;
     assert!(done["reply"].as_str().unwrap().contains("fsw:ok"), "{done}");
     assert_eq!(
         std::fs::read_to_string(&inside).unwrap(),
@@ -573,59 +836,30 @@ async fn fs_write_inside_and_outside_cwd() {
 
     let outside = tempfile::tempdir().unwrap();
     let outside_file = outside.path().join("nope.txt");
-    call_json(
+    let sid = spawn_id(
         &tools,
-        "spawn",
-        spawn_args(
-            "wo",
-            dir.path(),
-            &format!("WRITE {}", outside_file.display()),
-        ),
+        spawn_args(dir.path(), &format!("WRITE {}", outside_file.display())),
     )
     .await;
-    let done = wait(&tools, "wo", 60).await;
+    let done = wait(&tools, &sid, 60).await;
     let reply = done["reply"].as_str().unwrap();
     assert!(reply.contains("fswerr:"), "{reply}");
     assert!(reply.contains("outside the session cwd"), "{reply}");
     assert!(!outside_file.exists());
 
     // The wideopen agent may write outside its cwd.
-    call_json(
+    let sid = spawn_id(
         &tools,
-        "spawn",
-        json!({"name": "ww", "agent": "wideopen", "cwd": dir.path(),
+        json!({"agent": "wideopen", "cwd": dir.path(),
                "prompt": format!("WRITE {}", outside_file.display())}),
     )
     .await;
-    let done = wait(&tools, "ww", 60).await;
+    let done = wait(&tools, &sid, 60).await;
     assert!(done["reply"].as_str().unwrap().contains("fsw:ok"), "{done}");
     assert_eq!(
         std::fs::read_to_string(&outside_file).unwrap(),
         "written-by-fake-agent"
     );
-}
-
-/// A name held by a live subagent cannot be spawned again; once `forget`
-/// releases it, the name is reusable.
-#[tokio::test(flavor = "multi_thread")]
-async fn duplicate_live_name_rejected_until_forgotten() {
-    if !python3() {
-        eprintln!("skipping: python3 not found");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("dup", dir.path(), "hi")).await;
-    wait(&tools, "dup", 60).await;
-
-    let err = call_err(&tools, "spawn", spawn_args("dup", dir.path(), "again")).await;
-    assert!(err.contains("already running"), "{err}");
-
-    call_json(&tools, "forget", json!({"name": "dup"})).await;
-    let spawned = call_json(&tools, "spawn", spawn_args("dup", dir.path(), "again")).await;
-    assert_eq!(spawned["state"], "running");
-    let done = wait(&tools, "dup", 60).await;
-    assert_eq!(done["state"], "done");
 }
 
 /// `send` only accepts `idle`/`done`/`cancelled` subagents; a `running` one
@@ -638,21 +872,20 @@ async fn send_to_running_subagent_rejected() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("run", dir.path(), "wait")).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
 
     let err = call_err(
         &tools,
         "send",
-        json!({"name": "run", "prompt": "more work"}),
+        json!({"session_id": sid.as_str(), "prompt": "more work"}),
     )
     .await;
     assert!(err.contains("cannot accept a prompt"), "{err}");
 
-    call_json(&tools, "cancel", json!({"name": "run"})).await;
+    call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
 }
 
-/// An agent whose command does not exist fails `spawn` cleanly and releases
-/// the name it reserved.
+/// An agent whose command does not exist fails `spawn` cleanly.
 #[tokio::test(flavor = "multi_thread")]
 async fn spawn_with_missing_command_fails() {
     if !python3() {
@@ -675,55 +908,14 @@ async fn spawn_with_missing_command_fails() {
     let err = call_err(
         &tools,
         "spawn",
-        json!({"name": "b", "agent": "missing", "cwd": dir.path(), "prompt": "hi"}),
+        json!({"agent": "missing", "cwd": dir.path(), "prompt": "hi"}),
     )
     .await;
     assert!(err.contains("cannot spawn agent"), "{err}");
 
-    // The failed spawn released the name: a working agent can take it.
-    let spawned = call_json(&tools, "spawn", spawn_args("b", dir.path(), "hi")).await;
-    assert_eq!(spawned["state"], "running");
-    wait(&tools, "b", 60).await;
-}
-
-/// Two concurrent `spawn` calls for one name: the reservation is atomic, so
-/// exactly one succeeds and the other is told the name is taken.
-#[tokio::test(flavor = "multi_thread")]
-async fn concurrent_spawn_same_name_runs_once() {
-    if !python3() {
-        eprintln!("skipping: python3 not found");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
-    let tools = std::sync::Arc::new(tools);
-    let cwd = dir.path().to_path_buf();
-    let first = {
-        let tools = tools.clone();
-        let cwd = cwd.clone();
-        tokio::spawn(async move { call(&tools, "spawn", spawn_args("cc", &cwd, "hi")).await })
-    };
-    let second = {
-        let tools = tools.clone();
-        tokio::spawn(async move { call(&tools, "spawn", spawn_args("cc", &cwd, "hi")).await })
-    };
-
-    let mut succeeded = 0;
-    let mut errors = Vec::new();
-    for outcome in [first.await.expect("task"), second.await.expect("task")] {
-        match outcome {
-            Ok(result) if result.is_error() => {
-                errors.push(result.error_message().unwrap_or("?").to_string());
-            }
-            Ok(_) => succeeded += 1,
-            Err(error) => errors.push(error),
-        }
-    }
-    assert_eq!(succeeded, 1, "{errors:?}");
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("already running"), "{}", errors[0]);
-
-    let done = wait(&tools, "cc", 60).await;
+    // A working agent still spawns.
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done");
 }
 
@@ -738,13 +930,8 @@ async fn terminal_output_truncates_to_tail() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(
-        &tools,
-        "spawn",
-        spawn_args("big", dir.path(), "RUNLINE seq 1 5000"),
-    )
-    .await;
-    let done = wait(&tools, "big", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "RUNLINE seq 1 5000")).await;
+    let done = wait(&tools, &sid, 60).await;
     let reply = done["reply"].as_str().unwrap();
     assert!(reply.contains("trunc"), "{reply}");
     assert!(reply.contains("5000"), "{reply}");
@@ -762,19 +949,19 @@ async fn result_and_transcript_after_cancel() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("cx", dir.path(), "wait")).await;
-    let running = call_json(&tools, "status", json!({"name": "cx"})).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+    let running = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(running["state"], "running", "{running}");
-    call_json(&tools, "cancel", json!({"name": "cx"})).await;
-    let done = wait(&tools, "cx", 60).await;
+    call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
+    let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "cancelled");
 
-    let result = call_json(&tools, "result", json!({"name": "cx"})).await;
+    let result = call_json(&tools, "result", json!({"session_id": sid.as_str()})).await;
     assert_eq!(result["turn"], 1);
     assert_eq!(result["reply"], "Hello ");
     assert_eq!(result["stop_reason"], "cancelled");
 
-    let text = call_text(&tools, "transcript", json!({"name": "cx"})).await;
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
     assert!(text.contains("=== [turn 1] END cancelled"), "{text}");
 }
 
@@ -787,13 +974,13 @@ async fn permit_with_unknown_request_id() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("p", dir.path(), "hi")).await;
-    wait(&tools, "p", 60).await;
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
 
     let err = call_err(
         &tools,
         "permit",
-        json!({"name": "p", "request_id": "perm-99", "option_id": "allow-1"}),
+        json!({"session_id": sid.as_str(), "request_id": "perm-99", "option_id": "allow-1"}),
     )
     .await;
     assert!(err.contains("no pending permission request"), "{err}");
