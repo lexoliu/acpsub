@@ -649,8 +649,9 @@ async fn terminal_kill_reports_signal_exit() {
     assert!(reply.contains("signal:9"), "{reply}");
 }
 
-/// `close` ends the process but keeps the registry entry: the name still
-/// lists as `closed`, and `send` to it errors.
+/// `close` ends the process but keeps the registry entry: `status` still
+/// reports it as `closed`, `list` hides it unless `all`, and `send` to it
+/// errors.
 #[tokio::test(flavor = "multi_thread")]
 async fn close_keeps_name_registered() {
     if !python3() {
@@ -668,13 +669,24 @@ async fn close_keeps_name_registered() {
     let status = call_json(&tools, "status", json!({"name": "cl"})).await;
     assert_eq!(status["live"], false);
     assert_eq!(status["state"], "closed");
+    // `list` shows live subagents only; the closed name stays reachable via
+    // `status`/`spawn`, and via `list` with `all`.
     let list = call_json(&tools, "list", json!({})).await;
+    assert!(
+        !list["subagents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "cl"),
+        "{list}"
+    );
+    let list = call_json(&tools, "list", json!({"all": true})).await;
     let entry = list["subagents"]
         .as_array()
         .unwrap()
         .iter()
         .find(|s| s["name"] == "cl")
-        .expect("cl still listed");
+        .expect("cl listed with all");
     assert_eq!(entry["live"], false);
     assert_eq!(entry["state"], "closed");
 
@@ -767,27 +779,22 @@ async fn duplicate_live_name_rejected_until_forgotten() {
     assert_eq!(done["state"], "done");
 }
 
-/// `send` only accepts `idle`/`done`/`cancelled` subagents; a `running` one
-/// rejects the prompt.
+/// `send` rejects a prompt only when no turn can ever take it: a `failed`
+/// subagent errors, while `running`/`needs_permission` queue instead.
 #[tokio::test(flavor = "multi_thread")]
-async fn send_to_running_subagent_rejected() {
+async fn send_to_failed_subagent_rejected() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    call_json(&tools, "spawn", spawn_args("run", dir.path(), "wait")).await;
+    call_json(&tools, "spawn", spawn_args("f", dir.path(), "die")).await;
+    let done = wait(&tools, "f", 30).await;
+    assert_eq!(done["state"], "failed", "{done}");
 
-    let err = call_err(
-        &tools,
-        "send",
-        json!({"name": "run", "prompt": "more work"}),
-    )
-    .await;
+    let err = call_err(&tools, "send", json!({"name": "f", "prompt": "more work"})).await;
     assert!(err.contains("cannot accept a prompt"), "{err}");
-
-    call_json(&tools, "cancel", json!({"name": "run"})).await;
 }
 
 /// An agent whose command does not exist fails `spawn` cleanly and releases

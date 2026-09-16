@@ -811,10 +811,13 @@ impl Tool for TranscriptTool {
     }
 }
 
-/// List subagents: live ones with their state, and registered (closed but
-/// resumable) ones from the registry.
+/// List live subagents with their state. Pass `all: true` to also include
+/// registered (closed but resumable) names from the registry.
 #[derive(Debug, Deserialize, JsonSchema)]
-struct ListArgs {}
+struct ListArgs {
+    /// Also list closed subagents kept in the registry for resume.
+    all: Option<bool>,
+}
 
 struct ListTool(Arc<AppState>);
 
@@ -867,14 +870,14 @@ impl Tool for ListTool {
     type Arguments = ListArgs;
     type Res = Value;
 
-    fn call(&self, _args: ListArgs) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        std::future::ready(Ok(self.list()))
+    fn call(&self, args: ListArgs) -> impl Future<Output = aither_core::Result<Value>> + Send {
+        std::future::ready(Ok(self.list(args.all.unwrap_or(false))))
     }
 }
 
 impl ListTool {
     /// Synchronous body: `list` only reads shared state.
-    fn list(&self) -> Value {
+    fn list(&self, all: bool) -> Value {
         let (live_views, registered) = {
             let live = self.0.live.lock().expect("live poisoned");
             let registry = self.0.registry.lock().expect("registry poisoned");
@@ -882,10 +885,14 @@ impl ListTool {
                 live.iter()
                     .map(|(name, sub)| (name.clone(), live_view(name, sub)))
                     .collect::<BTreeMap<_, _>>(),
-                registry
-                    .iter()
-                    .map(|(name, entry)| (name.clone(), entry.clone()))
-                    .collect::<BTreeMap<_, _>>(),
+                if all {
+                    registry
+                        .iter()
+                        .map(|(name, entry)| (name.clone(), entry.clone()))
+                        .collect::<BTreeMap<_, _>>()
+                } else {
+                    BTreeMap::new()
+                },
             )
         };
         let mut by_name: BTreeMap<String, Value> = registered

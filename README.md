@@ -68,7 +68,7 @@ with no `[agents.*]` entries serves no agents.
 | `cancel` | `name` | Answer pending permissions `cancelled`, send `session/cancel`. |
 | `permit` | `name, request_id, option_id` | Answer a queued `ask`-policy permission request. |
 | `transcript` | `name, from?, tail?, full?, thinking?` | Rendered transcript (same output as the CLI). |
-| `list` | — | Live and registered subagents with state. |
+| `list` | `all?` | Live subagents with state; `all: true` also lists closed registry entries kept for resume. |
 | `close` | `name` | End the process; keep the registry entry (still resumable). |
 | `forget` | `name` | Remove the registry entry (and the process if live). |
 | `agents` | — | Configured agents; for initialised ones their `agentInfo`, modes, config options. |
