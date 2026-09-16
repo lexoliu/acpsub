@@ -1,2 +1,10 @@
 # Single-crate release config: release PRs, changelog, crates.io publish.
+# The tag name shape is load-bearing: release.yml's probe looks for the
+# `v<version>` tag release-plz pushes, and its `dist` matrix and installer
+# URLs are built on it.
 [workspace]
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+
+[[package]]
+name = "acpsub"

@@ -1,18 +1,50 @@
 name: Release
 
+# Two entry points:
+#
+# * `push` to `main` (a merged dev→main release PR): release-plz publishes
+#   the crate to crates.io over OIDC trusted publishing, tags `v<version>`
+#   and creates the GitHub release — then the `dist` matrix and
+#   `release-assets` chain off the tag it created in this same run. Chaining
+#   inside one workflow is required because a tag pushed under GITHUB_TOKEN
+#   triggers no follow-up workflow.
+# * `workflow_dispatch` with a `tag` input: re-runs the dist and asset jobs
+#   for an existing release tag — the recovery path for a failed build leg,
+#   and the way to attach binaries to a release cut before this pipeline
+#   existed.
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to re-run, e.g. v0.2.0"
+        required: true
+        type: string
 
 permissions:
-  contents: write
-  pull-requests: write
-  id-token: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  DIST_VERSION: 0.30.2
 
 jobs:
-  release-plz:
-    name: release-plz
+  release:
+    name: Publish and tag the release
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    outputs:
+      # The `v<version>` tag for this run's release-plz release, empty when
+      # it released nothing (a merge that changed no released package).
+      tag: ${{ steps.probe.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,3 +59,132 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+      # Whether this run released: release-plz tags the pushed commit, so
+      # the peeled `v<version>` tag points at github.sha exactly when this
+      # run released — an older tag existing on the remote is not a release
+      # and must not rerun the whole matrix on every main push.
+      - name: Probe the release tag
+        id: probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="v${version}"
+          peeled="$(git ls-remote --tags origin "refs/tags/${tag}^{}" | cut -f1)"
+          if [[ "${peeled}" == "${{ github.sha }}" ]]; then
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "release-plz released ${tag} at ${peeled}."
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "release-plz released nothing this run."
+          fi
+
+  dist:
+    name: dist / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: release
+    # On push this waits on the probe: a run that released nothing leaves
+    # `tag` empty and skips the matrix. On dispatch the release job is
+    # skipped outright — `always()` keeps a skipped need from cascading —
+    # and the tag comes from the input instead.
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.release.outputs.tag != '')
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.release.outputs.tag || inputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install cargo-dist
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dist@${{ env.DIST_VERSION }}
+
+      - name: Build artifacts
+        shell: bash
+        run: |
+          dist build \
+            --tag "${{ env.TAG }}" \
+            --artifacts=local \
+            --target "${{ matrix.target }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            target/distrib/*${{ matrix.target }}*.tar.*
+            target/distrib/*${{ matrix.target }}*.zip*
+            target/distrib/*${{ matrix.target }}*-dist-manifest.json
+
+  release-assets:
+    name: Upload release assets
+    needs: [release, dist]
+    # `always()` so a skipped `release` on workflow_dispatch still resolves;
+    # the dist result is what actually gates this job.
+    if: always() && needs.dist.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.release.outputs.tag || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install cargo-dist
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dist@${{ env.DIST_VERSION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib
+          merge-multiple: true
+
+      - name: Build global release artifacts
+        run: dist build --tag "${{ env.TAG }}" --artifacts=global
+
+      # The patterns must not overlap. `*.tar.*` would also match every
+      # `…tar.xz.sha256` that `*.sha256` matches again, listing each checksum
+      # twice; the upload action then issues a second delete for the one
+      # existing asset and fails on a re-run. `.tar.xz`, `.zip`, `.sha256`,
+      # `.sh`, `.ps1` and `sha256.sum` are disjoint suffixes.
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            target/distrib/*.tar.xz
+            target/distrib/*.tar.gz
+            target/distrib/*.zip
+            target/distrib/*.sha256
+            target/distrib/*.sh
+            target/distrib/*.ps1
+            target/distrib/sha256.sum
