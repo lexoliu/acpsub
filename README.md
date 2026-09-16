@@ -12,8 +12,18 @@ server restarts and externally created sessions can be adopted via
 
 ## Install
 
+Prebuilt binaries for macOS, Linux, and Windows ship on every GitHub
+release; the installer puts `acpsub` on your `PATH`:
+
 ```sh
-cargo install acpsub
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/lexoliu/acpsub/releases/latest/download/acpsub-installer.sh | sh
+```
+
+From source instead:
+
+```sh
+cargo install acpsub --locked
 ```
 
 ## Wire it into your orchestrating agent
