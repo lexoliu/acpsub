@@ -24,6 +24,8 @@ use crate::registry::RegistryEntry;
 use crate::state::{AppState, Launch, Status, Subagent, launch, start_turn};
 use crate::transcript::{RenderOptions, render};
 
+/// `wait`'s minimum timeout: shorter polls belong to `status`.
+const MIN_WAIT_SECS: u64 = 60;
 /// `wait`'s default timeout.
 const DEFAULT_WAIT_SECS: u64 = 600;
 /// `wait`'s maximum timeout.
@@ -264,12 +266,13 @@ impl Tool for SendTool {
 struct WaitArgs {
     /// Subagent name.
     name: String,
-    /// Seconds to wait (default 600, max 3600). Prefer long waits —
+    /// Seconds to wait (default 600, min 60, max 3600). Prefer long waits —
     /// 300–1800 (5–30 min): the block is event-driven and returns early on
     /// any state change, so a generous timeout is free, while every expiry
     /// costs a model turn just to re-issue the wait on a still-`running`
     /// result. Keep it under 1800 to stay inside the 30-min prompt-cache
-    /// TTL. On expiry the result reports the still-current state.
+    /// TTL. On expiry the result reports the still-current state. For an
+    /// instant check use `status` — timeouts under 60 are rejected.
     timeout_secs: Option<u64>,
 }
 
@@ -283,6 +286,11 @@ impl Tool for WaitTool {
     type Res = Value;
 
     async fn call(&self, args: WaitArgs) -> aither_core::Result<Value> {
+        if let Some(secs) = args.timeout_secs
+            && secs < MIN_WAIT_SECS
+        {
+            return Err(Error::TimeoutBelowMin { got: secs }.into());
+        }
         let sub = self.0.get(&args.name)?;
         let timeout = Duration::from_secs(
             args.timeout_secs
@@ -316,9 +324,10 @@ impl Tool for WaitTool {
 struct WaitAnyArgs {
     /// Subagent names to watch.
     names: Vec<String>,
-    /// Seconds to wait (default 600, max 3600). Prefer 300–1800 (5–30
-    /// min), as with `wait`: early return on the first finisher is free,
-    /// but each expiry burns a model turn re-issuing the wait.
+    /// Seconds to wait (default 600, min 60, max 3600). Prefer 300–1800
+    /// (5–30 min), as with `wait`: early return on the first finisher is
+    /// free, but each expiry burns a model turn re-issuing the wait.
+    /// Timeouts under 60 are rejected — use `status` for instant checks.
     timeout_secs: Option<u64>,
 }
 
@@ -332,6 +341,11 @@ impl Tool for WaitAnyTool {
     type Res = Value;
 
     async fn call(&self, args: WaitAnyArgs) -> aither_core::Result<Value> {
+        if let Some(secs) = args.timeout_secs
+            && secs < MIN_WAIT_SECS
+        {
+            return Err(Error::TimeoutBelowMin { got: secs }.into());
+        }
         let subs = args
             .names
             .iter()

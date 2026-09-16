@@ -60,7 +60,7 @@ with no `[agents.*]` entries serves no agents.
 |---|---|---|
 | `spawn` | `name, agent, cwd, prompt, mode?, config?, permission?, replace?` | Start the process (`session/load` for a resumable registered name), `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{name, session_id, agent, state}` at once. |
 | `send` | `name, prompt` | Next turn on the same session. Errors unless the subagent is `idle`, `done`, or `cancelled`. |
-| `wait` | `name, timeout_secs` (default 600, max 3600; prefer 300–1800) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, stop_reason?, reply, tool_calls, elapsed_secs, pending_permission?}`. |
+| `wait` | `name, timeout_secs` (default 600, min 60, max 3600; prefer 300–1800) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, stop_reason?, reply, tool_calls, elapsed_secs, pending_permission?}`. |
 | `wait_any` | `names, timeout_secs` | First of them to leave `running`. |
 | `status` | `name` | State, session id, cwd, agent, turns, transcript path. |
 | `result` | `name, turn?` | The reply of the last (or nth) turn. |
@@ -76,7 +76,7 @@ The wait is event-driven: a long `timeout_secs` costs nothing while the
 subagent runs and returns early on any state change, but every expiry costs
 the orchestrator a model turn to re-issue the wait on a still-`running`
 result. Prefer 300–1800s (5–30 min), staying under the 30-min prompt-cache
-TTL.
+TTL. Timeouts under 60s are rejected — use `status` for an instant check.
 
 ## Model
 

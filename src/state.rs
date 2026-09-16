@@ -2,13 +2,15 @@
 //! the spawn/turn machinery.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aither_acp::{
-    AcpClient, ClientError, ConfigOption, ContentBlock, Implementation, PlanEntry,
+    AcpClient, ClientError, ConfigOption, ContentBlock, Implementation, PlanEntry, PromptResult,
     RequestPermissionOutcome, SessionModeState, StopReason, TextContent, ToolCall,
     ToolCallLocation, ToolCallStatus, ToolKind,
 };
@@ -736,32 +738,48 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
         .clone();
     let rt = sub.rt.clone();
     let name = sub.name.clone();
-    tokio::spawn(turn_task(
-        state, client, session_id, prompt, turn_n, rt, name,
-    ));
+    let mut prompt: PromptFut = Box::pin(async move {
+        client
+            .prompt(
+                &session_id,
+                vec![ContentBlock::Text(TextContent {
+                    text: prompt,
+                    annotations: None,
+                })],
+            )
+            .await
+    });
+    // Drive the prompt future once before returning: `AcpClient` enqueues
+    // the request on its unbounded outbound channel inside the first poll,
+    // so `session/prompt` is on the wire ahead of anything a later tool
+    // call sends — a `cancel` issued right after `spawn`/`send` cannot
+    // overtake the prompt it is meant to stop.
+    let ready = futures_lite::future::poll_fn(|cx| match prompt.as_mut().poll(cx) {
+        std::task::Poll::Ready(outcome) => std::task::Poll::Ready(Some(outcome)),
+        std::task::Poll::Pending => std::task::Poll::Ready(None),
+    })
+    .await;
+    // A synchronously-failed send resolves on the first poll; wrap the
+    // outcome so the same turn-end path handles it.
+    let prompt: PromptFut = ready.map_or(prompt, |outcome| Box::pin(async move { outcome }));
+    tokio::spawn(turn_task(state, prompt, turn_n, rt, name));
     Ok(())
 }
+
+/// The in-flight `session/prompt` call, already enqueued by `start_turn`.
+type PromptFut =
+    Pin<Box<dyn Future<Output = std::result::Result<PromptResult, ClientError>> + Send>>;
 
 /// Await `session/prompt`, record the turn's end in the transcript, state,
 /// and registry, then wake waiters.
 async fn turn_task(
     state: Arc<AppState>,
-    client: AcpClient<SubagentHandler>,
-    session_id: String,
-    prompt: String,
+    prompt: PromptFut,
     turn_n: u64,
     rt: Arc<SubRuntime>,
     name: String,
 ) {
-    let outcome = client
-        .prompt(
-            &session_id,
-            vec![ContentBlock::Text(TextContent {
-                text: prompt,
-                annotations: None,
-            })],
-        )
-        .await;
+    let outcome = prompt.await;
     match outcome {
         Ok(result) => {
             let reason = result.stop_reason;
