@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aither_acp::{
-    AcpClient, ClientError, ConfigOption, ContentBlock, Implementation, PlanEntry,
-    PromptResult, RequestPermissionOutcome, SessionModeState, StopReason, TextContent, ToolCall,
+    AcpClient, ClientError, ConfigOption, ContentBlock, Implementation, PlanEntry, PromptResult,
+    RequestPermissionOutcome, SessionModeState, StopReason, TextContent, ToolCall,
     ToolCallLocation, ToolCallStatus, ToolKind,
 };
 use aither_mcp::transport::ChildProcessTransport;
@@ -761,8 +761,7 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
     .await;
     // A synchronously-failed send resolves on the first poll; wrap the
     // outcome so the same turn-end path handles it.
-    let prompt: PromptFut =
-        ready.map_or(prompt, |outcome| Box::pin(async move { outcome }));
+    let prompt: PromptFut = ready.map_or(prompt, |outcome| Box::pin(async move { outcome }));
     tokio::spawn(turn_task(state, prompt, turn_n, rt, name));
     Ok(())
 }
