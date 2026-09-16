@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 readme = "README.md"
-description = "Any ACP agent as a named, resumable subagent over MCP"
+description = "Any ACP agent as a resumable subagent over MCP"
 repository = "https://github.com/lexoliu/acpsub"
 keywords = ["acp", "mcp", "agent", "subagent"]
 categories = ["api-bindings", "command-line-utilities"]
@@ -27,6 +27,7 @@ clap = { version = "4", features = ["derive"] }
 futures-lite = "2"
 async-process = "2"
 jiff = "0.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

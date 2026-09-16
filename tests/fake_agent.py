@@ -21,6 +21,8 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 
 session/cancel answers the pending prompt with stopReason cancelled.
 FAKE_NO_LOAD=1 in the environment makes the agent not advertise loadSession.
+Session ids are `sess-<pid>-<n>` so concurrently spawned agents never
+collide.
 """
 
 import json
@@ -318,7 +320,7 @@ for line in sys.stdin:
             )
         elif method == "session/new":
             session_count += 1
-            session_id = f"sess-{session_count}"
+            session_id = f"sess-{os.getpid()}-{session_count}"
             respond(
                 request_id,
                 {

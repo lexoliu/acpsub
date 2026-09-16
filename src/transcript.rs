@@ -20,41 +20,62 @@ const CLIP: usize = 400;
 /// Each line is one record: `{"ts", "turn", "prompt"}` for prompts,
 /// `{"ts", "turn", "update"}` for `session/update` notifications, and
 /// `{"ts", "turn", "stop_reason"}` for turn ends.
+///
+/// The writer starts unbound — the file is named after the session id,
+/// which only exists after `session/new`/`session/load` answers. Records
+/// appended before [`TranscriptWriter::bind`] are buffered and flushed to
+/// the file at bind time.
 #[derive(Debug)]
 pub struct TranscriptWriter {
-    file: tokio::fs::File,
+    file: Option<tokio::fs::File>,
     path: PathBuf,
+    pending: Vec<String>,
 }
 
 impl TranscriptWriter {
+    /// A writer with no file yet; records buffer until [`Self::bind`].
+    #[must_use]
+    pub fn deferred() -> Self {
+        Self {
+            file: None,
+            path: PathBuf::new(),
+            pending: Vec::new(),
+        }
+    }
+
     /// Open (creating) the transcript file at `path`, creating its parent
-    /// directory first.
+    /// directory first, and flush every buffered record into it.
     ///
     /// # Errors
     ///
-    /// Returns an error if the parent directory or file cannot be created.
-    pub async fn create(path: &Path) -> io::Result<Self> {
+    /// Returns an error if the parent directory or file cannot be created,
+    /// or a buffered record cannot be written.
+    pub async fn bind(&mut self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let file = tokio::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .await?;
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-        })
+        for line in self.pending.drain(..) {
+            file.write_all(line.as_bytes()).await?;
+        }
+        file.flush().await?;
+        self.file = Some(file);
+        self.path = path.to_path_buf();
+        Ok(())
     }
 
-    /// The file this writer appends to.
+    /// The file this writer appends to, once bound.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Append one JSON record followed by a newline.
+    /// Append one JSON record followed by a newline; buffers it when the
+    /// writer is not bound yet.
     ///
     /// # Errors
     ///
@@ -62,8 +83,13 @@ impl TranscriptWriter {
     pub async fn append(&mut self, record: &Value) -> io::Result<()> {
         let mut line = serde_json::to_string(record).map_err(io::Error::other)?;
         line.push('\n');
-        self.file.write_all(line.as_bytes()).await?;
-        self.file.flush().await
+        if let Some(file) = &mut self.file {
+            file.write_all(line.as_bytes()).await?;
+            file.flush().await
+        } else {
+            self.pending.push(line);
+            Ok(())
+        }
     }
 }
 
