@@ -8,8 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aither_acp::{
-    AcpClient, ClientError, ConfigOption, ContentBlock, Implementation, PlanEntry,
-    RequestPermissionOutcome, SessionModeState, StopReason, TextContent, ToolCall,
+    AcpClient, AgentCapabilities, ClientError, ConfigOption, ContentBlock, Implementation,
+    InitializeResult, PlanEntry, PromptParams, PromptResult, RequestPermissionOutcome,
+    ResponseFuture, SessionLoadParams, SessionModeState, SessionNewParams, SessionResumeParams,
+    SessionSetConfigOptionParams, SessionSetModeParams, StopReason, TextContent, ToolCall,
     ToolCallLocation, ToolCallStatus, ToolKind,
 };
 use aither_mcp::transport::ChildProcessTransport;
@@ -221,6 +223,16 @@ pub struct Inner {
     pub current: Option<Turn>,
     /// Permission requests awaiting `permit`, oldest first.
     pub pending: Vec<PendingPermission>,
+    /// Follow-up prompts sent while a turn was running; drained oldest
+    /// first when the turn completes, dropped on cancel or failure.
+    pub queued: VecDeque<String>,
+    /// Whether the running turn's `session/prompt` has been written to the
+    /// connection. `cancel` waits for this: a `session/cancel` that overtakes
+    /// its prompt on the wire is ignored by agents, leaving the turn running.
+    pub prompt_sent: bool,
+    /// `agentCapabilities` from `initialize`; drives optional features such
+    /// as the fork strategy.
+    pub agent_capabilities: AgentCapabilities,
 }
 
 /// Everything the handler, tools, and background tasks share about one
@@ -286,6 +298,8 @@ pub struct Subagent {
     pub allow_outside_cwd: bool,
     /// The transcript file path.
     pub transcript_path: PathBuf,
+    /// Name this session was forked from, when the subagent is a `fork`.
+    pub forked_from: Option<String>,
     /// The ACP client handle.
     pub client: AcpClient<SubagentHandler>,
     /// Connection driver task; also marks the subagent failed on disconnect.
@@ -368,8 +382,8 @@ pub async fn launch(state: &Arc<AppState>, args: Launch) -> Result<Arc<Subagent>
     result
 }
 
-/// Everything `launch` does once the name is reserved: open the transcript,
-/// spawn the process, run the handshake, go live, start the first turn.
+/// Everything `launch` does once the name is reserved: wire the subagent up,
+/// then start the first turn.
 async fn launch_reserved(
     state: &Arc<AppState>,
     args: &Launch,
@@ -381,6 +395,28 @@ async fn launch_reserved(
         .permission
         .or(agent_cfg.permission)
         .unwrap_or(state.config.defaults.permission);
+    let sub = wire_subagent(state, args, &agent_cfg, cwd, permission, prior).await?;
+    if let Err(error) = start_turn(state.clone(), &sub, args.prompt.clone()).await {
+        state.live.lock().expect("live poisoned").remove(&args.name);
+        return Err(error);
+    }
+    Ok(sub)
+}
+
+/// Spawn the process, run the handshake, and put the subagent live.
+///
+/// Shared by `launch_reserved` (spawn) and `fork_launch_reserved` (fork):
+/// `prior` drives `session/load`/`session/resume` in the handshake and
+/// carries `forked_from` lineage. The first prompt is NOT sent — callers
+/// start the turn themselves.
+async fn wire_subagent(
+    state: &Arc<AppState>,
+    args: &Launch,
+    agent_cfg: &AgentConfig,
+    cwd: PathBuf,
+    permission: PermissionPolicy,
+    prior: Option<RegistryEntry>,
+) -> Result<Arc<Subagent>> {
     let transcript_path = state
         .config
         .defaults
@@ -402,6 +438,9 @@ async fn launch_reserved(
             turns: Vec::new(),
             current: None,
             pending: Vec::new(),
+            queued: VecDeque::new(),
+            prompt_sent: false,
+            agent_capabilities: AgentCapabilities::default(),
         }),
         notify: Notify::new(),
         transcript: tokio::sync::Mutex::new(transcript),
@@ -420,10 +459,11 @@ async fn launch_reserved(
         agent_cfg.allow_outside_cwd,
     );
     let (client, conn, stderr_pump) =
-        connect(&agent_cfg, &cwd, handler, rt.clone(), args.name.clone())?;
+        connect(agent_cfg, &cwd, handler, rt.clone(), args.name.clone())?;
 
+    let forked_from = prior.as_ref().and_then(|entry| entry.forked_from.clone());
     // On any handshake failure, kill the child before returning the error.
-    let result = handshake(state, &client, &rt, args, &agent_cfg, prior).await;
+    let result = handshake(state, &client, &rt, args, agent_cfg, prior).await;
     if let Err(error) = result {
         rt.closing.store(true, Ordering::Relaxed);
         client.close();
@@ -438,6 +478,7 @@ async fn launch_reserved(
         permission,
         allow_outside_cwd: agent_cfg.allow_outside_cwd,
         transcript_path,
+        forked_from,
         client,
         conn: Mutex::new(Some(conn)),
         stderr_pump: Mutex::new(Some(stderr_pump)),
@@ -455,10 +496,6 @@ async fn launch_reserved(
         .lock()
         .expect("reserved poisoned")
         .remove(&args.name);
-    if let Err(error) = start_turn(state.clone(), &sub, args.prompt.clone()).await {
-        state.live.lock().expect("live poisoned").remove(&args.name);
-        return Err(error);
-    }
     Ok(sub)
 }
 
@@ -576,37 +613,24 @@ async fn handshake(
         source,
     };
     let init = client.initialize().await.map_err(agent_error)?;
-    let (session_id, modes, config_options) = if let Some(entry) = &prior {
-        if !init.agent_capabilities.load_session {
-            return Err(Error::NameRegistered(args.name.clone()));
-        }
-        let result = client
-            .load_session(&entry.session_id, args.cwd.clone(), vec![])
-            .await
-            .map_err(agent_error)?;
-        (
-            entry.session_id.clone(),
-            result.modes,
-            result.config_options,
-        )
-    } else {
-        let result = client
-            .new_session(args.cwd.clone(), vec![])
-            .await
-            .map_err(agent_error)?;
-        (result.session_id, result.modes, result.config_options)
-    };
+    let (session_id, modes, config_options) =
+        open_session(client, args, &init, prior.as_ref()).await?;
     {
         let mut inner = rt.inner.lock().expect("inner poisoned");
         inner.session_id.clone_from(&session_id);
         inner.agent_info = init.agent_info;
+        inner.agent_capabilities = init.agent_capabilities;
         inner.modes = modes;
         inner.config_options = config_options.unwrap_or_default();
         inner.turn_offset = prior.as_ref().map_or(0, |entry| entry.turns);
     }
     if let Some(mode) = args.mode.clone().or_else(|| agent_cfg.mode.clone()) {
         client
-            .set_mode(&session_id, &mode)
+            .set_mode(SessionSetModeParams {
+                session_id: session_id.clone(),
+                mode_id: mode.clone(),
+                meta: None,
+            })
             .await
             .map_err(agent_error)?;
         let mut inner = rt.inner.lock().expect("inner poisoned");
@@ -622,7 +646,12 @@ async fn handshake(
             ConfigValue::Toggle(value) => aither_acp::SessionConfigValue::from(value),
         };
         let updated = client
-            .set_config_option(&session_id, &id, value)
+            .set_config_option(SessionSetConfigOptionParams {
+                session_id: session_id.clone(),
+                config_id: id,
+                value,
+                meta: None,
+            })
             .await
             .map_err(agent_error)?;
         rt.inner.lock().expect("inner poisoned").config_options = updated;
@@ -637,6 +666,7 @@ async fn handshake(
             created: now(),
             last_turn: None,
             turns: 0,
+            forked_from: None,
         };
         state
             .update_registry(|registry| registry.insert(args.name.clone(), entry))
@@ -644,6 +674,70 @@ async fn handshake(
     }
     debug!(name = %args.name, %session_id, "subagent session established");
     Ok(())
+}
+
+/// Resume the session named by `prior` (`session/load` when advertised,
+/// else `session/resume`), or start a fresh `session/new`.
+///
+/// # Errors
+///
+/// Returns [`Error::NameRegistered`] when a prior session exists but the
+/// agent can neither load nor resume it, or the agent error on failure.
+async fn open_session(
+    client: &AcpClient<SubagentHandler>,
+    args: &Launch,
+    init: &InitializeResult,
+    prior: Option<&RegistryEntry>,
+) -> Result<(String, Option<SessionModeState>, Option<Vec<ConfigOption>>)> {
+    let agent_error = |source: ClientError| Error::Agent {
+        agent: args.name.clone(),
+        source,
+    };
+    let Some(entry) = prior else {
+        let result = client
+            .new_session(SessionNewParams {
+                cwd: args.cwd.clone(),
+                mcp_servers: vec![],
+                additional_directories: vec![],
+                meta: None,
+            })
+            .await
+            .map_err(agent_error)?;
+        return Ok((result.session_id, result.modes, result.config_options));
+    };
+    let (modes, config_options) = if init.agent_capabilities.load_session {
+        let result = client
+            .load_session(SessionLoadParams {
+                session_id: entry.session_id.clone(),
+                cwd: args.cwd.clone(),
+                mcp_servers: vec![],
+                additional_directories: vec![],
+                meta: None,
+            })
+            .await
+            .map_err(agent_error)?;
+        (result.modes, result.config_options)
+    } else if init
+        .agent_capabilities
+        .session_capabilities
+        .resume
+        .is_some()
+    {
+        let result = client
+            .resume_session(SessionResumeParams {
+                session_id: entry.session_id.clone(),
+                cwd: args.cwd.clone(),
+                mcp_servers: vec![],
+                additional_directories: vec![],
+                meta: None,
+            })
+            .await
+            .map_err(agent_error)?;
+        (result.modes, result.config_options)
+    } else {
+        return Err(Error::NameRegistered(args.name.clone()));
+    };
+    Ok((entry.session_id.clone(), modes, config_options))
 }
 
 /// Connection task epilogue: a dead agent marks the subagent failed unless
@@ -693,29 +787,57 @@ async fn pump_stderr(stderr: async_process::ChildStderr, rt: Arc<SubRuntime>, na
 ///
 /// # Errors
 ///
-/// Returns [`Error::NotPromptable`] when the status does not accept a prompt,
-/// or an I/O error if the transcript record cannot be written.
+/// Returns [`Error::NotPromptable`] when the subagent is failed, or an I/O
+/// error if the transcript record cannot be written.
 ///
 /// # Panics
 ///
 /// Panics if a state mutex is poisoned.
-pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: String) -> Result<()> {
-    let turn_n = {
+pub async fn start_turn(
+    state: Arc<AppState>,
+    sub: &Arc<Subagent>,
+    prompt: String,
+) -> Result<SendOutcome> {
+    enum Action {
+        Start(u64),
+        Queued(usize),
+        Reject(String),
+    }
+    let action = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-        if !inner.status.accepts_prompt() {
+        let action = match inner.status {
+            // A turn in flight (`current` set covers `running` and
+            // `needs_permission`), or a non-empty queue in the `done` drain
+            // gap: the live turn task drains in FIFO order, so a direct
+            // start would overtake prompts parked earlier.
+            _ if inner.current.is_some() || !inner.queued.is_empty() => {
+                inner.queued.push_back(prompt.clone());
+                Action::Queued(inner.queued.len())
+            }
+            _ if !inner.status.accepts_prompt() => Action::Reject(inner.status.name().to_string()),
+            _ => {
+                let n = inner.turn_offset + inner.turns.len() as u64 + 1;
+                inner.current = Some(Turn {
+                    n,
+                    ..Turn::default()
+                });
+                inner.status = Status::Running;
+                inner.prompt_sent = false;
+                Action::Start(n)
+            }
+        };
+        drop(inner);
+        action
+    };
+    let turn_n = match action {
+        Action::Queued(position) => return Ok(SendOutcome::Queued(position)),
+        Action::Reject(status) => {
             return Err(Error::NotPromptable {
                 name: sub.name.clone(),
-                status: inner.status.name().to_string(),
+                status,
             });
         }
-        let n = inner.turn_offset + inner.turns.len() as u64 + 1;
-        inner.current = Some(Turn {
-            n,
-            ..Turn::default()
-        });
-        inner.status = Status::Running;
-        drop(inner);
-        n
+        Action::Start(n) => n,
     };
     sub.rt
         .transcript
@@ -726,7 +848,9 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
         .map_err(|source| Error::io("cannot write transcript", source))?;
     sub.rt.notify.notify_waiters();
 
-    let client = sub.client.clone();
+    // Push the prompt request now, before this call returns: a `session/
+    // cancel` or a `send` decision made after `Running` was observed must
+    // never reach the wire ahead of the prompt it acts on.
     let session_id = sub
         .rt
         .inner
@@ -734,34 +858,174 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
         .expect("inner poisoned")
         .session_id
         .clone();
+    let turn = match sub
+        .client
+        .start_prompt(&PromptParams {
+            session_id: session_id.clone(),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: prompt,
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        })
+        .await
+    {
+        Ok(turn) => turn,
+        Err(error) => {
+            let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+            if let Some(turn) = inner.current.take() {
+                inner.turns.push(turn);
+            }
+            inner.status = Status::Failed(error.to_string());
+            drop(inner);
+            sub.rt.notify.notify_waiters();
+            return Err(Error::Agent {
+                agent: sub.name.clone(),
+                source: error,
+            });
+        }
+    };
+    sub.rt.inner.lock().expect("inner poisoned").prompt_sent = true;
+    sub.rt.notify.notify_waiters();
+
+    let client = sub.client.clone();
     let rt = sub.rt.clone();
     let name = sub.name.clone();
-    tokio::spawn(turn_task(
-        state, client, session_id, prompt, turn_n, rt, name,
-    ));
-    Ok(())
+    tokio::spawn(turn_task(state, client, session_id, turn, turn_n, rt, name));
+    Ok(SendOutcome::Running)
 }
 
-/// Await `session/prompt`, record the turn's end in the transcript, state,
-/// and registry, then wake waiters.
+/// Await the in-flight `session/prompt`, record the turn's end, then keep
+/// looping while a completed turn leaves queued prompts behind: each queued
+/// prompt becomes the next turn in this same task, so no two turns ever run
+/// concurrently.
 async fn turn_task(
     state: Arc<AppState>,
     client: AcpClient<SubagentHandler>,
     session_id: String,
-    prompt: String,
-    turn_n: u64,
+    mut turn: ResponseFuture<PromptResult>,
+    mut turn_n: u64,
     rt: Arc<SubRuntime>,
     name: String,
 ) {
-    let outcome = client
-        .prompt(
-            &session_id,
-            vec![ContentBlock::Text(TextContent {
-                text: prompt,
-                annotations: None,
-            })],
-        )
-        .await;
+    loop {
+        let outcome = (&mut turn).await;
+        settle_turn(&rt, turn_n, outcome).await;
+        // Update the registry: turn count and last_turn.
+        let turns = {
+            let inner = rt.inner.lock().expect("inner poisoned");
+            inner.turn_offset + inner.turns.len() as u64
+        };
+        let result = state
+            .update_registry(|registry| {
+                if let Some(entry) = registry.get_mut(&name) {
+                    entry.turns = turns;
+                    entry.last_turn = Some(now());
+                }
+            })
+            .await;
+        if let Err(error) = result {
+            warn!(%error, "registry persist failed");
+        }
+        rt.notify.notify_waiters();
+        // A completed turn drains the queue into the next turn inside this
+        // task; cancelled or failed turns drop it — the lead re-sends what it
+        // still wants. When a `send` slipped into the Done window and already
+        // started its own turn (`current.is_some()`), that task drains the
+        // queue at its own end, so this one leaves it alone.
+        let next = {
+            let mut inner = rt.inner.lock().expect("inner poisoned");
+            match inner.status {
+                Status::Done(_) if inner.current.is_none() => {
+                    inner.queued.pop_front().map(|queued| {
+                        let n = inner.turn_offset + inner.turns.len() as u64 + 1;
+                        inner.current = Some(Turn {
+                            n,
+                            ..Turn::default()
+                        });
+                        inner.status = Status::Running;
+                        inner.prompt_sent = false;
+                        (queued, n)
+                    })
+                }
+                // Cancelled or failed: stale briefs are dropped; the lead
+                // re-sends what it still wants. `running`/`needs_permission`
+                // here means a `send` in the `done` window already started
+                // the next turn — its own task drains the queue at its end.
+                Status::Cancelled | Status::Failed(_) => {
+                    inner.queued.clear();
+                    None
+                }
+                _ => None,
+            }
+        };
+        let Some((queued, n)) = next else {
+            break;
+        };
+        if let Err(error) = rt
+            .transcript
+            .lock()
+            .await
+            .append(&serde_json::json!({"ts": now(), "turn": n, "prompt": queued}))
+            .await
+        {
+            warn!(%error, "transcript write failed");
+        }
+        rt.notify.notify_waiters();
+        // Same ordering rule as `start_turn`: the prompt request is pushed
+        // inside this task before the next iteration, so a `cancel` that saw
+        // `Running` cannot overtake it on the wire.
+        match client
+            .start_prompt(&PromptParams {
+                session_id: session_id.clone(),
+                prompt: vec![ContentBlock::Text(TextContent {
+                    text: queued,
+                    annotations: None,
+                    meta: None,
+                })],
+                meta: None,
+            })
+            .await
+        {
+            Ok(next_turn) => {
+                rt.inner.lock().expect("inner poisoned").prompt_sent = true;
+                rt.notify.notify_waiters();
+                turn = next_turn;
+                turn_n = n;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                let record = serde_json::json!({
+                    "ts": now(),
+                    "turn": n,
+                    "stop_reason": "error",
+                    "error": reason,
+                });
+                if let Err(error) = rt.transcript.lock().await.append(&record).await {
+                    warn!(%error, "transcript write failed");
+                }
+                let mut inner = rt.inner.lock().expect("inner poisoned");
+                if let Some(turn) = inner.current.take() {
+                    inner.turns.push(turn);
+                }
+                inner.status = Status::Failed(reason);
+                inner.queued.clear();
+                drop(inner);
+                rt.notify.notify_waiters();
+                break;
+            }
+        }
+    }
+}
+
+/// Record a finished turn: transcript end record, the completed `Turn`, and
+/// the terminal status (`done`, `cancelled`, or `failed`).
+async fn settle_turn(
+    rt: &SubRuntime,
+    turn_n: u64,
+    outcome: std::result::Result<PromptResult, ClientError>,
+) {
     match outcome {
         Ok(result) => {
             let reason = result.stop_reason;
@@ -808,21 +1072,270 @@ async fn turn_task(
             inner.status = Status::Failed(reason);
         }
     }
-    // Update the registry: turn count and last_turn.
-    let turns = {
-        let inner = rt.inner.lock().expect("inner poisoned");
+}
+
+/// What a `send` did with the prompt.
+#[derive(Debug)]
+pub enum SendOutcome {
+    /// The prompt started a turn immediately.
+    Running,
+    /// The prompt was parked behind the running turn; carries its 1-based
+    /// queue position.
+    Queued(usize),
+}
+
+/// Send a follow-up prompt: a new turn on the same session.
+///
+/// When the subagent is running or awaiting a permission answer, the prompt
+/// is parked and fires in order once the turn completes; a cancelled or
+/// failed turn drops the queue.
+///
+/// # Errors
+///
+/// Returns [`Error::UnknownSubagent`] when the name is not live, or
+/// [`Error::NotPromptable`] when the subagent failed.
+///
+/// # Panics
+///
+/// Panics if a state mutex is poisoned.
+pub async fn send(state: &Arc<AppState>, name: &str, prompt: String) -> Result<SendOutcome> {
+    let sub = state.get(name)?;
+    start_turn(state.clone(), &sub, prompt).await
+}
+
+/// Arguments for [`fork`], as given by the `fork` tool.
+#[derive(Debug)]
+pub struct ForkArgs {
+    /// Source subagent name; must be live.
+    pub name: String,
+    /// Name for the forked subagent; defaults to `<name>-fork` (with `-N`
+    /// suffixes on collision).
+    pub new_name: Option<String>,
+    /// First turn for the fork, sent once it is live.
+    pub prompt: Option<String>,
+    /// 1-based history step to fork from; defaults to the latest.
+    pub step: Option<u64>,
+}
+
+/// Fork a live subagent's session: clone its history into a new session,
+/// attach it to a fresh agent process, and register it under a new name.
+///
+/// The fork keeps the source's agent, cwd, and permission policy. The
+/// source is untouched and stays usable.
+///
+/// Fork strategy, by advertised capability: `sessionCapabilities.fork`
+/// (`session/fork`) first, then devin's `_cognition.ai/revert/forkFromStep`.
+/// Neither present is a [`Error::ForkUnsupported`] error — acpsub does not
+/// fake a fork by respawning.
+///
+/// # Errors
+///
+/// Returns [`Error::UnknownSubagent`] when the source is not live,
+/// [`Error::ForkUnsupported`] when the agent cannot fork,
+/// [`Error::ForkStep`] when `step` names no forkable step, or the usual
+/// launch errors.
+///
+/// # Panics
+///
+/// Panics if a state mutex is poisoned.
+pub async fn fork(state: &Arc<AppState>, args: ForkArgs) -> Result<Arc<Subagent>> {
+    let source = state.get(&args.name)?;
+    let new_name = match &args.new_name {
+        Some(name) => {
+            validate_name(name)?;
+            name.clone()
+        }
+        None => args.name.clone() + "-fork",
+    };
+    // A forked session id, minted on the source's live connection.
+    let forked_id = mint_fork(&source, args.step).await?;
+    fork_launch(state, &source, new_name, forked_id, args.prompt).await
+}
+
+/// Run the source agent's fork method and return the new session id.
+async fn mint_fork(source: &Subagent, step: Option<u64>) -> Result<String> {
+    let (session_id, caps) = {
+        let inner = source.rt.inner.lock().expect("inner poisoned");
+        (inner.session_id.clone(), inner.agent_capabilities.clone())
+    };
+    let agent_error = |source_err: ClientError| Error::Agent {
+        agent: source.name.clone(),
+        source: source_err,
+    };
+    if caps.session_capabilities.extra.contains_key("fork") {
+        let result: serde_json::Value = source
+            .client
+            .request(
+                "session/fork",
+                &serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": source.cwd,
+                    "mcpServers": [],
+                    "additionalDirectories": [],
+                }),
+            )
+            .await
+            .map_err(agent_error)?;
+        return result
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| Error::ForkUnsupported {
+                name: source.name.clone(),
+                agent: source.agent.clone(),
+            });
+    }
+    if aither_acp::vendor::devin::supports(&caps, aither_acp::vendor::devin::capability::REVERT) {
+        return mint_fork_devin(source, &session_id, step).await;
+    }
+    Err(Error::ForkUnsupported {
+        name: source.name.clone(),
+        agent: source.agent.clone(),
+    })
+}
+
+/// Devin path: resolve `step` to a `forkTargetNodeId` via
+/// `revert/listSteps`, then `revert/forkFromStep` mints the session.
+async fn mint_fork_devin(source: &Subagent, session_id: &str, step: Option<u64>) -> Result<String> {
+    use aither_acp::vendor::devin::revert;
+    let agent_error = |source_err: ClientError| Error::Agent {
+        agent: source.name.clone(),
+        source: source_err,
+    };
+    let steps: revert::ListStepsResult = source
+        .client
+        .request(
+            revert::LIST_STEPS_METHOD,
+            &revert::ListStepsParams {
+                session_id: session_id.to_string(),
+            },
+        )
+        .await
+        .map_err(agent_error)?;
+    let target = match step {
+        Some(n) => steps.steps.iter().find(|s| s.step_number == n),
+        None => steps
+            .steps
+            .iter()
+            .rev()
+            .find(|s| s.fork_target_node_id.is_some()),
+    }
+    .ok_or_else(|| Error::ForkStep {
+        name: source.name.clone(),
+        step: step.unwrap_or_else(|| steps.steps.last().map_or(0, |s| s.step_number)),
+        have: steps.steps.len() as u64,
+    })?;
+    let node = target.fork_target_node_id.ok_or_else(|| Error::ForkStep {
+        name: source.name.clone(),
+        step: target.step_number,
+        have: steps.steps.len() as u64,
+    })?;
+    let result: revert::ForkFromStepResult = source
+        .client
+        .request(
+            revert::FORK_FROM_STEP_METHOD,
+            &revert::ForkFromStepParams {
+                session_id: session_id.to_string(),
+                target_node_id: node,
+            },
+        )
+        .await
+        .map_err(agent_error)?;
+    Ok(result.forked_session_id)
+}
+
+/// Launch the forked session on its own process, mirroring `launch`.
+async fn fork_launch(
+    state: &Arc<AppState>,
+    source: &Subagent,
+    name: String,
+    forked_id: String,
+    prompt: Option<String>,
+) -> Result<Arc<Subagent>> {
+    // Reserve the name; collide like spawn does.
+    {
+        let live = state.live.lock().expect("live poisoned");
+        let mut reserved = state.reserved.lock().expect("reserved poisoned");
+        if live.contains_key(&name) || !reserved.insert(name.clone()) {
+            return Err(Error::NameTaken(name));
+        }
+    }
+    let result = fork_launch_reserved(state, source, &name, &forked_id, prompt).await;
+    if result.is_err() {
+        state
+            .reserved
+            .lock()
+            .expect("reserved poisoned")
+            .remove(&name);
+    }
+    result
+}
+
+/// `fork_launch` once the name is reserved.
+async fn fork_launch_reserved(
+    state: &Arc<AppState>,
+    source: &Subagent,
+    name: &str,
+    forked_id: &str,
+    prompt: Option<String>,
+) -> Result<Arc<Subagent>> {
+    // The name must also be free in the registry: a registered name means a
+    // resumable session already exists under it.
+    if state
+        .registry
+        .lock()
+        .expect("registry poisoned")
+        .get(name)
+        .is_some()
+    {
+        return Err(Error::NameRegistered(name.to_string()));
+    }
+    let agent_cfg = state.config.agent(&source.agent)?.clone();
+    let source_turns = {
+        let inner = source.rt.inner.lock().expect("inner poisoned");
         inner.turn_offset + inner.turns.len() as u64
     };
-    let result = state
-        .update_registry(|registry| {
-            if let Some(entry) = registry.get_mut(&name) {
-                entry.turns = turns;
-                entry.last_turn = Some(now());
-            }
-        })
-        .await;
-    if let Err(error) = result {
-        warn!(%error, "registry persist failed");
+    // A synthetic prior entry routes the handshake through `session/load`
+    // (or `session/resume`) on the forked id, and carries the lineage into
+    // the registry insert below.
+    let prior = RegistryEntry {
+        agent: source.agent.clone(),
+        session_id: forked_id.to_string(),
+        cwd: source.cwd.clone(),
+        created: now(),
+        last_turn: None,
+        turns: source_turns,
+        forked_from: Some(source.name.clone()),
+    };
+    let launch_args = Launch {
+        name: name.to_string(),
+        agent: source.agent.clone(),
+        cwd: source.cwd.clone(),
+        prompt: String::new(),
+        mode: None,
+        config: BTreeMap::new(),
+        permission: Some(source.permission),
+        replace: false,
+    };
+    let sub = wire_subagent(
+        state,
+        &launch_args,
+        &agent_cfg,
+        source.cwd.clone(),
+        source.permission,
+        Some(prior.clone()),
+    )
+    .await?;
+    // The handshake skips the registry write for a prior entry, so the
+    // fork's lineage entry goes in once the session is established.
+    state
+        .update_registry(|registry| registry.insert(name.to_string(), prior))
+        .await?;
+    if let Some(prompt) = prompt
+        && let Err(error) = start_turn(state.clone(), &sub, prompt).await
+    {
+        state.live.lock().expect("live poisoned").remove(name);
+        return Err(error);
     }
-    rt.notify.notify_waiters();
+    Ok(sub)
 }

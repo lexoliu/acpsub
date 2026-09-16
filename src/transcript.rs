@@ -164,7 +164,9 @@ fn chunk_text(update: &SessionUpdate) -> Option<String> {
     match &chunk.content {
         ContentBlock::Text(text) => Some(text.text.clone()),
         ContentBlock::Image(_) => Some("[image]".to_string()),
+        ContentBlock::Audio(_) => Some("[audio]".to_string()),
         ContentBlock::Resource(resource) => Some(format!("[resource {}]", resource.resource.uri)),
+        ContentBlock::ResourceLink(link) => Some(format!("[link {}]", link.uri)),
     }
 }
 
@@ -316,9 +318,11 @@ fn render_tool_content(content: &[ToolCallContent], out: &mut String, options: &
             ToolCallContent::Content { content } => match content {
                 ContentBlock::Text(text) => text.text.clone(),
                 ContentBlock::Image(_) => "[image]".to_string(),
+                ContentBlock::Audio(_) => "[audio]".to_string(),
                 ContentBlock::Resource(resource) => {
                     format!("[resource {}]", resource.resource.uri)
                 }
+                ContentBlock::ResourceLink(link) => format!("[link {}]", link.uri),
             },
             ToolCallContent::Diff(diff) => format!("diff {}", diff.path.display()),
             ToolCallContent::Terminal { terminal_id } => format!("terminal {terminal_id}"),

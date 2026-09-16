@@ -137,6 +137,7 @@ args = ["{script}"]
     for expected in [
         "spawn",
         "send",
+        "fork",
         "wait",
         "wait_any",
         "status",

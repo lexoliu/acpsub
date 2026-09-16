@@ -31,6 +31,9 @@ pub struct RegistryEntry {
     /// Number of completed turns.
     #[serde(default)]
     pub turns: u64,
+    /// Name this session was forked from, when the subagent is a `fork`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
 
 /// The name → entry map backed by `registry.json`.
@@ -148,14 +151,40 @@ mod tests {
                 created: "2026-09-10T00:00:00Z".to_string(),
                 last_turn: None,
                 turns: 2,
+                forked_from: None,
+            },
+        );
+        registry.insert(
+            "dev-fork".to_string(),
+            RegistryEntry {
+                agent: "devin".to_string(),
+                session_id: "sess-2".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                created: "2026-09-10T00:00:00Z".to_string(),
+                last_turn: None,
+                turns: 2,
+                forked_from: Some("dev".to_string()),
             },
         );
         let snapshot = registry.snapshot().expect("snapshot");
+        // `forked_from: None` stays absent so old readers ignore it.
+        assert!(!snapshot.contains("forked_from\":null"));
         let loaded: BTreeMap<String, RegistryEntry> =
             serde_json::from_str(&snapshot).expect("parse snapshot");
         assert_eq!(loaded["dev"].session_id, "sess-1");
         assert_eq!(loaded["dev"].turns, 2);
         assert_eq!(loaded["dev"].agent, "devin");
+        assert_eq!(
+            loaded["dev-fork"].forked_from.as_deref(),
+            Some("dev"),
+            "lineage survives the round-trip"
+        );
+        // An entry written before the field existed still loads.
+        let legacy: RegistryEntry = serde_json::from_str(
+            r#"{"agent":"devin","session_id":"s","cwd":"/t","created":"t","turns":0}"#,
+        )
+        .expect("legacy entry parses");
+        assert_eq!(legacy.forked_from, None);
     }
 
     #[test]
@@ -178,6 +207,7 @@ mod tests {
                 created: "t".to_string(),
                 last_turn: Some("t2".to_string()),
                 turns: 1,
+                forked_from: None,
             },
         );
         persist(&path, registry.snapshot().expect("snapshot"))

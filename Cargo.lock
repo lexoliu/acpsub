@@ -18,7 +18,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
@@ -42,9 +42,7 @@ dependencies = [
 
 [[package]]
 name = "aither-acp"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f8e9dc83fd9234deb2d5e7e967c812bd970d9e32ad7d31bfa932d330571dc0d"
+version = "0.4.0"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -55,16 +53,14 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror",
  "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "aither-agent"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8913268d6983df1ff9001697dee7725d7618b3e4adc61c065f4d2b5bda136559"
+version = "0.4.0"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -96,9 +92,7 @@ dependencies = [
 
 [[package]]
 name = "aither-attachments"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1662054889ea745dff9d5a21a360695f8c18dac5b052f2347c51a6a43410b43c"
+version = "0.4.0"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -110,9 +104,7 @@ dependencies = [
 
 [[package]]
 name = "aither-core"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47da031904fe9599caa4e8dfe95db811daec80b681153127cdd6fda3c969d7d0"
+version = "0.4.0"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -127,9 +119,7 @@ dependencies = [
 
 [[package]]
 name = "aither-derive"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4548f55e5f10a2a9690560781aa54a8be645e9f52c7782d9e276bf4f0d7b21"
+version = "0.4.0"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro2",
@@ -139,30 +129,28 @@ dependencies = [
 
 [[package]]
 name = "aither-mcp"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68e2393cd457791cd87bee63dc3cd9287643ba9f7820d567a5a272cc0af2f4b9"
+version = "0.4.0"
 dependencies = [
  "aither-core",
  "aither-sandbox",
  "async-channel",
  "async-lock",
  "async-process",
+ "base64 0.23.1",
  "blocking",
  "futures-lite",
  "futures-util",
+ "mime",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror",
  "tracing",
  "zenwave",
 ]
 
 [[package]]
 name = "aither-sandbox"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13410744e47abd7ab18f7243c08898b61b14c5d2dc24801a2a5419c85ab4df0a"
+version = "0.4.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -187,7 +175,7 @@ dependencies = [
  "serde_json",
  "shell-words",
  "strsim",
- "thiserror 2.0.20",
+ "thiserror",
  "tokio",
  "tracing",
  "uuid",
@@ -482,18 +470,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-native-tls"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9343dc5acf07e79ff82d0c37899f079db3534d99f189a1837c8e549c99405bec"
-dependencies = [
- "futures-util",
- "native-tls",
- "thiserror 1.0.69",
- "url",
-]
-
-[[package]]
 name = "async-net"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -567,22 +543,6 @@ name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
-
-[[package]]
-name = "async-tungstenite"
-version = "0.34.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8447f02eaa65412035e2d3eeaa3fc82bbb8d7137c84c5976b4af685136012ee9"
-dependencies = [
- "async-net",
- "atomic-waker",
- "futures-core",
- "futures-io",
- "futures-task",
- "log",
- "pin-project-lite",
- "tungstenite",
-]
 
 [[package]]
 name = "atomic-waker"
@@ -690,7 +650,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_urlencoded",
- "thiserror 2.0.20",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tower-service",
@@ -996,12 +956,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "data-encoding"
-version = "2.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
-
-[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1029,7 +983,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -1268,21 +1222,6 @@ dependencies = [
  "miniz_oxide 0.9.1",
  "zlib-rs",
 ]
-
-[[package]]
-name = "foreign-types"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6f339eb8adc052cd2ca78910fda869aefa38d22d5cb648e6485e4d3fc06f3b1"
-dependencies = [
- "foreign-types-shared",
-]
-
-[[package]]
-name = "foreign-types-shared"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "form_urlencoded"
@@ -1548,7 +1487,7 @@ dependencies = [
  "shell-escape",
  "smol",
  "smol-hyper",
- "thiserror 2.0.20",
+ "thiserror",
  "toml 0.8.23",
  "tracing",
  "tracing-appender",
@@ -1985,7 +1924,7 @@ checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
 dependencies = [
  "enumflags2",
  "libc",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -2137,23 +2076,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "native-tls"
-version = "0.2.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "465500e14ea162429d264d44189adc38b199b62b1c21eea9f69e4b73cb03bbf2"
-dependencies = [
- "libc",
- "log",
- "openssl",
- "openssl-probe",
- "openssl-sys",
- "schannel",
- "security-framework",
- "security-framework-sys",
- "tempfile",
-]
-
-[[package]]
 name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2230,47 +2152,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openssl"
-version = "0.10.81"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77823a27f0babb03091cb9ed9ef80af3b39dbc82f97e8fa530374b7dafd87a45"
-dependencies = [
- "bitflags 2.13.2",
- "cfg-if",
- "foreign-types",
- "libc",
- "openssl-macros",
- "openssl-sys",
-]
-
-[[package]]
-name = "openssl-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "openssl-sys"
-version = "0.9.117"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
- "vcpkg",
-]
 
 [[package]]
 name = "option-ext"
@@ -2329,12 +2214,6 @@ dependencies = [
  "fastrand",
  "futures-io",
 ]
-
-[[package]]
-name = "pkg-config"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "png"
@@ -2569,7 +2448,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -2929,17 +2808,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha1"
-version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3155,31 +3023,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl 2.0.20",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -3388,7 +3236,7 @@ checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
 dependencies = [
  "crossbeam-channel",
  "symlink",
- "thiserror 2.0.20",
+ "thiserror",
  "time",
  "tracing-subscriber",
 ]
@@ -3448,22 +3296,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "tungstenite"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.5",
- "sha1",
- "thiserror 2.0.20",
-]
 
 [[package]]
 name = "typenum"
@@ -3548,12 +3380,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"
@@ -4022,9 +3848,7 @@ dependencies = [
  "async-fs",
  "async-io",
  "async-lock",
- "async-native-tls",
  "async-net",
- "async-tungstenite",
  "base64 0.22.1",
  "block",
  "dirs",
@@ -4041,14 +3865,13 @@ dependencies = [
  "httpdate",
  "hyper",
  "js-sys",
- "native-tls",
  "objc",
  "once_cell",
  "rustls",
  "rustls-native-certs",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror",
  "time",
  "tower-service",
  "tracing",

@@ -74,6 +74,29 @@ pub enum Error {
     #[error("subagent '{0}' is not live (closed); use the transcript tool to inspect its history")]
     NotLive(String),
 
+    /// The subagent's agent advertises no fork capability acpsub knows.
+    #[error(
+        "subagent '{name}' (agent '{agent}') cannot fork: the agent advertises neither sessionCapabilities.fork nor a known vendor fork method"
+    )]
+    ForkUnsupported {
+        /// Subagent name.
+        name: String,
+        /// Agent config key.
+        agent: String,
+    },
+
+    /// A `fork` requested a history step that does not exist or cannot be
+    /// forked from.
+    #[error("subagent '{name}' has no forkable step {step} (has {have} steps)")]
+    ForkStep {
+        /// Subagent name.
+        name: String,
+        /// Requested step number.
+        step: u64,
+        /// Number of steps the agent reported.
+        have: u64,
+    },
+
     /// The subagent has no running turn to cancel.
     #[error("subagent '{0}' has no running turn")]
     NotRunning(String),

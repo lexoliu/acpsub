@@ -63,9 +63,15 @@ impl ClientHandler for SubagentHandler {
             fs: FileSystemCapability {
                 read_text_file: true,
                 write_text_file: true,
+                meta: None,
             },
             terminal: true,
-            meta: None,
+            // Unlock devin's `_cognition.ai/revert/*` surface (listSteps,
+            // forkFromStep); agents that do not know the flag ignore it.
+            meta: Some(serde_json::json!({
+                aither_acp::vendor::devin::capability::REVERT: true,
+            })),
+            ..ClientCapabilities::default()
         }
     }
 

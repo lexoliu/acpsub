@@ -251,7 +251,7 @@ registry = "/tmp/acpsub-registry.json"
 command = "devin"
 args = ["acp"]
 mode = "bypass"
-config = { model = "swe-2-max" }
+config = { model = "swe-2-high" }
 allow_outside_cwd = false
 
 [agents.claude]
@@ -274,7 +274,7 @@ env = { FOO = "bar" }
         assert_eq!(devin.mode.as_deref(), Some("bypass"));
         assert_eq!(
             devin.config["model"],
-            ConfigValue::Select("swe-2-max".to_string())
+            ConfigValue::Select("swe-2-high".to_string())
         );
         let claude = &config.agents["claude"];
         assert_eq!(claude.permission, Some(PermissionPolicy::Ask));

@@ -21,7 +21,9 @@ use tracing::debug;
 use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
-use crate::state::{AppState, Launch, Status, Subagent, launch, start_turn};
+use crate::state::{
+    AppState, ForkArgs, Inner, Launch, SendOutcome, Status, Subagent, fork, launch, send,
+};
 use crate::transcript::{RenderOptions, render};
 
 /// `wait`'s default timeout.
@@ -41,6 +43,7 @@ pub fn build_tools(state: Arc<AppState>) -> aither_core::Result<Tools> {
     let mut tools = Tools::new();
     tools.register(SpawnTool(state.clone()))?;
     tools.register(SendTool(state.clone()))?;
+    tools.register(ForkTool(state.clone()))?;
     tools.register(WaitTool(state.clone()))?;
     tools.register(WaitAnyTool(state.clone()))?;
     tools.register(StatusTool(state.clone()))?;
@@ -69,6 +72,14 @@ fn spawned_view(sub: &Subagent) -> Value {
         "cwd": sub.cwd,
         "transcript": sub.transcript_path,
     })
+}
+
+/// Whether a `wait` should keep blocking: a turn in flight, or queued
+/// prompts sitting in the `done` drain gap before the turn task starts
+/// them. `needs_permission` returns so the lead can answer it.
+fn has_pending_work(inner: &Inner) -> bool {
+    matches!(inner.status, Status::Running)
+        || (matches!(inner.status, Status::Done(_)) && !inner.queued.is_empty())
 }
 
 /// A `wait`-style result for one subagent.
@@ -134,6 +145,7 @@ async fn close_sub(sub: &Subagent) {
         for pending in inner.pending.drain(..) {
             let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
         }
+        inner.queued.clear();
         if matches!(inner.status, Status::Running | Status::NeedsPermission) {
             inner.status = Status::Cancelled;
         }
@@ -222,8 +234,11 @@ impl Tool for SpawnTool {
 
 /// Send a follow-up prompt to a live subagent: a new turn on the same session.
 ///
-/// Only valid when the subagent is `idle`, `done`, or `cancelled`; a `running`
-/// or `needs_permission` subagent must be waited on or cancelled first.
+/// When the subagent is `running` (or awaiting `permit`), the prompt is parked
+/// and fires as the next turn when the current one completes — the response
+/// reports `state: "queued"` with its position. A `failed` subagent rejects
+/// prompts. A cancelled turn drops the queue, so re-send after `cancel` what
+/// you still want done.
 /// Returns immediately; use `wait` for the reply.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SendArgs {
@@ -243,9 +258,70 @@ impl Tool for SendTool {
     type Res = Value;
 
     async fn call(&self, args: SendArgs) -> aither_core::Result<Value> {
-        let sub = self.0.get(&args.name)?;
-        start_turn(self.0.clone(), &sub, args.prompt).await?;
-        Ok(json!({"name": args.name, "state": "running"}))
+        match send(&self.0, &args.name, args.prompt).await? {
+            SendOutcome::Running => Ok(json!({"name": args.name, "state": "running"})),
+            SendOutcome::Queued(position) => {
+                Ok(json!({"name": args.name, "state": "queued", "position": position}))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fork
+// ---------------------------------------------------------------------------
+
+/// Fork a live subagent: clone its session history into a new session on a
+/// fresh agent process, registered under a new name.
+///
+/// Use this to branch work that shares the source's accumulated context —
+/// the fork inherits everything the source session saw up to the fork
+/// point, so its first prompt can be a short instruction instead of a full
+/// briefing. The source is untouched and stays usable. The forked session
+/// keeps the source's agent, cwd, and permission policy.
+///
+/// Forks need the source to be live and the agent to advertise a fork
+/// capability (`sessionCapabilities.fork` or devin's revert surface);
+/// otherwise the call errors rather than silently spawning a fresh,
+/// context-free session.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ForkToolArgs {
+    /// Source subagent name; must be live.
+    name: String,
+    /// Name for the forked subagent (`[A-Za-z0-9._-]+`). Defaults to
+    /// `<name>-fork`.
+    new_name: Option<String>,
+    /// First turn for the fork, sent once it is live.
+    prompt: Option<String>,
+    /// 1-based history step to fork from; defaults to the latest step.
+    step: Option<u64>,
+}
+
+struct ForkTool(Arc<AppState>);
+
+impl Tool for ForkTool {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("fork")
+    }
+    type Arguments = ForkToolArgs;
+    type Res = Value;
+
+    async fn call(&self, args: ForkToolArgs) -> aither_core::Result<Value> {
+        let sub = fork(
+            &self.0,
+            ForkArgs {
+                name: args.name,
+                new_name: args.new_name,
+                prompt: args.prompt,
+                step: args.step,
+            },
+        )
+        .await?;
+        let mut view = spawned_view(&sub);
+        if let Some(from) = &sub.forked_from {
+            view["forked_from"] = json!(from);
+        }
+        Ok(view)
     }
 }
 
@@ -289,7 +365,7 @@ impl Tool for WaitTool {
         loop {
             {
                 let inner = sub.rt.inner.lock().expect("inner poisoned");
-                if !matches!(inner.status, Status::Running) {
+                if !has_pending_work(&inner) {
                     break;
                 }
             }
@@ -341,7 +417,7 @@ impl Tool for WaitAnyTool {
             for (name, sub) in &subs {
                 let done = {
                     let inner = sub.rt.inner.lock().expect("inner poisoned");
-                    !matches!(inner.status, Status::Running)
+                    !has_pending_work(&inner)
                 };
                 if done {
                     return Ok(wait_view(name, sub, started));
@@ -396,7 +472,7 @@ impl StatusTool {
             .get(&args.name)
             .cloned();
         if let Some(sub) = sub {
-            let (status, session_id, turns, last_stop, pending) = {
+            let (status, session_id, turns, last_stop, pending, queued) = {
                 let inner = sub.rt.inner.lock().expect("inner poisoned");
                 (
                     inner.status.clone(),
@@ -408,6 +484,7 @@ impl StatusTool {
                         .iter()
                         .map(|p| p.request_id.clone())
                         .collect::<Vec<_>>(),
+                    inner.queued.len(),
                 )
             };
             let mut view = json!({
@@ -421,7 +498,11 @@ impl StatusTool {
                 "transcript": sub.transcript_path,
                 "permission": serde_json::to_value(sub.permission).unwrap_or_default(),
                 "pending_permissions": pending,
+                "queued_prompts": queued,
             });
+            if let Some(from) = &sub.forked_from {
+                view["forked_from"] = json!(from);
+            }
             if let Some(reason) = last_stop {
                 view["last_stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
             }
@@ -438,7 +519,7 @@ impl StatusTool {
             .get(&args.name)
             .cloned();
         if let Some(entry) = entry {
-            return Ok(json!({
+            let mut view = json!({
                 "name": args.name,
                 "agent": entry.agent,
                 "live": false,
@@ -448,7 +529,11 @@ impl StatusTool {
                 "turns": entry.turns,
                 "created": entry.created,
                 "last_turn": entry.last_turn,
-            }));
+            });
+            if let Some(from) = &entry.forked_from {
+                view["forked_from"] = json!(from);
+            }
+            return Ok(view);
         }
         Err(Error::UnknownSubagent(args.name))
     }
@@ -519,8 +604,12 @@ impl ResultTool {
 // ---------------------------------------------------------------------------
 
 /// Cancel a subagent's running turn: answers every queued permission request
-/// `cancelled`, then sends `session/cancel`. The turn ends with the agent's
-/// `cancelled` stop reason.
+/// `cancelled`, drops any prompts parked by `send`, then sends
+/// `session/cancel`. The turn ends with the agent's `cancelled` stop reason.
+///
+/// If the turn was just started, `session/cancel` waits until the prompt it
+/// targets is on the connection — a cancel that overtakes the prompt request
+/// on the wire would be ignored by the agent and leave the turn running.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CancelArgs {
     /// Subagent name.
@@ -538,13 +627,30 @@ impl Tool for CancelTool {
 
     async fn call(&self, args: CancelArgs) -> aither_core::Result<Value> {
         let sub = self.0.get(&args.name)?;
-        {
-            let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-            if !matches!(inner.status, Status::Running | Status::NeedsPermission) {
-                return Err(Error::NotRunning(args.name).into());
+        loop {
+            {
+                let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+                if matches!(inner.status, Status::Done(_)) && !inner.queued.is_empty() {
+                    // The turn ended but parked prompts have not started
+                    // yet — dropping them stops the pending work outright.
+                    inner.queued.clear();
+                    return Ok(json!({"name": args.name, "cancelled": true}));
+                }
+                if !matches!(inner.status, Status::Running | Status::NeedsPermission) {
+                    return Err(Error::NotRunning(args.name).into());
+                }
+                if inner.prompt_sent {
+                    for pending in inner.pending.drain(..) {
+                        let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
+                    }
+                    inner.queued.clear();
+                    drop(inner);
+                    break;
+                }
             }
-            for pending in inner.pending.drain(..) {
-                let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
+            tokio::select! {
+                () = sub.rt.notify.notified() => {},
+                () = tokio::time::sleep(Duration::from_millis(50)) => {},
             }
         }
         let session_id = sub
@@ -555,7 +661,7 @@ impl Tool for CancelTool {
             .session_id
             .clone();
         sub.client
-            .cancel(&session_id)
+            .cancel(session_id)
             .await
             .map_err(|source| Error::Agent {
                 agent: args.name.clone(),
@@ -722,7 +828,7 @@ fn live_view(name: &str, sub: &Subagent) -> Value {
             inner.turn_offset + inner.turns.len() as u64,
         )
     };
-    json!({
+    let mut view = json!({
         "name": name,
         "agent": sub.agent,
         "live": true,
@@ -730,12 +836,16 @@ fn live_view(name: &str, sub: &Subagent) -> Value {
         "session_id": session_id,
         "cwd": sub.cwd,
         "turns": turns,
-    })
+    });
+    if let Some(from) = &sub.forked_from {
+        view["forked_from"] = json!(from);
+    }
+    view
 }
 
 /// `list` view of a registered but closed subagent.
 fn closed_view(name: &str, entry: &RegistryEntry) -> Value {
-    json!({
+    let mut view = json!({
         "name": name,
         "agent": entry.agent,
         "live": false,
@@ -743,7 +853,11 @@ fn closed_view(name: &str, entry: &RegistryEntry) -> Value {
         "session_id": entry.session_id,
         "cwd": entry.cwd,
         "turns": entry.turns,
-    })
+    });
+    if let Some(from) = &entry.forked_from {
+        view["forked_from"] = json!(from);
+    }
+    view
 }
 
 impl Tool for ListTool {

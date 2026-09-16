@@ -13,7 +13,7 @@ registry = "~/.local/share/acpsub/registry.json"
 command = "devin"
 args = ["acp"]
 mode = "bypass"                          # session/set_mode after session/new
-config = { model = "swe-2-max" }         # session/set_config_option id -> value
+config = { model = "swe-2-high" }        # session/set_config_option id -> value
 allow_outside_cwd = false                # refuse fs/* paths outside cwd
 # env = { API_KEY = "..." }              # extra environment for the process
 # permission = "ask"                     # per-agent override of the default

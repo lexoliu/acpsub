@@ -409,6 +409,168 @@ async fn forget_removes_registry_entry() {
     assert!(err.contains("unknown subagent"), "{err}");
 }
 
+/// `send` while a turn runs parks the prompt; it drains into the next turn
+/// once the running turn completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_queues_while_running() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("q", dir.path(), "wait 0.5")).await;
+
+    let sent = call_json(&tools, "send", json!({"name": "q", "prompt": "second"})).await;
+    assert_eq!(sent["state"], "queued", "{sent}");
+    assert_eq!(sent["position"], 1, "{sent}");
+    let status = call_json(&tools, "status", json!({"name": "q"})).await;
+    assert_eq!(status["queued_prompts"], 1, "{status}");
+
+    wait(&tools, "q", 30).await;
+    wait(&tools, "q", 30).await;
+    let status = call_json(&tools, "status", json!({"name": "q"})).await;
+    assert_eq!(status["state"], "done", "{status}");
+    assert_eq!(status["turns"], 2, "{status}");
+    assert_eq!(status["queued_prompts"], 0, "{status}");
+    let second = call_json(&tools, "result", json!({"name": "q", "turn": 2})).await;
+    assert_eq!(second["reply"], "Hello abworld", "{second}");
+}
+
+/// A cancelled turn drops queued prompts rather than running stale briefs.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_queued_dropped_on_cancel() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("qc", dir.path(), "wait")).await;
+
+    let sent = call_json(&tools, "send", json!({"name": "qc", "prompt": "later"})).await;
+    assert_eq!(sent["state"], "queued", "{sent}");
+
+    call_json(&tools, "cancel", json!({"name": "qc"})).await;
+    let done = wait(&tools, "qc", 30).await;
+    assert_eq!(done["state"], "cancelled", "{done}");
+
+    let status = call_json(&tools, "status", json!({"name": "qc"})).await;
+    assert_eq!(status["queued_prompts"], 0, "{status}");
+
+    // The subagent still accepts new prompts after the queue was dropped.
+    let sent = call_json(&tools, "send", json!({"name": "qc", "prompt": "hi"})).await;
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = wait(&tools, "qc", 30).await;
+    assert_eq!(done["reply"], "Hello abworld", "{done}");
+}
+
+/// Fork through the standard `session/fork` capability.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_via_session_fork() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let mut args = spawn_args("src", dir.path(), "hi");
+    args["agent"] = json!("forker");
+    call_json(&tools, "spawn", args).await;
+    wait(&tools, "src", 30).await;
+
+    let forked = call_json(&tools, "fork", json!({"name": "src"})).await;
+    assert_eq!(forked["name"], "src-fork", "{forked}");
+    assert_eq!(forked["forked_from"], "src", "{forked}");
+    assert_eq!(forked["session_id"], "sess-forked-std", "{forked}");
+
+    // The fork is live and takes prompts.
+    let sent = call_json(&tools, "send", json!({"name": "src-fork", "prompt": "go"})).await;
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = wait(&tools, "src-fork", 30).await;
+    assert_eq!(done["reply"], "Hello abworld", "{done}");
+
+    // The source is untouched and its lineage shows in list.
+    let status = call_json(&tools, "status", json!({"name": "src"})).await;
+    assert_eq!(status["state"], "done", "{status}");
+    assert_eq!(status["session_id"], "sess-1", "{status}");
+    let list = call_json(&tools, "list", json!({})).await;
+    let entry = list["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "src-fork")
+        .expect("fork listed");
+    assert_eq!(entry["forked_from"], "src", "{entry}");
+}
+
+/// Fork through devin's `_cognition.ai/revert/*` surface: the default picks
+/// the latest forkable step, `step` selects explicitly, and non-forkable or
+/// out-of-range steps error.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_via_devin_revert() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let mut args = spawn_args("dv", dir.path(), "hi");
+    args["agent"] = json!("devin");
+    call_json(&tools, "spawn", args).await;
+    wait(&tools, "dv", 30).await;
+
+    // Latest forkable step is 3 (node 303); step 2 has no fork target.
+    let forked = call_json(&tools, "fork", json!({"name": "dv"})).await;
+    assert_eq!(forked["session_id"], "sess-fork-303", "{forked}");
+    assert_eq!(forked["forked_from"], "dv", "{forked}");
+
+    let forked = call_json(
+        &tools,
+        "fork",
+        json!({"name": "dv", "new_name": "dv-early", "step": 1, "prompt": "go"}),
+    )
+    .await;
+    assert_eq!(forked["session_id"], "sess-fork-101", "{forked}");
+    assert_eq!(forked["state"], "running", "{forked}");
+    let done = wait(&tools, "dv-early", 30).await;
+    assert_eq!(done["reply"], "Hello abworld", "{done}");
+
+    let err = call_err(
+        &tools,
+        "fork",
+        json!({"name": "dv", "new_name": "dv-q", "step": 2}),
+    )
+    .await;
+    assert!(err.contains("no forkable step 2"), "{err}");
+    let err = call_err(
+        &tools,
+        "fork",
+        json!({"name": "dv", "new_name": "dv-far", "step": 9}),
+    )
+    .await;
+    assert!(err.contains("no forkable step 9"), "{err}");
+}
+
+/// An agent with no fork capability errors instead of silently respawning.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_unsupported_errors() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("nf", dir.path(), "hi")).await;
+    wait(&tools, "nf", 30).await;
+
+    let err = call_err(&tools, "fork", json!({"name": "nf"})).await;
+    assert!(err.contains("cannot fork"), "{err}");
+    // The failed fork left no live subagent behind.
+    let err = call_err(&tools, "status", json!({"name": "nf-fork"})).await;
+    assert!(err.contains("unknown subagent"), "{err}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn agents_tool_reports_initialized() {
     if !python3() {

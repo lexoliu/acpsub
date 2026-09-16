@@ -56,6 +56,20 @@ pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
         "wideopen".to_string(),
         AgentConfig {
             allow_outside_cwd: true,
+            ..fake.clone()
+        },
+    );
+    agents.insert(
+        "forker".to_string(),
+        AgentConfig {
+            env: BTreeMap::from([("FAKE_FORK".to_string(), "1".to_string())]),
+            ..fake.clone()
+        },
+    );
+    agents.insert(
+        "devin".to_string(),
+        AgentConfig {
+            env: BTreeMap::from([("FAKE_DEVIN_REVERT".to_string(), "1".to_string())]),
             ..fake
         },
     );

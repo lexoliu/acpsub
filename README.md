@@ -40,7 +40,7 @@ registry = "~/.local/share/acpsub/registry.json"
 command = "devin"
 args = ["acp"]
 mode = "bypass"                            # session/set_mode after session/new
-config = { model = "swe-2-max" }           # session/set_config_option id → value
+config = { model = "swe-2-high" }          # session/set_config_option id → value
 allow_outside_cwd = false                  # refuse fs/* paths outside cwd
 
 [agents.claude]
@@ -59,7 +59,8 @@ with no `[agents.*]` entries serves no agents.
 | tool | arguments | behaviour |
 |---|---|---|
 | `spawn` | `name, agent, cwd, prompt, mode?, config?, permission?, replace?` | Start the process (`session/load` for a resumable registered name), `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{name, session_id, agent, state}` at once. |
-| `send` | `name, prompt` | Next turn on the same session. Errors unless the subagent is `idle`, `done`, or `cancelled`. |
+| `send` | `name, prompt` | Next turn on the same session. While `running`/`needs_permission` the prompt is parked and fires when the turn completes (`{state: "queued", position}`); a cancelled or failed turn drops the queue. |
+| `fork` | `name, new_name?, prompt?, step?` | Clone the session history into a new session on a fresh process (`sessionCapabilities.fork`, else devin's `_cognition.ai/revert/*`; unsupported agents error). `step` picks the 1-based history step (default: latest forkable). Returns `{name, session_id, forked_from, state}`. |
 | `wait` | `name, timeout_secs` (default 600, max 3600) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, stop_reason?, reply, tool_calls, elapsed_secs, pending_permission?}`. |
 | `wait_any` | `names, timeout_secs` | First of them to leave `running`. |
 | `status` | `name` | State, session id, cwd, agent, turns, transcript path. |
@@ -78,9 +79,9 @@ with no `[agents.*]` entries serves no agents.
   a transcript file. States: `idle | running | needs_permission |
   done(stop_reason) | cancelled | failed`.
 - **Registry** (`registry.json`): `name → {agent, session_id, cwd, created,
-  last_turn, turns}`, written atomically. `spawn` of a registered name whose
-  agent advertised `loadSession` runs `session/load`; otherwise it errors
-  (`replace=true` forgets the old entry instead).
+  last_turn, turns, forked_from?}`, written atomically. `spawn` of a
+  registered name whose agent advertised `loadSession` runs `session/load`;
+  otherwise it errors (`replace=true` forgets the old entry instead).
 - **Transcript**: every `session/update`, prompt, and turn end is appended to
   `<transcript_dir>/<name>.jsonl` as a verbatim JSON record. A turn's `reply`
   is that turn's concatenated `agent_message_chunk` text.

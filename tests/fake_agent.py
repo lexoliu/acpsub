@@ -17,21 +17,30 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 - "KILL <cmd>" -> terminal/create, terminal/kill, then wait_for_exit and
   output; the kill's signal exit is recorded into the reply.
 - "wait" -> the prompt never completes until session/cancel.
+- "wait N" -> the prompt completes after N seconds.
 - "die" -> the process exits mid-turn with status 3.
 
 session/cancel answers the pending prompt with stopReason cancelled.
 FAKE_NO_LOAD=1 in the environment makes the agent not advertise loadSession.
+FAKE_FORK=1 advertises sessionCapabilities.fork and answers session/fork.
+FAKE_DEVIN_REVERT=1 advertises _meta["cognition.ai/revert"] and answers
+_cognition.ai/revert/listSteps + forkFromStep (forked session ids echo the
+target node: sess-fork-<node>).
 """
 
 import json
 import os
 import shlex
 import sys
+import threading
+
+send_lock = threading.Lock()
 
 
 def send(message):
-    sys.stdout.write(json.dumps(message) + "\n")
-    sys.stdout.flush()
+    with send_lock:
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
 
 
 def respond(request_id, result):
@@ -136,6 +145,13 @@ def on_prompt(request_id, params):
         {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "in_progress"},
     )
     if text == "wait":
+        return
+    if text.startswith("wait "):
+        try:
+            seconds = float(text[5:].strip())
+        except ValueError:
+            seconds = 0
+        threading.Timer(seconds, finish_prompt).start()
         return
     if "PERMISSION" in text:
         new_request(
@@ -306,13 +322,18 @@ for line in sys.stdin:
     if "method" in msg and "id" in msg:
         method, request_id, params = msg["method"], msg["id"], msg.get("params") or {}
         if method == "initialize":
+            capabilities = {
+                "loadSession": os.environ.get("FAKE_NO_LOAD") != "1",
+            }
+            if os.environ.get("FAKE_FORK") == "1":
+                capabilities["sessionCapabilities"] = {"fork": {}}
+            if os.environ.get("FAKE_DEVIN_REVERT") == "1":
+                capabilities["_meta"] = {"cognition.ai/revert": True}
             respond(
                 request_id,
                 {
                     "protocolVersion": 1,
-                    "agentCapabilities": {
-                        "loadSession": os.environ.get("FAKE_NO_LOAD") != "1",
-                    },
+                    "agentCapabilities": capabilities,
                     "agentInfo": {"name": "fake-agent-py", "version": "0.1.0"},
                 },
             )
@@ -379,6 +400,39 @@ for line in sys.stdin:
                     ]
                 },
             )
+        elif method == "session/fork":
+            respond(request_id, {"sessionId": "sess-forked-std"})
+        elif method == "_cognition.ai/revert/listSteps":
+            respond(
+                request_id,
+                {
+                    "steps": [
+                        {
+                            "stepId": "st-1",
+                            "stepNumber": 1,
+                            "kind": "prompt",
+                            "summary": "first step",
+                            "forkTargetNodeId": 101,
+                        },
+                        {
+                            "stepId": "st-2",
+                            "stepNumber": 2,
+                            "kind": "question",
+                            "summary": "a question, not forkable",
+                        },
+                        {
+                            "stepId": "st-3",
+                            "stepNumber": 3,
+                            "kind": "prompt",
+                            "summary": "third step",
+                            "forkTargetNodeId": 303,
+                        },
+                    ]
+                },
+            )
+        elif method == "_cognition.ai/revert/forkFromStep":
+            node = params.get("targetNodeId", 0)
+            respond(request_id, {"forkedSessionId": f"sess-fork-{node}"})
         elif method == "session/prompt":
             on_prompt(request_id, params)
         else:
