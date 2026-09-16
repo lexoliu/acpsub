@@ -1,20 +1,29 @@
 name: Release
 
-# Two entry points:
+# Entry points:
 #
-# * `push` to `main` (a merged dev→main release PR): release-plz publishes
-#   the crate to crates.io over OIDC trusted publishing, tags `v<version>`
-#   and creates the GitHub release — then the `dist` matrix and
-#   `release-assets` chain off the tag it created in this same run. Chaining
-#   inside one workflow is required because a tag pushed under GITHUB_TOKEN
-#   triggers no follow-up workflow.
-# * `workflow_dispatch` with a `tag` input: re-runs the dist and asset jobs
-#   for an existing release tag — the recovery path for a failed build leg,
-#   and the way to attach binaries to a release cut before this pipeline
-#   existed.
+# * `push` to `dev` (any merge): `release-plz release-pr` refreshes the
+#   version-bump pull request — against `dev`, never `main`, because the
+#   PR source gate only lets `dev` into `main`. The bump then rides the
+#   ordinary dev→main merge. release-plz's own `release` leg must NOT run
+#   on dev: it would publish and tag a not-yet-released version straight
+#   off the dev push, ahead of main. Only `release-pr` runs here, as the
+#   release-plz binary — MarcoIeni/release-plz-action always runs both
+#   legs, which is exactly how the unmergeable main-bound bump PRs were
+#   created.
+# * `push` to `main` (a merged dev→main release PR): `release-plz
+#   release` publishes the crate to crates.io over OIDC trusted
+#   publishing, tags `v<version>` and creates the GitHub release — then
+#   the `dist` matrix and `release-assets` chain off the tag it created
+#   in this same run. Chaining inside one workflow is required because a
+#   tag pushed under GITHUB_TOKEN triggers no follow-up workflow.
+# * `workflow_dispatch` with a `tag` input: re-runs the dist and asset
+#   jobs for an existing release tag — the recovery path for a failed
+#   build leg, and the way to attach binaries to a release cut before
+#   this pipeline existed.
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
   workflow_dispatch:
     inputs:
       tag:
@@ -30,10 +39,38 @@ env:
   DIST_VERSION: 0.30.2
 
 jobs:
+  release-pr:
+    name: Refresh the release pull request
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    concurrency:
+      group: release-plz-dev
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install release-plz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: release-plz
+      - uses: release-plz/git-config@v0.1.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update the release PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: release-plz release-pr --git-token "$GITHUB_TOKEN"
+
   release:
     name: Publish and tag the release
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     concurrency:
       group: release-main
       cancel-in-progress: false
@@ -55,10 +92,18 @@ jobs:
       # CARGO_REGISTRY_TOKEN secret is needed.
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
-      - uses: MarcoIeni/release-plz-action@v0.5
+      - name: Install release-plz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: release-plz
+      - uses: release-plz/git-config@v0.1.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish and tag
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: release-plz release --git-token "$GITHUB_TOKEN"
       # Whether this run released: release-plz tags the pushed commit, so
       # the peeled `v<version>` tag points at github.sha exactly when this
       # run released — an older tag existing on the remote is not a release
