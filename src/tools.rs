@@ -264,8 +264,12 @@ impl Tool for SendTool {
 struct WaitArgs {
     /// Subagent name.
     name: String,
-    /// Seconds to wait (default 600, max 3600). On expiry the result reports
-    /// the still-current state.
+    /// Seconds to wait (default 600, max 3600). Prefer long waits —
+    /// 300–1800 (5–30 min): the block is event-driven and returns early on
+    /// any state change, so a generous timeout is free, while every expiry
+    /// costs a model turn just to re-issue the wait on a still-`running`
+    /// result. Keep it under 1800 to stay inside the 30-min prompt-cache
+    /// TTL. On expiry the result reports the still-current state.
     timeout_secs: Option<u64>,
 }
 
@@ -312,7 +316,9 @@ impl Tool for WaitTool {
 struct WaitAnyArgs {
     /// Subagent names to watch.
     names: Vec<String>,
-    /// Seconds to wait (default 600, max 3600).
+    /// Seconds to wait (default 600, max 3600). Prefer 300–1800 (5–30
+    /// min), as with `wait`: early return on the first finisher is free,
+    /// but each expiry burns a model turn re-issuing the wait.
     timeout_secs: Option<u64>,
 }
 
