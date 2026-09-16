@@ -26,6 +26,14 @@ async fn spawn_wait_reply() {
     assert_eq!(done["state"], "done");
     assert_eq!(done["stop_reason"], "end_turn");
     assert_eq!(done["reply"], "Hello abworld", "{done}");
+    // `tool_calls` is opt-in: absent by default, rendered on request.
+    assert!(done["tool_calls"].is_null(), "{done}");
+    let done = call_json(
+        &tools,
+        "wait",
+        json!({"name": "a", "timeout_secs": 30, "tool_calls": true}),
+    )
+    .await;
     assert_eq!(done["tool_calls"][0]["id"], "tc-1");
     assert_eq!(done["tool_calls"][0]["status"], "completed");
 
@@ -358,7 +366,17 @@ async fn list_and_unknown_names() {
 
     let list = call_json(&tools, "list", json!({})).await;
     let subs = list["subagents"].as_array().unwrap();
-    assert!(subs.iter().any(|s| s["name"] == "l1" && s["live"] == true));
+    let entry = subs.iter().find(|s| s["name"] == "l1").expect("l1 listed");
+    assert_eq!(entry["state"], "done");
+    assert!(entry["live"].is_null() && entry["cwd"].is_null(), "{entry}");
+    let list = call_json(&tools, "list", json!({"full": true})).await;
+    let entry = list["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "l1")
+        .expect("l1 listed");
+    assert_eq!(entry["live"], true);
 
     let err = call_err(&tools, "status", json!({"name": "nobody"})).await;
     assert!(err.contains("unknown subagent"), "{err}");
@@ -615,6 +633,8 @@ async fn agent_death_mid_turn_marks_failed() {
 
     let status = call_json(&tools, "status", json!({"name": "d"})).await;
     assert_eq!(status["state"], "failed");
+    assert!(status["live"].is_null(), "{status}");
+    let status = call_json(&tools, "status", json!({"name": "d", "full": true})).await;
     assert_eq!(status["live"], true);
 
     // The registry entry outlives the process: after `close` the name resumes

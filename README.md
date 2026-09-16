@@ -58,17 +58,17 @@ with no `[agents.*]` entries serves no agents.
 
 | tool | arguments | behaviour |
 |---|---|---|
-| `spawn` | `name, agent, cwd, prompt, mode?, config?, permission?, replace?` | Start the process (`session/load` for a resumable registered name), `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{name, session_id, agent, state}` at once. |
+| `spawn` | `name, agent, cwd, prompt, mode?, config?, permission?, replace?, full?` | Start the process (`session/load` for a resumable registered name), `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{name, session_id, state}` at once (`full` adds `agent`/`cwd`/`transcript`). |
 | `send` | `name, prompt` | Next turn on the same session. While `running`/`needs_permission` the prompt is parked and fires when the turn completes (`{state: "queued", position}`); a cancelled or failed turn drops the queue. |
-| `fork` | `name, new_name?, prompt?, step?` | Clone the session history into a new session on a fresh process (`sessionCapabilities.fork`, else devin's `_cognition.ai/revert/*`; unsupported agents error). `step` picks the 1-based history step (default: latest forkable). Returns `{name, session_id, forked_from, state}`. |
-| `wait` | `name, timeout_secs` (default 600, max 3600) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, stop_reason?, reply, tool_calls, elapsed_secs, pending_permission?}`. |
-| `wait_any` | `names, timeout_secs` | First of them to leave `running`. |
-| `status` | `name` | State, session id, cwd, agent, turns, transcript path. |
+| `fork` | `name, new_name?, prompt?, step?, full?` | Clone the session history into a new session on a fresh process (`sessionCapabilities.fork`, else devin's `_cognition.ai/revert/*`; unsupported agents error). `step` picks the 1-based history step (default: latest forkable). Returns `{name, session_id, forked_from, state}`. |
+| `wait` | `name, timeout_secs` (default 600, max 3600), `tool_calls?` | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, stop_reason?, reply, elapsed_secs, pending_permission?}`; `tool_calls: true` adds the turn's tool-call list. |
+| `wait_any` | `names, timeout_secs, tool_calls?` | First of them to leave `running`. |
+| `status` | `name, full?` | State, session id, turns, queued/pending counts, last stop reason (`full` adds `agent`/`cwd`/`transcript`/`permission`/`live`). |
 | `result` | `name, turn?` | The reply of the last (or nth) turn. |
 | `cancel` | `name` | Answer pending permissions `cancelled`, send `session/cancel`. |
 | `permit` | `name, request_id, option_id` | Answer a queued `ask`-policy permission request. |
 | `transcript` | `name, from?, tail?, full?, thinking?` | Rendered transcript (same output as the CLI). |
-| `list` | `all?` | Live subagents with state; `all: true` also lists closed registry entries kept for resume. |
+| `list` | `all?, full?` | Live subagents `{name, state, turns}`; `all: true` also lists closed registry entries kept for resume, `full` adds the static fields per entry. |
 | `close` | `name` | End the process; keep the registry entry (still resumable). |
 | `forget` | `name` | Remove the registry entry (and the process if live). |
 | `agents` | — | Configured agents; for initialised ones their `agentInfo`, modes, config options. |
