@@ -168,7 +168,7 @@ args = ["{script}"]
 
     let waited = server.request(
         "tools/call",
-        &json!({"name": "wait", "arguments": {"name": "e2e", "timeout_secs": 30}}),
+        &json!({"name": "wait", "arguments": {"name": "e2e", "timeout_secs": 60}}),
     );
     let waited = tool_json(&waited);
     assert_eq!(waited["state"], "done", "{waited}");

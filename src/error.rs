@@ -98,6 +98,13 @@ pub enum Error {
         offered: Vec<String>,
     },
 
+    /// `wait`/`wait_any` received a `timeout_secs` below the minimum.
+    #[error("timeout_secs {got} is below the 60s minimum; use `status` for an instant state check")]
+    TimeoutBelowMin {
+        /// The rejected timeout.
+        got: u64,
+    },
+
     /// The requested turn does not exist.
     #[error("subagent '{name}' has no turn {turn} (has {have})")]
     NoSuchTurn {

@@ -22,7 +22,7 @@ async fn spawn_wait_reply() {
     assert_eq!(spawned["state"], "running");
     assert_eq!(spawned["session_id"], "sess-1");
 
-    let done = wait(&tools, "a", 30).await;
+    let done = wait(&tools, "a", 60).await;
     assert_eq!(done["state"], "done");
     assert_eq!(done["stop_reason"], "end_turn");
     assert_eq!(done["reply"], "Hello abworld", "{done}");
@@ -43,10 +43,10 @@ async fn send_followup_turn() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("b", dir.path(), "hi")).await;
-    wait(&tools, "b", 30).await;
+    wait(&tools, "b", 60).await;
 
     call_json(&tools, "send", json!({"name": "b", "prompt": "again"})).await;
-    let done = wait(&tools, "b", 30).await;
+    let done = wait(&tools, "b", 60).await;
     assert_eq!(done["state"], "done");
 
     let status = call_json(&tools, "status", json!({"name": "b"})).await;
@@ -69,11 +69,11 @@ async fn cancel_mid_turn() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("c", dir.path(), "wait")).await;
-    let running = wait(&tools, "c", 2).await;
+    let running = call_json(&tools, "status", json!({"name": "c"})).await;
     assert_eq!(running["state"], "running");
 
     call_json(&tools, "cancel", json!({"name": "c"})).await;
-    let done = wait(&tools, "c", 30).await;
+    let done = wait(&tools, "c", 60).await;
     assert_eq!(done["state"], "cancelled", "{done}");
     assert_eq!(done["stop_reason"], "cancelled");
 }
@@ -93,7 +93,7 @@ async fn wait_returns_when_cancel_runs_concurrently() {
 
     let waiter = {
         let tools = tools.clone();
-        tokio::spawn(async move { wait(&tools, "w", 30).await })
+        tokio::spawn(async move { wait(&tools, "w", 60).await })
     };
     // Let the prompt reach the agent so the cancel answers it.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -102,6 +102,29 @@ async fn wait_returns_when_cancel_runs_concurrently() {
     let done = waiter.await.expect("wait task panicked");
     assert_eq!(done["state"], "cancelled", "{done}");
     assert_eq!(done["stop_reason"], "cancelled");
+}
+
+/// Timeouts under the 60s floor are rejected on both wait tools; an instant
+/// check is `status`'s job.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_rejects_timeout_below_min() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    call_json(&tools, "spawn", spawn_args("s", dir.path(), "wait")).await;
+
+    let err = call_err(&tools, "wait", json!({"name": "s", "timeout_secs": 30})).await;
+    assert!(err.contains("below the 60s minimum"), "{err}");
+    let err = call_err(
+        &tools,
+        "wait_any",
+        json!({"names": ["s"], "timeout_secs": 1}),
+    )
+    .await;
+    assert!(err.contains("below the 60s minimum"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -116,7 +139,7 @@ async fn permission_ask_then_permit() {
     args["permission"] = json!("ask");
     call_json(&tools, "spawn", args).await;
 
-    let waiting = wait(&tools, "d", 30).await;
+    let waiting = wait(&tools, "d", 60).await;
     assert_eq!(waiting["state"], "needs_permission", "{waiting}");
     let pending = &waiting["pending_permission"];
     assert_eq!(pending["tool_call"]["id"], "tc-1");
@@ -136,7 +159,7 @@ async fn permission_ask_then_permit() {
         json!({"name": "d", "request_id": request_id, "option_id": "allow-1"}),
     )
     .await;
-    let done = wait(&tools, "d", 30).await;
+    let done = wait(&tools, "d", 60).await;
     assert_eq!(done["state"], "done", "{done}");
     assert!(
         done["reply"].as_str().unwrap().contains("perm:allow-1"),
@@ -155,7 +178,7 @@ async fn permission_deny_policy() {
     let mut args = spawn_args("e", dir.path(), "PERMISSION go");
     args["permission"] = json!("deny");
     call_json(&tools, "spawn", args).await;
-    let done = wait(&tools, "e", 30).await;
+    let done = wait(&tools, "e", 60).await;
     assert_eq!(done["state"], "done", "{done}");
     assert!(
         done["reply"].as_str().unwrap().contains("perm:deny-1"),
@@ -180,7 +203,7 @@ async fn fs_read_inside_and_outside_cwd() {
         spawn_args("f", dir.path(), &format!("READ {}", inside.display())),
     )
     .await;
-    let done = wait(&tools, "f", 30).await;
+    let done = wait(&tools, "f", 60).await;
     assert!(
         done["reply"].as_str().unwrap().contains("fs:inner-content"),
         "{done}"
@@ -192,7 +215,7 @@ async fn fs_read_inside_and_outside_cwd() {
         spawn_args("g", dir.path(), "READ /etc/hosts"),
     )
     .await;
-    let done = wait(&tools, "g", 30).await;
+    let done = wait(&tools, "g", 60).await;
     let reply = done["reply"].as_str().unwrap();
     assert!(reply.contains("fserr:"), "{reply}");
     assert!(reply.contains("outside the session cwd"), "{reply}");
@@ -204,7 +227,7 @@ async fn fs_read_inside_and_outside_cwd() {
         json!({"name": "h", "agent": "wideopen", "cwd": dir.path(), "prompt": "READ /etc/hosts"}),
     )
     .await;
-    let done = wait(&tools, "h", 30).await;
+    let done = wait(&tools, "h", 60).await;
     assert!(done["reply"].as_str().unwrap().contains("fs:"), "{done}");
     assert!(
         !done["reply"].as_str().unwrap().contains("fserr:"),
@@ -226,7 +249,7 @@ async fn terminal_run() {
         spawn_args("t", dir.path(), "RUN echo hello-term"),
     )
     .await;
-    let done = wait(&tools, "t", 30).await;
+    let done = wait(&tools, "t", 60).await;
     let reply = done["reply"].as_str().unwrap().to_string();
     assert!(reply.contains("term:hello-term"), "{reply}");
     assert!(reply.contains("exit:0"), "{reply}");
@@ -248,7 +271,7 @@ async fn terminal_run_shell_line() {
         spawn_args("t", dir.path(), "RUNLINE echo shell-$((40 + 2))"),
     )
     .await;
-    let done = wait(&tools, "t", 30).await;
+    let done = wait(&tools, "t", 60).await;
     let reply = done["reply"].as_str().unwrap().to_string();
     assert!(reply.contains("term:shell-42"), "{reply}");
     assert!(reply.contains("exit:0"), "{reply}");
@@ -263,7 +286,7 @@ async fn transcript_rendering() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("tr", dir.path(), "hi")).await;
-    wait(&tools, "tr", 30).await;
+    wait(&tools, "tr", 60).await;
 
     let text = call_text(&tools, "transcript", json!({"name": "tr"})).await;
     assert!(text.contains("=== [turn 1] USER\nhi"), "{text}");
@@ -301,14 +324,14 @@ async fn registry_resume_via_load() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("res", dir.path(), "hi")).await;
-    wait(&tools, "res", 30).await;
+    wait(&tools, "res", 60).await;
     call_json(&tools, "close", json!({"name": "res"})).await;
 
     // Registered but not live: the fake agent advertises loadSession, so the
     // second spawn runs session/load and keeps the session id.
     let resumed = call_json(&tools, "spawn", spawn_args("res", dir.path(), "again")).await;
     assert_eq!(resumed["session_id"], "sess-1");
-    let done = wait(&tools, "res", 30).await;
+    let done = wait(&tools, "res", 60).await;
     assert_eq!(done["state"], "done");
 
     let status = call_json(&tools, "status", json!({"name": "res"})).await;
@@ -328,7 +351,7 @@ async fn registry_no_load_requires_replace() {
     let mut args = spawn_args("nl", dir.path(), "hi");
     args["agent"] = json!("noload");
     call_json(&tools, "spawn", args.clone()).await;
-    wait(&tools, "nl", 30).await;
+    wait(&tools, "nl", 60).await;
     call_json(&tools, "close", json!({"name": "nl"})).await;
 
     let err = call_err(&tools, "spawn", args.clone()).await;
@@ -338,7 +361,7 @@ async fn registry_no_load_requires_replace() {
     // but no session/load replay record.
     args["replace"] = json!(true);
     call_json(&tools, "spawn", args).await;
-    let done = wait(&tools, "nl", 30).await;
+    let done = wait(&tools, "nl", 60).await;
     assert_eq!(done["state"], "done");
     let text = call_text(&tools, "transcript", json!({"name": "nl"})).await;
     assert_eq!(text.matches("=== [turn 1] USER").count(), 2, "{text}");
@@ -354,7 +377,7 @@ async fn list_and_unknown_names() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("l1", dir.path(), "hi")).await;
-    wait(&tools, "l1", 30).await;
+    wait(&tools, "l1", 60).await;
 
     let list = call_json(&tools, "list", json!({})).await;
     let subs = list["subagents"].as_array().unwrap();
@@ -386,7 +409,7 @@ async fn wait_any_returns_first_done() {
     let first = call_json(
         &tools,
         "wait_any",
-        json!({"names": ["w1", "w2"], "timeout_secs": 30}),
+        json!({"names": ["w1", "w2"], "timeout_secs": 60}),
     )
     .await;
     assert_eq!(first["name"], "w2", "{first}");
@@ -403,7 +426,7 @@ async fn forget_removes_registry_entry() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("fg", dir.path(), "hi")).await;
-    wait(&tools, "fg", 30).await;
+    wait(&tools, "fg", 60).await;
     call_json(&tools, "forget", json!({"name": "fg"})).await;
     let err = call_err(&tools, "status", json!({"name": "fg"})).await;
     assert!(err.contains("unknown subagent"), "{err}");
@@ -418,7 +441,7 @@ async fn agents_tool_reports_initialized() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("ag", dir.path(), "hi")).await;
-    wait(&tools, "ag", 30).await;
+    wait(&tools, "ag", 60).await;
     let agents = call_json(&tools, "agents", json!({})).await;
     let fake = agents["agents"]
         .as_array()
@@ -444,7 +467,7 @@ async fn agent_death_mid_turn_marks_failed() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("d", dir.path(), "die")).await;
-    let done = wait(&tools, "d", 30).await;
+    let done = wait(&tools, "d", 60).await;
     assert_eq!(done["state"], "failed", "{done}");
     assert!(
         done["error"].as_str().is_some_and(|e| !e.is_empty()),
@@ -460,7 +483,7 @@ async fn agent_death_mid_turn_marks_failed() {
     call_json(&tools, "close", json!({"name": "d"})).await;
     let resumed = call_json(&tools, "spawn", spawn_args("d", dir.path(), "hi")).await;
     assert_eq!(resumed["session_id"], "sess-1");
-    let done = wait(&tools, "d", 30).await;
+    let done = wait(&tools, "d", 60).await;
     assert_eq!(done["state"], "done");
 }
 
@@ -480,7 +503,7 @@ async fn terminal_kill_reports_signal_exit() {
         spawn_args("k", dir.path(), "KILL sleep 60"),
     )
     .await;
-    let done = wait(&tools, "k", 30).await;
+    let done = wait(&tools, "k", 60).await;
     assert_eq!(done["state"], "done", "{done}");
     let reply = done["reply"].as_str().unwrap();
     assert!(reply.contains("exit:None"), "{reply}");
@@ -498,7 +521,7 @@ async fn close_keeps_name_registered() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("cl", dir.path(), "hi")).await;
-    wait(&tools, "cl", 30).await;
+    wait(&tools, "cl", 60).await;
 
     let closed = call_json(&tools, "close", json!({"name": "cl"})).await;
     assert_eq!(closed["closed"], true);
@@ -541,7 +564,7 @@ async fn fs_write_inside_and_outside_cwd() {
         spawn_args("wi", dir.path(), &format!("WRITE {}", inside.display())),
     )
     .await;
-    let done = wait(&tools, "wi", 30).await;
+    let done = wait(&tools, "wi", 60).await;
     assert!(done["reply"].as_str().unwrap().contains("fsw:ok"), "{done}");
     assert_eq!(
         std::fs::read_to_string(&inside).unwrap(),
@@ -560,7 +583,7 @@ async fn fs_write_inside_and_outside_cwd() {
         ),
     )
     .await;
-    let done = wait(&tools, "wo", 30).await;
+    let done = wait(&tools, "wo", 60).await;
     let reply = done["reply"].as_str().unwrap();
     assert!(reply.contains("fswerr:"), "{reply}");
     assert!(reply.contains("outside the session cwd"), "{reply}");
@@ -574,7 +597,7 @@ async fn fs_write_inside_and_outside_cwd() {
                "prompt": format!("WRITE {}", outside_file.display())}),
     )
     .await;
-    let done = wait(&tools, "ww", 30).await;
+    let done = wait(&tools, "ww", 60).await;
     assert!(done["reply"].as_str().unwrap().contains("fsw:ok"), "{done}");
     assert_eq!(
         std::fs::read_to_string(&outside_file).unwrap(),
@@ -593,7 +616,7 @@ async fn duplicate_live_name_rejected_until_forgotten() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("dup", dir.path(), "hi")).await;
-    wait(&tools, "dup", 30).await;
+    wait(&tools, "dup", 60).await;
 
     let err = call_err(&tools, "spawn", spawn_args("dup", dir.path(), "again")).await;
     assert!(err.contains("already running"), "{err}");
@@ -601,7 +624,7 @@ async fn duplicate_live_name_rejected_until_forgotten() {
     call_json(&tools, "forget", json!({"name": "dup"})).await;
     let spawned = call_json(&tools, "spawn", spawn_args("dup", dir.path(), "again")).await;
     assert_eq!(spawned["state"], "running");
-    let done = wait(&tools, "dup", 30).await;
+    let done = wait(&tools, "dup", 60).await;
     assert_eq!(done["state"], "done");
 }
 
@@ -660,7 +683,7 @@ async fn spawn_with_missing_command_fails() {
     // The failed spawn released the name: a working agent can take it.
     let spawned = call_json(&tools, "spawn", spawn_args("b", dir.path(), "hi")).await;
     assert_eq!(spawned["state"], "running");
-    wait(&tools, "b", 30).await;
+    wait(&tools, "b", 60).await;
 }
 
 /// Two concurrent `spawn` calls for one name: the reservation is atomic, so
@@ -700,7 +723,7 @@ async fn concurrent_spawn_same_name_runs_once() {
     assert_eq!(errors.len(), 1);
     assert!(errors[0].contains("already running"), "{}", errors[0]);
 
-    let done = wait(&tools, "cc", 30).await;
+    let done = wait(&tools, "cc", 60).await;
     assert_eq!(done["state"], "done");
 }
 
@@ -721,7 +744,7 @@ async fn terminal_output_truncates_to_tail() {
         spawn_args("big", dir.path(), "RUNLINE seq 1 5000"),
     )
     .await;
-    let done = wait(&tools, "big", 30).await;
+    let done = wait(&tools, "big", 60).await;
     let reply = done["reply"].as_str().unwrap();
     assert!(reply.contains("trunc"), "{reply}");
     assert!(reply.contains("5000"), "{reply}");
@@ -740,9 +763,10 @@ async fn result_and_transcript_after_cancel() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("cx", dir.path(), "wait")).await;
-    wait(&tools, "cx", 2).await;
+    let running = call_json(&tools, "status", json!({"name": "cx"})).await;
+    assert_eq!(running["state"], "running", "{running}");
     call_json(&tools, "cancel", json!({"name": "cx"})).await;
-    let done = wait(&tools, "cx", 30).await;
+    let done = wait(&tools, "cx", 60).await;
     assert_eq!(done["state"], "cancelled");
 
     let result = call_json(&tools, "result", json!({"name": "cx"})).await;
@@ -764,7 +788,7 @@ async fn permit_with_unknown_request_id() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     call_json(&tools, "spawn", spawn_args("p", dir.path(), "hi")).await;
-    wait(&tools, "p", 30).await;
+    wait(&tools, "p", 60).await;
 
     let err = call_err(
         &tools,
