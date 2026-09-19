@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::config::PermissionPolicy;
-use crate::state::{PendingPermission, Status, SubRuntime, ToolCallSummary, now};
+use crate::state::{PendingPermission, Status, SubRuntime, ToolCallSummary, Turn, now};
 use crate::terminal::{self, Terminal};
 
 /// Handles one subagent's agent-to-client traffic.
@@ -70,14 +70,33 @@ impl ClientHandler for SubagentHandler {
         reason = "the `inner` guard must stay alive while `turn` borrows it"
     )]
     async fn session_update(&self, notification: SessionNotification) {
-        let turn_n = self
-            .rt
-            .inner
-            .lock()
-            .expect("inner poisoned")
-            .current
-            .as_ref()
-            .map_or(0, |turn| turn.n);
+        // A `session/update` with no current turn means the agent is running
+        // a turn we did not open: a steered prompt that landed after its
+        // target turn ended. Materialize `current` for the oldest pending
+        // steer so the update — and the turn — is tracked; `steer_resolved`
+        // settles it when the steer's `session/prompt` resolves.
+        let (turn_n, materialized) = {
+            let mut inner = self.rt.inner.lock().expect("inner poisoned");
+            let materialized = inner.current.is_none()
+                && !inner.steer_pending.is_empty()
+                && !matches!(inner.status, Status::Failed(_));
+            if materialized {
+                let n = inner.turn_offset + inner.turns.len() as u64 + 1;
+                inner.current = Some(Turn {
+                    n,
+                    ..Turn::default()
+                });
+                inner.steer_owner = inner.steer_pending.front().copied();
+                inner.status = Status::Running;
+            }
+            (
+                inner.current.as_ref().map_or(0, |turn| turn.n),
+                materialized,
+            )
+        };
+        if materialized {
+            self.rt.notify.notify_waiters();
+        }
         let record = serde_json::json!({
             "ts": now(),
             "turn": turn_n,

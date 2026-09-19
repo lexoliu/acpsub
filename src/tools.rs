@@ -21,7 +21,10 @@ use tracing::debug;
 use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
-use crate::state::{AppState, Launch, Status, Subagent, launch, start_turn};
+use crate::state::{
+    AppState, Gate, Launch, Status, Subagent, begin_turn, launch, prompt_slot_free,
+    record_queue_dropped, spawn_turn_task, start_turn, steer_resolved, steer_turn, steer_waiter,
+};
 use crate::transcript::{RenderOptions, render};
 
 /// `wait`'s minimum timeout: shorter polls belong to `status`.
@@ -32,6 +35,10 @@ const DEFAULT_WAIT_SECS: u64 = 600;
 const MAX_WAIT_SECS: u64 = 3600;
 /// `wait_any` polls the named subagents this often.
 const WAIT_ANY_POLL: Duration = Duration::from_millis(50);
+/// How long `send` waits for a synchronous rejection of a steer before
+/// reporting `steered`; an accepted steer resolves only at turn end, so a
+/// longer wait would just stall the caller.
+const STEER_ACK: Duration = Duration::from_millis(250);
 
 /// Build the full tool set over `state`.
 ///
@@ -72,7 +79,7 @@ fn spawned_view(sub: &Subagent) -> Value {
 
 /// A `wait`-style result for one subagent.
 fn wait_view(sub: &Subagent, started: Instant) -> Value {
-    let (status, reply, tool_calls, pending) = {
+    let (status, reply, tool_calls, pending, turn_n, queued) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
         let turn = inner.current.as_ref().or_else(|| inner.turns.last());
         let pending = inner.pending.first().map(|perm| {
@@ -98,13 +105,17 @@ fn wait_view(sub: &Subagent, started: Instant) -> Value {
                 turn.tool_calls.values().cloned().collect::<Vec<_>>()
             }),
             pending,
+            turn.map(|turn| turn.n),
+            inner.queue.len(),
         )
     };
     let mut view = json!({
         "session_id": sub.session_id,
         "state": status.name(),
+        "turn": turn_n,
         "reply": reply,
         "tool_calls": tool_calls,
+        "queued": queued,
         "elapsed_secs": started.elapsed().as_secs_f64(),
     });
     match &status {
@@ -133,6 +144,9 @@ async fn close_sub(sub: &Subagent) {
         for pending in inner.pending.drain(..) {
             let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
         }
+        inner.queue.clear();
+        inner.steer_pending.clear();
+        inner.steer_owner = None;
         if matches!(inner.status, Status::Running | Status::NeedsPermission) {
             inner.status = Status::Cancelled;
         }
@@ -316,10 +330,10 @@ impl Tool for AdoptTool {
 // send
 // ---------------------------------------------------------------------------
 
-/// Send a follow-up prompt to a live subagent: a new turn on the same session.
+/// Send a prompt to a live subagent. `policy` decides what a `running` (or
+/// `needs_permission`) subagent does with it; nothing is queued or injected
+/// unless you ask.
 ///
-/// Only valid when the subagent is `idle`, `done`, or `cancelled`; a `running`
-/// or `needs_permission` subagent must be waited on or cancelled first.
 /// Returns immediately; use `wait` for the reply.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SendArgs {
@@ -327,6 +341,31 @@ struct SendArgs {
     session_id: String,
     /// The prompt for the next turn.
     prompt: String,
+    /// Required: how to deliver while a turn is running.
+    ///
+    /// `try` — the original behavior: error unless the subagent is `idle`,
+    /// `done`, or `cancelled`. `queued` — park the prompt on a FIFO queue;
+    /// it fires as the next turn when the current one ends, and is dropped
+    /// if that turn is cancelled or fails, or on `cancel`/`close`/`forget`.
+    /// `steer` — inject the prompt into the running turn (a second
+    /// `session/prompt` while it is in flight); agents that support
+    /// mid-turn injection fold it into the active task, agents that do not
+    /// surface an error.
+    policy: SendPolicy,
+}
+
+/// Delivery policy for `send` while a turn is running — no default, the
+/// caller chooses explicitly.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum SendPolicy {
+    /// Error when the subagent is not `idle`, `done`, or `cancelled`.
+    Try,
+    /// Park the prompt on the subagent's queue; it fires as the next turn
+    /// when the current one ends.
+    Queued,
+    /// Inject the prompt into the running turn as a steering message.
+    Steer,
 }
 
 struct SendTool(Arc<AppState>);
@@ -340,7 +379,108 @@ impl Tool for SendTool {
 
     async fn call(&self, args: SendArgs) -> aither_core::Result<Value> {
         let sub = self.0.get(&args.session_id)?;
-        start_turn(self.0.clone(), &sub, args.prompt).await?;
+        match args.policy {
+            SendPolicy::Try => {
+                start_turn(self.0.clone(), &sub, args.prompt).await?;
+            }
+            SendPolicy::Queued => {
+                // Promptable → start the turn, otherwise park the prompt. A
+                // concurrent `send` can win the start between the check and
+                // `start_turn`; retry then lands in the queue.
+                enum Action {
+                    Fresh,
+                    Queued(usize),
+                }
+                loop {
+                    let action = {
+                        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+                        if prompt_slot_free(&inner) && inner.queue.is_empty() {
+                            Action::Fresh
+                        } else if matches!(inner.status, Status::Failed(_)) {
+                            return Err(Error::NotPromptable {
+                                session_id: args.session_id.clone(),
+                                status: inner.status.name().to_string(),
+                            }
+                            .into());
+                        } else {
+                            inner.queue.push_back(args.prompt.clone());
+                            Action::Queued(inner.queue.len())
+                        }
+                    };
+                    match action {
+                        Action::Queued(position) => {
+                            sub.rt.notify.notify_waiters();
+                            return Ok(json!({
+                                "session_id": args.session_id,
+                                "state": "queued",
+                                "position": position,
+                            }));
+                        }
+                        Action::Fresh => {
+                            match start_turn(self.0.clone(), &sub, args.prompt.clone()).await {
+                                Ok(()) => break,
+                                Err(Error::NotPromptable { .. }) => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                        }
+                    }
+                }
+            }
+            SendPolicy::Steer => {
+                let wire = sub.rt.prompt_send.lock().await;
+                let status = {
+                    let inner = sub.rt.inner.lock().expect("inner poisoned");
+                    inner.status.clone()
+                };
+                match status {
+                    Status::Idle | Status::Done(_) | Status::Cancelled => {
+                        let (turn_n, fut) =
+                            begin_turn(&sub, args.prompt, Gate::Check, false).await?;
+                        spawn_turn_task(self.0.clone(), &sub, fut, turn_n);
+                    }
+                    Status::Running | Status::NeedsPermission => {
+                        let (steer_id, turn_n, mut fut) = steer_turn(&sub, args.prompt).await?;
+                        drop(wire);
+                        // An accepted steer resolves only at turn end; a
+                        // rejection lands almost at once. Give the agent a
+                        // beat to reject before reporting `steered`.
+                        if let Ok(outcome) = tokio::time::timeout(STEER_ACK, &mut fut).await {
+                            if let Err(source) =
+                                steer_resolved(self.0.clone(), &sub, steer_id, turn_n, outcome)
+                                    .await
+                            {
+                                return Err(Error::Agent {
+                                    agent: sub.agent.clone(),
+                                    source,
+                                }
+                                .into());
+                            }
+                        } else {
+                            tokio::spawn(steer_waiter(
+                                self.0.clone(),
+                                sub.clone(),
+                                steer_id,
+                                turn_n,
+                                fut,
+                            ));
+                        }
+                        return Ok(json!({
+                            "session_id": args.session_id,
+                            "state": "steered",
+                            "turn": turn_n,
+                        }));
+                    }
+                    Status::Failed(_) => {
+                        drop(wire);
+                        return Err(Error::NotPromptable {
+                            session_id: args.session_id.clone(),
+                            status: status.name().to_string(),
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
         Ok(json!({"session_id": args.session_id, "state": "running"}))
     }
 }
@@ -510,7 +650,7 @@ impl StatusTool {
             .get(&args.session_id)
             .cloned();
         if let Some(sub) = sub {
-            let (status, turns, last_stop, pending) = {
+            let (status, turns, last_stop, pending, queued) = {
                 let inner = sub.rt.inner.lock().expect("inner poisoned");
                 (
                     inner.status.clone(),
@@ -521,6 +661,7 @@ impl StatusTool {
                         .iter()
                         .map(|p| p.request_id.clone())
                         .collect::<Vec<_>>(),
+                    inner.queue.iter().cloned().collect::<Vec<_>>(),
                 )
             };
             let mut view = json!({
@@ -530,6 +671,7 @@ impl StatusTool {
                 "state": status.name(),
                 "cwd": sub.cwd,
                 "turns": turns,
+                "queued": queued,
                 "transcript": sub.transcript_path,
                 "permission": serde_json::to_value(sub.permission).unwrap_or_default(),
                 "pending_permissions": pending,
@@ -630,8 +772,9 @@ impl ResultTool {
 // ---------------------------------------------------------------------------
 
 /// Cancel a subagent's running turn: answers every queued permission request
-/// `cancelled`, then sends `session/cancel`. The turn ends with the agent's
-/// `cancelled` stop reason.
+/// `cancelled`, drops prompts parked by `send` with `policy: "queued"`, then
+/// sends `session/cancel`. The turn ends with the agent's `cancelled` stop
+/// reason.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CancelArgs {
     /// Session id, as returned by `spawn`/`adopt`.
@@ -649,7 +792,7 @@ impl Tool for CancelTool {
 
     async fn call(&self, args: CancelArgs) -> aither_core::Result<Value> {
         let sub = self.0.get(&args.session_id)?;
-        {
+        let (dropped, turn_n) = {
             let mut inner = sub.rt.inner.lock().expect("inner poisoned");
             if !matches!(inner.status, Status::Running | Status::NeedsPermission) {
                 return Err(Error::NotRunning(args.session_id.clone()).into());
@@ -657,7 +800,13 @@ impl Tool for CancelTool {
             for pending in inner.pending.drain(..) {
                 let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
             }
-        }
+            (
+                std::mem::take(&mut inner.queue),
+                inner.current.as_ref().map(|turn| turn.n),
+            )
+        };
+        record_queue_dropped(&sub.rt, turn_n, dropped).await;
+        sub.rt.notify.notify_waiters();
         sub.client
             .cancel(&sub.session_id)
             .await

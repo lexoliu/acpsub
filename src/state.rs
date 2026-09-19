@@ -223,6 +223,20 @@ pub struct Inner {
     pub current: Option<Turn>,
     /// Permission requests awaiting `permit`, oldest first.
     pub pending: Vec<PendingPermission>,
+    /// Prompts parked by `send` with `policy: "queued"`, oldest first. Fired
+    /// one at a time as each turn ends; dropped when a turn ends `cancelled`
+    /// or fails, and on `cancel`/`close`/`forget`/agent disconnect.
+    pub queue: VecDeque<String>,
+    /// Ids of steered prompts whose `session/prompt` result is still in
+    /// flight, oldest first — the wire order their turns would run in. A
+    /// steer that lands after its target turn ended runs as a turn of its
+    /// own; the first untracked `session/update` materializes a `current`
+    /// for it (see `steer_owner`), and the queue holds until they resolve.
+    pub steer_pending: VecDeque<u64>,
+    /// The pending steer that owns the materialized `current` turn — set
+    /// when `current` was not opened by a `send`/`spawn`/`adopt` prompt but
+    /// synthesized for untracked `session/update` traffic.
+    pub steer_owner: Option<u64>,
 }
 
 /// Everything the handler, tools, and background tasks share about one
@@ -233,6 +247,12 @@ pub struct SubRuntime {
     pub inner: Mutex<Inner>,
     /// Wakes `wait`/`wait_any` callers on every status change.
     pub notify: Notify,
+    /// Serializes every `session/prompt` wire-send — turn prompts, queued
+    /// handoffs, and steers — so a steer can never overtake the prompt of
+    /// the turn it steers into and the between-turns transition stays atomic.
+    /// `Arc` so a queued-turn handoff can move the owned guard into the
+    /// chained task.
+    pub prompt_send: Arc<tokio::sync::Mutex<()>>,
     /// The JSONL transcript file.
     pub transcript: tokio::sync::Mutex<TranscriptWriter>,
     /// Live terminals by id.
@@ -243,6 +263,8 @@ pub struct SubRuntime {
     pub next_perm: AtomicU64,
     /// Terminal id counter.
     pub next_term: AtomicU64,
+    /// Steer id counter.
+    pub next_steer: AtomicU64,
     /// Set by `close`/`forget` before the connection is shut down.
     pub closing: AtomicBool,
 }
@@ -421,12 +443,17 @@ async fn launch_inner(
             turns: Vec::new(),
             current: None,
             pending: Vec::new(),
+            queue: VecDeque::new(),
+            steer_pending: VecDeque::new(),
+            steer_owner: None,
         }),
         notify: Notify::new(),
+        prompt_send: Arc::new(tokio::sync::Mutex::new(())),
         transcript: tokio::sync::Mutex::new(TranscriptWriter::deferred()),
         terminals: Terminals::new(HashMap::new()),
         stderr_tail: Mutex::new(VecDeque::new()),
         next_perm: AtomicU64::new(1),
+        next_steer: AtomicU64::new(1),
         next_term: AtomicU64::new(1),
         closing: AtomicBool::new(false),
     });
@@ -678,6 +705,9 @@ fn on_disconnect(rt: &SubRuntime) {
     }
     inner.status = Status::Failed("agent process exited".to_string());
     inner.pending.clear();
+    inner.queue.clear();
+    inner.steer_pending.clear();
+    inner.steer_owner = None;
     inner.current = None;
     drop(inner);
     rt.notify.notify_waiters();
@@ -705,11 +735,26 @@ async fn pump_stderr(stderr: async_process::ChildStderr, rt: Arc<SubRuntime>) {
     }
 }
 
+/// Whether [`begin_turn`] verifies the status before starting a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gate {
+    /// The status must accept a prompt — the `send`/`spawn`/`adopt` paths.
+    Check,
+    /// The queued-turn handoff already reserved the slot: the status is
+    /// `Running` with no current turn.
+    Chained,
+}
+
+/// Whether the status accepts a prompt and no steered prompt is still in
+/// flight on the wire — its turn, if the agent runs it as one, comes first.
+pub(crate) fn prompt_slot_free(inner: &Inner) -> bool {
+    inner.status.accepts_prompt() && inner.steer_pending.is_empty()
+}
+
 /// Begin a prompt turn on an established session.
 ///
-/// The caller has already checked the status accepts a prompt. Writes the
-/// `prompt` transcript record, marks the turn running, and spawns the task
-/// that awaits `session/prompt` and records the turn's end.
+/// Serializes through `rt.prompt_send`, requires a promptable status, and
+/// spawns the task that records the turn's end.
 ///
 /// # Errors
 ///
@@ -720,12 +765,58 @@ async fn pump_stderr(stderr: async_process::ChildStderr, rt: Arc<SubRuntime>) {
 ///
 /// Panics if a state mutex is poisoned.
 pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: String) -> Result<()> {
+    let _wire = sub.rt.prompt_send.lock().await;
+    let (turn_n, fut) = begin_turn(sub, prompt, Gate::Check, false).await?;
+    spawn_turn_task(state, sub, fut, turn_n);
+    Ok(())
+}
+
+/// The shared tail of `start_turn`, `send`'s steer-fallback, and the
+/// queued-turn handoff: marks the turn running, writes the `prompt`
+/// transcript record, and enqueues `session/prompt`.
+///
+/// The caller must hold `rt.prompt_send`: serializing every prompt's
+/// wire-send is what keeps a steer behind the prompt of the turn it steers
+/// into, and what keeps the between-turns handoff atomic against `send`.
+/// The caller also spawns [`turn_task`] on the returned future — see
+/// [`spawn_turn_task`].
+///
+/// `queued` marks the transcript record as queue-fired (rendered
+/// `USER (queued)`).
+///
+/// Returns the turn's number and its `session/prompt` future.
+///
+/// # Errors
+///
+/// Returns [`Error::NotPromptable`] when the gate rejects the current
+/// status, or an I/O error if the transcript record cannot be written — in
+/// which case the subagent is marked `failed`, since the turn can neither
+/// run nor be logged.
+///
+/// # Panics
+///
+/// Panics if a state mutex is poisoned.
+pub(crate) async fn begin_turn(
+    sub: &Arc<Subagent>,
+    prompt: String,
+    gate: Gate,
+    queued: bool,
+) -> Result<(u64, PromptFut)> {
     let turn_n = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-        if !inner.status.accepts_prompt() {
+        let ready = match gate {
+            Gate::Check => prompt_slot_free(&inner),
+            Gate::Chained => matches!(inner.status, Status::Running) && inner.current.is_none(),
+        };
+        if !ready {
+            let status = if inner.status.accepts_prompt() {
+                "steer in flight".to_string()
+            } else {
+                inner.status.name().to_string()
+            };
             return Err(Error::NotPromptable {
                 session_id: sub.session_id.clone(),
-                status: inner.status.name().to_string(),
+                status,
             });
         }
         let n = inner.turn_offset + inner.turns.len() as u64 + 1;
@@ -734,22 +825,53 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
             ..Turn::default()
         });
         inner.status = Status::Running;
-        drop(inner);
         n
     };
-    sub.rt
-        .transcript
-        .lock()
-        .await
-        .append(&serde_json::json!({"ts": now(), "turn": turn_n, "prompt": prompt}))
-        .await
-        .map_err(|source| Error::io("cannot write transcript", source))?;
+    let mut record = serde_json::json!({"ts": now(), "turn": turn_n, "prompt": prompt});
+    if queued {
+        record["queued"] = serde_json::json!(true);
+    }
+    if let Err(source) = sub.rt.transcript.lock().await.append(&record).await {
+        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+        inner.current = None;
+        inner.status = Status::Failed(format!("cannot write transcript: {source}"));
+        drop(inner);
+        sub.rt.notify.notify_waiters();
+        return Err(Error::io("cannot write transcript", source));
+    }
     sub.rt.notify.notify_waiters();
 
-    let client = sub.client.clone();
-    let session_id = sub.session_id.clone();
-    let rt = sub.rt.clone();
-    let task_session_id = session_id.clone();
+    let fut = enqueue_prompt(&sub.client, &sub.session_id, prompt).await;
+    Ok((turn_n, fut))
+}
+
+/// Spawn the turn-end task for a [`begin_turn`] result.
+pub(crate) fn spawn_turn_task(
+    state: Arc<AppState>,
+    sub: &Arc<Subagent>,
+    prompt: PromptFut,
+    turn_n: u64,
+) {
+    tokio::spawn(turn_task(
+        state,
+        prompt,
+        turn_n,
+        sub.rt.clone(),
+        sub.session_id.clone(),
+    ));
+}
+
+/// Build a `session/prompt` call and drive it once so the request is on the
+/// wire: `AcpClient` enqueues the request on its unbounded outbound channel
+/// inside the first poll, so a `cancel` or steer issued right after cannot
+/// overtake the prompt it is meant to follow.
+async fn enqueue_prompt(
+    client: &AcpClient<SubagentHandler>,
+    session_id: &str,
+    prompt: String,
+) -> PromptFut {
+    let client = client.clone();
+    let session_id = session_id.to_string();
     let mut prompt: PromptFut = Box::pin(async move {
         client
             .prompt(
@@ -761,11 +883,6 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
             )
             .await
     });
-    // Drive the prompt future once before returning: `AcpClient` enqueues
-    // the request on its unbounded outbound channel inside the first poll,
-    // so `session/prompt` is on the wire ahead of anything a later tool
-    // call sends — a `cancel` issued right after `spawn`/`send` cannot
-    // overtake the prompt it is meant to stop.
     let ready = futures_lite::future::poll_fn(|cx| match prompt.as_mut().poll(cx) {
         std::task::Poll::Ready(outcome) => std::task::Poll::Ready(Some(outcome)),
         std::task::Poll::Pending => std::task::Poll::Ready(None),
@@ -773,17 +890,218 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
     .await;
     // A synchronously-failed send resolves on the first poll; wrap the
     // outcome so the same turn-end path handles it.
-    let prompt: PromptFut = ready.map_or(prompt, |outcome| Box::pin(async move { outcome }));
-    tokio::spawn(turn_task(state, prompt, turn_n, rt, task_session_id));
-    Ok(())
+    ready.map_or(prompt, |outcome| Box::pin(async move { outcome }))
+}
+
+/// Inject `prompt` into the running turn as a steering message: a second
+/// `session/prompt` on the wire while the turn is in flight.
+///
+/// The caller holds `rt.prompt_send`, so the steer lands on the wire behind
+/// the running turn's own prompt. Agents that support mid-turn injection
+/// (devin treats it as an injected user message steering the active task)
+/// fold the text into the turn; the returned future resolves with that
+/// turn's own result — or with a rejection from agents that do not accept a
+/// concurrent prompt. A steer that lands after the target turn ended runs
+/// as a turn of its own: [`steer_resolved`] reconciles which it became.
+///
+/// Returns the steer id, the target turn's number, and the prompt call's
+/// future, which the caller either awaits briefly for a synchronous
+/// rejection or hands to [`steer_waiter`].
+///
+/// # Panics
+///
+/// Panics if a state mutex is poisoned.
+pub(crate) async fn steer_turn(
+    sub: &Arc<Subagent>,
+    prompt: String,
+) -> Result<(u64, u64, PromptFut)> {
+    let (steer_id, turn_n) = {
+        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+        let steer_id = sub.rt.next_steer.fetch_add(1, Ordering::Relaxed);
+        inner.steer_pending.push_back(steer_id);
+        (steer_id, inner.current.as_ref().map_or(0, |turn| turn.n))
+    };
+    let record = serde_json::json!({"ts": now(), "turn": turn_n, "steer": prompt});
+    if let Err(error) = sub.rt.transcript.lock().await.append(&record).await {
+        warn!(%error, "transcript write failed");
+    }
+    let fut = enqueue_prompt(&sub.client, &sub.session_id, prompt).await;
+    Ok((steer_id, turn_n, fut))
+}
+
+/// The `steer_end` transcript record for a resolved steer call.
+pub(crate) fn steer_end_record(
+    turn_n: u64,
+    outcome: &std::result::Result<PromptResult, ClientError>,
+) -> serde_json::Value {
+    match outcome {
+        Ok(result) => serde_json::json!({
+            "ts": now(),
+            "turn": turn_n,
+            "steer_end": serde_json::to_value(result.stop_reason).unwrap_or_default(),
+        }),
+        Err(error) => serde_json::json!({
+            "ts": now(),
+            "turn": turn_n,
+            "steer_end": "error",
+            "error": error.to_string(),
+        }),
+    }
+}
+
+/// Reconcile a steered prompt's resolution with the state machine.
+///
+/// Three fates: the agent folded it into the turn it was sent into — the
+/// tracked turn's own `turn_task` owns that end, so only the `steer_end`
+/// record is written; the agent ran it as a turn of its own — untracked
+/// `session/update` traffic materialized a `current` owned by this steer,
+/// so its resolution IS that turn's end and [`finish_turn`] settles it;
+/// or it errored — a rejection transfers ownership of a materialized turn
+/// to the next pending steer, since the traffic cannot be the rejected
+/// one's. When the last in-flight steer resolves without owning a turn and
+/// the queue was held for it, the first queued prompt chains here.
+///
+/// Returns the outcome back to the caller (a synchronous `send(steer)` path
+/// reports rejections from it).
+pub(crate) async fn steer_resolved(
+    state: Arc<AppState>,
+    sub: &Arc<Subagent>,
+    steer_id: u64,
+    target_turn: u64,
+    outcome: std::result::Result<PromptResult, ClientError>,
+) -> std::result::Result<PromptResult, ClientError> {
+    let (mine, kick, turn_n) = {
+        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+        inner.steer_pending.retain(|&id| id != steer_id);
+        let mine = if inner.steer_owner == Some(steer_id) {
+            inner.steer_owner = None;
+            if outcome.is_err()
+                && let Some(&owner) = inner.steer_pending.front()
+            {
+                inner.steer_owner = Some(owner);
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        let kick = !mine
+            && inner.steer_pending.is_empty()
+            && inner.current.is_none()
+            && matches!(inner.status, Status::Done(_))
+            && !inner.queue.is_empty();
+        let prompt = if kick {
+            inner.status = Status::Running;
+            inner.queue.pop_front()
+        } else {
+            None
+        };
+        let turn_n = inner.current.as_ref().map_or(target_turn, |turn| turn.n);
+        drop(inner);
+        (mine, prompt, turn_n)
+    };
+    if mine {
+        let returned = outcome.clone();
+        finish_turn(
+            state,
+            sub.rt.clone(),
+            sub.session_id.clone(),
+            turn_n,
+            outcome,
+        )
+        .await;
+        let record = steer_end_record(turn_n, &returned);
+        if let Err(error) = sub.rt.transcript.lock().await.append(&record).await {
+            warn!(%error, "transcript write failed");
+        }
+        returned
+    } else {
+        if let Some(prompt) = kick {
+            let wire = sub.rt.prompt_send.clone().lock_owned().await;
+            spawn_chained(state, sub.session_id.clone(), prompt, wire);
+        }
+        let record = steer_end_record(turn_n, &outcome);
+        if let Err(error) = sub.rt.transcript.lock().await.append(&record).await {
+            warn!(%error, "transcript write failed");
+        }
+        outcome
+    }
+}
+
+/// Await a steered prompt's resolution, then [`steer_resolved`] it.
+pub(crate) async fn steer_waiter(
+    state: Arc<AppState>,
+    sub: Arc<Subagent>,
+    steer_id: u64,
+    target_turn: u64,
+    prompt: PromptFut,
+) {
+    let outcome = prompt.await;
+    let _ = steer_resolved(state, &sub, steer_id, target_turn, outcome).await;
 }
 
 /// The in-flight `session/prompt` call, already enqueued by `start_turn`.
-type PromptFut =
+pub(crate) type PromptFut =
     Pin<Box<dyn Future<Output = std::result::Result<PromptResult, ClientError>> + Send>>;
 
-/// Await `session/prompt`, record the turn's end in the transcript, state,
-/// and registry, then wake waiters.
+/// Push the finished turn into `turns` and pick the follow-up state: a
+/// `cancelled` turn drops the queue, a queued prompt becomes the next turn
+/// (the status stays `running` — no `done` interlude), anything else settles
+/// `done`. A steered prompt still in flight may materialize as a turn ahead
+/// of the queue on the wire, so the queue pops only once they all resolve.
+/// Returns the prompt to chain and the prompts the queue dropped.
+fn settle_turn(rt: &SubRuntime, reason: StopReason) -> (Option<String>, VecDeque<String>) {
+    let mut inner = rt.inner.lock().expect("inner poisoned");
+    if let Some(mut turn) = inner.current.take() {
+        turn.stop_reason = Some(reason);
+        inner.turns.push(turn);
+    }
+    let outcome = if reason == StopReason::Cancelled {
+        inner.status = Status::Cancelled;
+        (None, std::mem::take(&mut inner.queue))
+    } else if inner.steer_pending.is_empty()
+        && let Some(next) = inner.queue.pop_front()
+    {
+        (Some(next), VecDeque::new())
+    } else {
+        inner.status = Status::Done(reason);
+        (None, VecDeque::new())
+    };
+    drop(inner);
+    outcome
+}
+
+/// Push the finished turn into `turns`, mark the subagent `failed`, and
+/// return the dropped queue.
+fn fail_turn(rt: &SubRuntime, reason: String) -> VecDeque<String> {
+    let mut inner = rt.inner.lock().expect("inner poisoned");
+    if let Some(turn) = inner.current.take() {
+        inner.turns.push(turn);
+    }
+    inner.status = Status::Failed(reason);
+    std::mem::take(&mut inner.queue)
+}
+
+/// Append a `queue_dropped` transcript record, when any prompts dropped.
+pub(crate) async fn record_queue_dropped(
+    rt: &SubRuntime,
+    turn_n: Option<u64>,
+    prompts: VecDeque<String>,
+) {
+    if prompts.is_empty() {
+        return;
+    }
+    let mut record = serde_json::json!({"ts": now(), "queue_dropped": prompts});
+    if let Some(turn_n) = turn_n {
+        record["turn"] = serde_json::json!(turn_n);
+    }
+    if let Err(error) = rt.transcript.lock().await.append(&record).await {
+        warn!(%error, "transcript write failed");
+    }
+}
+
+/// Await `session/prompt`, then [`finish_turn`].
 async fn turn_task(
     state: Arc<AppState>,
     prompt: PromptFut,
@@ -792,6 +1110,47 @@ async fn turn_task(
     session_id: String,
 ) {
     let outcome = prompt.await;
+    finish_turn(state, rt, session_id, turn_n, outcome).await;
+}
+
+/// Spawn the queued-turn handoff: the wire guard moves into the task so the
+/// queued prompt reaches the wire ahead of any `send` that lands between
+/// the turns.
+fn spawn_chained(
+    state: Arc<AppState>,
+    session_id: String,
+    prompt: String,
+    wire: tokio::sync::OwnedMutexGuard<()>,
+) {
+    tokio::spawn(async move {
+        let _wire = wire;
+        match state.get(&session_id) {
+            Ok(sub) => match begin_turn(&sub, prompt, Gate::Chained, true).await {
+                Ok((n, fut)) => spawn_turn_task(state, &sub, fut, n),
+                Err(error) => warn!(%error, "queued turn failed to start"),
+            },
+            Err(error) => warn!(%error, "queued prompt dropped: subagent gone"),
+        }
+    });
+}
+
+/// The shared settlement tail of `turn_task` and a steer-owned turn's
+/// [`steer_resolved`]: record the turn's end in the transcript, settle or
+/// fail state, update the registry, and wake waiters.
+///
+/// While this task holds `rt.prompt_send` the between-turns transition is
+/// atomic: a `send`/`steer` sees either the still-`running` pre-transition
+/// state or the settled post-transition one, never the gap. A queued prompt
+/// popped here becomes the next turn without a `done` interlude; a
+/// `cancelled` or failed turn drops the queue instead.
+async fn finish_turn(
+    state: Arc<AppState>,
+    rt: Arc<SubRuntime>,
+    session_id: String,
+    turn_n: u64,
+    outcome: std::result::Result<PromptResult, ClientError>,
+) {
+    let wire = rt.prompt_send.clone().lock_owned().await;
     match outcome {
         Ok(result) => {
             let reason = result.stop_reason;
@@ -803,16 +1162,13 @@ async fn turn_task(
             if let Err(error) = rt.transcript.lock().await.append(&record).await {
                 warn!(%error, "transcript write failed");
             }
-            let mut inner = rt.inner.lock().expect("inner poisoned");
-            if let Some(mut turn) = inner.current.take() {
-                turn.stop_reason = Some(reason);
-                inner.turns.push(turn);
-            }
-            inner.status = if reason == StopReason::Cancelled {
-                Status::Cancelled
+            let (next, dropped) = settle_turn(&rt, reason);
+            if let Some(prompt) = next {
+                spawn_chained(state.clone(), session_id.clone(), prompt, wire);
             } else {
-                Status::Done(reason)
-            };
+                drop(wire);
+            }
+            record_queue_dropped(&rt, Some(turn_n), dropped).await;
         }
         Err(error) => {
             let mut reason = error.to_string();
@@ -831,11 +1187,8 @@ async fn turn_task(
             if let Err(error) = rt.transcript.lock().await.append(&record).await {
                 warn!(%error, "transcript write failed");
             }
-            let mut inner = rt.inner.lock().expect("inner poisoned");
-            if let Some(turn) = inner.current.take() {
-                inner.turns.push(turn);
-            }
-            inner.status = Status::Failed(reason);
+            record_queue_dropped(&rt, Some(turn_n), fail_turn(&rt, reason)).await;
+            drop(wire);
         }
     }
     // Update the registry: turn count and last_turn.
