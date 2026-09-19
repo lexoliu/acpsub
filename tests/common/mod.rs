@@ -40,8 +40,11 @@ pub fn fake_agent_config() -> AgentConfig {
 }
 
 /// Build an app state rooted at `dir`, with a `fake` agent (loadSession,
-/// accepts `set_mode`/`set_config_option`), a `noload` agent (same script with
-/// `FAKE_NO_LOAD=1`), and a `wideopen` agent allowed outside its cwd.
+/// accepts `set_mode`/`set_config_option`), a `noload` agent (same script
+/// with `FAKE_NO_LOAD=1`), a `nosteer` agent (`FAKE_NO_STEER=1`, rejects a
+/// concurrent prompt), a `queueagent` (`FAKE_QUEUE_PROMPTS=1`, parks a
+/// concurrent prompt and runs it as its own turn), and a `wideopen` agent
+/// allowed outside its cwd.
 pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
     let mut agents = BTreeMap::new();
     let fake = fake_agent_config();
@@ -50,6 +53,20 @@ pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
         "noload".to_string(),
         AgentConfig {
             env: BTreeMap::from([("FAKE_NO_LOAD".to_string(), "1".to_string())]),
+            ..fake.clone()
+        },
+    );
+    agents.insert(
+        "nosteer".to_string(),
+        AgentConfig {
+            env: BTreeMap::from([("FAKE_NO_STEER".to_string(), "1".to_string())]),
+            ..fake.clone()
+        },
+    );
+    agents.insert(
+        "queueagent".to_string(),
+        AgentConfig {
+            env: BTreeMap::from([("FAKE_QUEUE_PROMPTS".to_string(), "1".to_string())]),
             ..fake.clone()
         },
     );

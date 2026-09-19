@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(tools)* [**breaking**] `send` takes a required `policy` — `try` (the
+  original behaviour), `queued` (park the prompt, fire it as the next turn),
+  or `steer` (inject into the running turn) ([#34](https://github.com/lexoliu/acpsub/issues/34))
+- *(tools)* `wait` and `status` report the current turn number and the
+  queued prompt list ([#34](https://github.com/lexoliu/acpsub/issues/34))
+
 ## [0.2.0](https://github.com/lexoliu/acpsub/compare/v0.1.0...v0.2.0) - 2026-09-16
 
 ### Added

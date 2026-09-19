@@ -73,10 +73,10 @@ with no `[agents.*]` entries serves no agents.
 |---|---|---|
 | `spawn` | `cwd, prompt, agent?, mode?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{session_id, agent, state}` at once — the session id is the handle for every other call. |
 | `adopt` | `session_id, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, or an external one such as a Devin session created elsewhere. Returns `{session_id, agent, state}`; with `prompt` the first turn starts immediately. |
-| `send` | `session_id, prompt` | Next turn on the same session. Errors unless the subagent is `idle`, `done`, or `cancelled`. |
-| `wait` | `session_id, timeout_secs` (default 600, min 60, max 3600; prefer 300–1800) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, stop_reason?, reply, tool_calls, elapsed_secs, pending_permission?}`. |
+| `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not surface an error), returning `{state: "steered", turn}`. On a promptable subagent all three just start the turn: `{state: "running"}`. |
+| `wait` | `session_id, timeout_secs` (default 600, min 60, max 3600; prefer 300–1800) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?}`. |
 | `wait_any` | `session_ids, timeout_secs` | First of them to leave `running`. |
-| `status` | `session_id` | State, cwd, agent, turns, transcript path — instant check. |
+| `status` | `session_id` | State, cwd, agent, turns, queued prompts, transcript path — instant check. |
 | `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
 | `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
 | `permit` | `session_id, request_id, option_id` | Answer a queued `ask`-policy permission request. |
@@ -116,6 +116,15 @@ TTL. Timeouts under 60s are rejected — use `status` for an instant check.
 - **Permissions**: `permission = allow|deny` answers requests by option kind;
   `ask` queues the request and flips the state to `needs_permission` until
   `permit` answers it.
+- **Prompt queue**: `send` with `policy: "queued"` parks prompts FIFO while a
+  turn runs; each fires as the next turn when the current one ends (the state
+  stays `running` through the handoff). A `cancelled` or `failed` turn — and
+  `cancel`/`close`/`forget` — drops the queue. `policy: "steer"` instead
+  sends a second `session/prompt` mid-turn; agents that support mid-turn
+  injection (e.g. `devin acp`) steer the active task with it. On an agent
+  that serializes concurrent prompts rather than injecting them, a steer
+  that lands behind the turn's end becomes a turn of its own — acpsub tracks
+  it from the `session/update` traffic and holds the queue until it ends.
 - **cwd boundary**: `fs/*` and `terminal/*` requests are refused outside the
   subagent's `cwd` unless the agent has `allow_outside_cwd = true`.
 

@@ -17,9 +17,22 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 - "KILL <cmd>" -> terminal/create, terminal/kill, then wait_for_exit and
   output; the kill's signal exit is recorded into the reply.
 - "wait" -> the prompt never completes until session/cancel.
+- "gather" -> the prompt completes once a steered prompt arrives; the
+  steered text is recorded into the reply.
 - "die" -> the process exits mid-turn with status 3.
 
-session/cancel answers the pending prompt with stopReason cancelled.
+A session/prompt that arrives while a prompt is pending is a steer: its
+request resolves with the same result as the turn's own prompt, and its
+text joins the turn via "steer:<text>" in the reply. FAKE_NO_STEER=1 makes
+the agent reject a concurrent prompt instead. FAKE_QUEUE_PROMPTS=1 makes
+the agent park a concurrent prompt and run it as its own turn after the
+current one ends (agents that serialize prompts instead of injecting).
+
+- "hold" -> the turn stays open until a queued prompt arrives
+  (FAKE_QUEUE_PROMPTS mode only).
+
+session/cancel answers the pending prompt (and every steer) with
+stopReason cancelled.
 FAKE_NO_LOAD=1 in the environment makes the agent not advertise loadSession.
 Session ids are `sess-<pid>-<n>` so concurrently spawned agents never
 collide.
@@ -51,6 +64,9 @@ def update(session_id, update_payload):
 
 
 pending_prompt = None
+pending_text = ""
+steered = []        # request ids of prompts injected mid-turn
+queued = []         # (request_id, text) parked in FAKE_QUEUE_PROMPTS mode
 session_id = ""
 session_count = 0
 next_req = 0
@@ -69,8 +85,22 @@ def new_request(method, params, kind):
     send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
 
 
-def finish_prompt():
+def answer_all(result):
+    """Resolve the pending prompt and every steer with the same result, then
+    start the next agent-side queued prompt, if any."""
     global pending_prompt
+    for steer_id in steered:
+        respond(steer_id, result)
+    steered.clear()
+    if pending_prompt is not None:
+        respond(pending_prompt, result)
+        pending_prompt = None
+    if pending_prompt is None and queued:
+        request_id, text = queued.pop(0)
+        begin_turn(request_id, text)
+
+
+def finish_prompt():
     if pending_prompt is None or outbound:
         return
     update(
@@ -85,17 +115,14 @@ def finish_prompt():
             "content": {"type": "text", "text": text},
         },
     )
-    respond(pending_prompt, {"stopReason": "end_turn"})
-    pending_prompt = None
+    answer_all({"stopReason": "end_turn"})
 
 
-def on_prompt(request_id, params):
-    global pending_prompt, session_id, collected
-    session_id = params.get("sessionId", session_id)
-    text = (params.get("prompt") or [{}])[0].get("text", "")
-    if text == "die":
-        sys.exit(3)
+def begin_turn(request_id, text):
+    """Open a turn for request_id and stream the standard updates."""
+    global pending_prompt, pending_text, collected
     pending_prompt = request_id
+    pending_text = text
     collected = []
     update(
         session_id,
@@ -137,7 +164,7 @@ def on_prompt(request_id, params):
         session_id,
         {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "in_progress"},
     )
-    if text == "wait":
+    if text in ("wait", "gather", "hold"):
         return
     if "PERMISSION" in text:
         new_request(
@@ -216,6 +243,45 @@ def on_prompt(request_id, params):
         },
     )
     finish_prompt()
+
+
+def on_prompt(request_id, params):
+    global session_id
+    session_id = params.get("sessionId", session_id)
+    text = (params.get("prompt") or [{}])[0].get("text", "")
+    if text == "die":
+        sys.exit(3)
+    if pending_prompt is not None:
+        # A prompt arriving while a turn runs is a steer injection — unless
+        # FAKE_NO_STEER=1 rejects it, or FAKE_QUEUE_PROMPTS=1 parks it
+        # agent-side to run as its own turn after this one ends.
+        if os.environ.get("FAKE_NO_STEER") == "1":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32600, "message": "prompt in flight"},
+                }
+            )
+            return
+        if os.environ.get("FAKE_QUEUE_PROMPTS") == "1":
+            queued.append((request_id, text))
+            if pending_text == "hold":
+                finish_prompt()
+            return
+        steered.append(request_id)
+        collected.append("steer:" + text)
+        update(
+            session_id,
+            {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": text},
+            },
+        )
+        if pending_text == "gather":
+            finish_prompt()
+        return
+    begin_turn(request_id, text)
 
 
 def on_response(msg):
@@ -393,8 +459,7 @@ for line in sys.stdin:
             )
     elif "method" in msg:
         if msg["method"] == "session/cancel" and pending_prompt is not None:
-            respond(pending_prompt, {"stopReason": "cancelled"})
-            pending_prompt = None
+            answer_all({"stopReason": "cancelled"})
             outbound.clear()
     elif "id" in msg:
         on_response(msg)

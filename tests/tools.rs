@@ -49,7 +49,7 @@ async fn send_followup_turn() {
     call_json(
         &tools,
         "send",
-        json!({"session_id": sid.as_str(), "prompt": "again"}),
+        json!({"session_id": sid.as_str(), "prompt": "again", "policy": "try"}),
     )
     .await;
     let done = wait(&tools, &sid, 60).await;
@@ -74,6 +74,316 @@ async fn send_followup_turn() {
     )
     .await;
     assert!(missing.contains("no turn 9"), "{missing}");
+}
+
+/// `policy` is a required argument: nothing is queued or injected unless
+/// the caller says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_requires_explicit_policy() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
+
+    let err = call_err(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "again"}),
+    )
+    .await;
+    assert!(err.contains("policy"), "{err}");
+}
+
+/// `policy: "try"` on a running subagent is the original rejection.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_try_rejects_running() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+
+    let err = call_err(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "hi", "policy": "try"}),
+    )
+    .await;
+    assert!(err.contains("running"), "{err}");
+    assert!(err.contains("cannot accept a prompt"), "{err}");
+    call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
+}
+
+/// `policy: "queued"` parks the prompt; it fires as the next turn when the
+/// running one ends — here ended by a steer into the `gather` prompt.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_queued_fires_after_turn() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
+
+    let queued = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "second", "policy": "queued"}),
+    )
+    .await;
+    assert_eq!(queued["state"], "queued", "{queued}");
+    assert_eq!(queued["position"], 1);
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["queued"], json!(["second"]), "{status}");
+
+    let steered = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "kick", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["turn"], 1);
+
+    // The queued prompt runs as turn 2 with no done interlude; `wait`
+    // returns when it ends.
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["turns"], 2);
+    assert_eq!(status["queued"], json!([]));
+
+    let first = call_json(
+        &tools,
+        "result",
+        json!({"session_id": sid.as_str(), "turn": 1}),
+    )
+    .await;
+    assert!(
+        first["reply"].as_str().unwrap().contains("steer:kick"),
+        "{first}"
+    );
+
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
+    assert!(text.contains("=== [turn 1] STEER\nkick"), "{text}");
+    assert!(text.contains("=== [turn 1] STEER END end_turn"), "{text}");
+    assert!(
+        text.contains("=== [turn 2] USER (queued)\nsecond"),
+        "{text}"
+    );
+}
+
+/// Queued prompts drop when the running turn is cancelled.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_queued_dropped_on_cancel() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+
+    for (prompt, position) in [("next", 1), ("third", 2)] {
+        let queued = call_json(
+            &tools,
+            "send",
+            json!({"session_id": sid.as_str(), "prompt": prompt, "policy": "queued"}),
+        )
+        .await;
+        assert_eq!(queued["state"], "queued");
+        assert_eq!(queued["position"], position);
+    }
+
+    call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "cancelled", "{done}");
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["queued"], json!([]), "{status}");
+    assert_eq!(status["turns"], 1);
+
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
+    assert!(text.contains("QUEUE DROPPED"), "{text}");
+    assert!(text.contains("next"), "{text}");
+    assert!(text.contains("third"), "{text}");
+
+    // A cancelled subagent accepts a fresh prompt.
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "hi", "policy": "try"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "running");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done");
+}
+
+/// Queued prompts drop when the turn fails; the steer that kills the agent
+/// surfaces its error to the `send` caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_queued_dropped_on_failure() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
+
+    let queued = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "next", "policy": "queued"}),
+    )
+    .await;
+    assert_eq!(queued["state"], "queued");
+
+    // "die" exits the agent process; both the turn and the steer error out.
+    let err = call_err(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "die", "policy": "steer"}),
+    )
+    .await;
+    assert_ne!(err, "");
+
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "failed", "{done}");
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["state"], "failed", "{status}");
+    assert_eq!(status["queued"], json!([]), "{status}");
+}
+
+/// A `steer` on a promptable subagent just starts the turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_steer_on_idle_starts_turn() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
+
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "again", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done");
+}
+
+/// An agent that rejects a concurrent prompt surfaces the rejection.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_steer_rejection_errors() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let mut args = spawn_args(dir.path(), "wait");
+    args["agent"] = json!("nosteer");
+    let sid = spawn_id(&tools, args).await;
+
+    let err = call_err(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "hi", "policy": "steer"}),
+    )
+    .await;
+    assert!(err.contains("prompt in flight"), "{err}");
+    call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
+}
+
+/// On an agent that serializes a concurrent prompt instead of injecting it,
+/// a steer that lands behind the running turn becomes a turn of its own:
+/// acpsub materializes it from the untracked `session/update` traffic and
+/// settles it when the steer's `session/prompt` resolves. The client-side
+/// queue holds until the steer-turn ends — it was sent after the steer on
+/// the wire — then chains without a `done` interlude.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_steer_becomes_turn_on_serializing_agent() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let mut args = spawn_args(dir.path(), "hold");
+    args["agent"] = json!("queueagent");
+    let sid = spawn_id(&tools, args).await;
+
+    // Turn 1 holds; park the queued prompt client-side while it runs.
+    let queued = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "RUN echo queue-fired", "policy": "queued"}),
+    )
+    .await;
+    assert_eq!(queued["state"], "queued", "{queued}");
+
+    // The steer parks agent-side, releasing turn 1; it then runs as turn 2.
+    let steered = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "PERMISSION", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["turn"], 1, "{steered}");
+
+    // `wait` may observe the `done` gap between turn 1 settling and the
+    // steer-turn materializing; poll until all three turns are recorded.
+    let mut status = json!({});
+    for _ in 0..200 {
+        status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+        if status["state"] == "done" && status["turns"] == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(status["state"], "done", "{status}");
+    assert_eq!(status["turns"], 3, "{status}");
+    assert_eq!(status["queued"], json!([]), "{status}");
+
+    let second = call_json(
+        &tools,
+        "result",
+        json!({"session_id": sid.as_str(), "turn": 2}),
+    )
+    .await;
+    assert!(
+        second["reply"].as_str().unwrap().contains("perm:allow-1"),
+        "{second}"
+    );
+    let third = call_json(
+        &tools,
+        "result",
+        json!({"session_id": sid.as_str(), "turn": 3}),
+    )
+    .await;
+    assert!(
+        third["reply"]
+            .as_str()
+            .unwrap()
+            .contains("term:queue-fired"),
+        "{third}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -380,7 +690,7 @@ async fn adopt_without_prompt_idles_until_send() {
     call_json(
         &tools,
         "send",
-        json!({"session_id": sid.as_str(), "prompt": "again"}),
+        json!({"session_id": sid.as_str(), "prompt": "again", "policy": "try"}),
     )
     .await;
     let done = wait(&tools, &sid, 60).await;
@@ -801,7 +1111,7 @@ async fn close_keeps_session_registered() {
     let err = call_err(
         &tools,
         "send",
-        json!({"session_id": sid.as_str(), "prompt": "again"}),
+        json!({"session_id": sid.as_str(), "prompt": "again", "policy": "try"}),
     )
     .await;
     assert!(err.contains("unknown session"), "{err}");
@@ -860,29 +1170,6 @@ async fn fs_write_inside_and_outside_cwd() {
         std::fs::read_to_string(&outside_file).unwrap(),
         "written-by-fake-agent"
     );
-}
-
-/// `send` only accepts `idle`/`done`/`cancelled` subagents; a `running` one
-/// rejects the prompt.
-#[tokio::test(flavor = "multi_thread")]
-async fn send_to_running_subagent_rejected() {
-    if !python3() {
-        eprintln!("skipping: python3 not found");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
-    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
-
-    let err = call_err(
-        &tools,
-        "send",
-        json!({"session_id": sid.as_str(), "prompt": "more work"}),
-    )
-    .await;
-    assert!(err.contains("cannot accept a prompt"), "{err}");
-
-    call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
 }
 
 /// An agent whose command does not exist fails `spawn` cleanly.

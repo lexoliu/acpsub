@@ -17,9 +17,12 @@ const CLIP: usize = 400;
 
 /// Append-only JSONL transcript writer.
 ///
-/// Each line is one record: `{"ts", "turn", "prompt"}` for prompts,
-/// `{"ts", "turn", "update"}` for `session/update` notifications, and
-/// `{"ts", "turn", "stop_reason"}` for turn ends.
+/// Each line is one record: `{"ts", "turn", "prompt"}` for prompts (with
+/// `"queued": true` when the prompt fired off the send queue), `{"ts",
+/// "turn", "steer"}`/`{"steer_end"}` for steered prompts, `{"queue_dropped"}`
+/// for prompts the queue dropped, `{"ts", "turn", "update"}` for
+/// `session/update` notifications, and `{"ts", "turn", "stop_reason"}` for
+/// turn ends.
 ///
 /// The writer starts unbound — the file is named after the session id,
 /// which only exists after `session/new`/`session/load` answers. Records
@@ -194,7 +197,8 @@ fn chunk_text(update: &SessionUpdate) -> Option<String> {
     }
 }
 
-/// Render one non-chunk record: a prompt, a turn end, or a session update.
+/// Render one non-chunk record: a prompt, a steer, a queue event, a turn
+/// end, or a session update.
 fn render_record(
     record: &Value,
     update: Option<&SessionUpdate>,
@@ -203,6 +207,35 @@ fn render_record(
 ) {
     if let Some(prompt) = record.get("prompt").and_then(Value::as_str) {
         render_user(record, prompt, out, options.full);
+        return;
+    }
+    if let Some(steer) = record.get("steer").and_then(Value::as_str) {
+        let turn = turn_n(record);
+        let _ = writeln!(
+            out,
+            "=== [turn {turn}] STEER\n{}",
+            clip(steer, options.full)
+        );
+        return;
+    }
+    if let Some(reason) = record.get("steer_end").and_then(Value::as_str) {
+        let turn = turn_n(record);
+        let _ = writeln!(out, "=== [turn {turn}] STEER END {reason}");
+        if let Some(error) = record.get("error").and_then(Value::as_str) {
+            let _ = writeln!(out, "    error: {}", clip(error, options.full));
+        }
+        return;
+    }
+    if let Some(dropped) = record.get("queue_dropped").and_then(Value::as_array) {
+        let turn = turn_n(record);
+        let _ = writeln!(out, "--- [turn {turn}] QUEUE DROPPED");
+        for prompt in dropped {
+            let _ = writeln!(
+                out,
+                "    {}",
+                clip(prompt.as_str().unwrap_or_default(), options.full)
+            );
+        }
         return;
     }
     if record.get("stop_reason").is_some() {
@@ -223,15 +256,30 @@ fn render_record(
     }
 }
 
-/// `=== [turn n] USER` + the prompt text.
+/// The record's `turn` field, or 0.
+fn turn_n(record: &Value) -> u64 {
+    record.get("turn").and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// `=== [turn n] USER` + the prompt text; `(queued)` marks a queue-fired
+/// prompt.
 fn render_user(record: &Value, prompt: &str, out: &mut String, full: bool) {
-    let turn = record.get("turn").and_then(Value::as_u64).unwrap_or(0);
-    let _ = writeln!(out, "=== [turn {turn}] USER\n{}", clip(prompt, full));
+    let turn = turn_n(record);
+    let queued = if record.get("queued").and_then(Value::as_bool) == Some(true) {
+        " (queued)"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        out,
+        "=== [turn {turn}] USER{queued}\n{}",
+        clip(prompt, full)
+    );
 }
 
 /// `=== [turn n] END <reason>` + an optional error line.
 fn render_turn_end(record: &Value, out: &mut String, full: bool) {
-    let turn = record.get("turn").and_then(Value::as_u64).unwrap_or(0);
+    let turn = turn_n(record);
     let reason = record
         .get("stop_reason")
         .and_then(Value::as_str)
