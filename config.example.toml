@@ -13,11 +13,12 @@ registry = "~/.local/share/acpsub/registry.json"
                                        #  implicit default; omitting `agent`
                                        #  with several configured errors)
 
+# [agents.<name>] only describes how to launch the agent. Session options
+# are per-call `spawn`/`adopt` arguments: `model` and `mode` are required,
+# other `session/set_config_option` values can be passed via `config`.
 [agents.devin]
 command = "devin"
 args = ["acp"]
-mode = "bypass"                          # session/set_mode after session/new
-config = { model = "swe-2-max" }         # session/set_config_option id -> value
 allow_outside_cwd = false                # refuse fs/* paths outside cwd
 # env = { API_KEY = "..." }              # extra environment for the process
 # permission = "ask"                     # per-agent override of the default
@@ -28,4 +29,3 @@ allow_outside_cwd = false                # refuse fs/* paths outside cwd
 [agents.claude]
 command = "npx"
 args = ["-y", "@zed-industries/claude-code-acp"]
-mode = "bypassPermissions"

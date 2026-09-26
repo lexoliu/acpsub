@@ -1,11 +1,12 @@
 //! Shared helpers for the integration tests.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use acpsub::config::{AgentConfig, ConfigValue};
-use acpsub::{AppState, Config, Defaults, PermissionPolicy};
+use acpsub::config::AgentConfig;
+use acpsub::{AppState, Config};
 use aither_core::llm::tool::{ToolResult, Tools};
 use serde_json::{Value, json};
 
@@ -24,19 +25,72 @@ pub fn python3() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// The `fake` agent config: `python3 tests/fake_agent.py` in `bypass` mode
-/// with `model` set to `b`.
+/// The `fake` agent config: `python3 tests/fake_agent.py` (loadSession,
+/// accepts `set_mode`/`set_config_option`).
 pub fn fake_agent_config() -> AgentConfig {
     AgentConfig {
         command: "python3".to_string(),
         args: vec![fake_agent_script().to_string_lossy().into_owned()],
         env: BTreeMap::new(),
-        mode: Some("bypass".to_string()),
-        config: BTreeMap::from([("model".to_string(), ConfigValue::Select("b".to_string()))]),
         allow_outside_cwd: false,
         permission: None,
         sessions_db: None,
     }
+}
+
+/// Write `dir/config.toml` for `agents` under `[defaults]` pointing at
+/// `dir`, and return the config file's path.
+pub fn write_config(
+    dir: &Path,
+    default_agent: Option<&str>,
+    agents: &BTreeMap<String, AgentConfig>,
+) -> PathBuf {
+    let mut text = format!(
+        "[defaults]\npermission = \"allow\"\ntranscript_dir = \"{}\"\nregistry = \"{}\"\n",
+        dir.join("transcripts").display(),
+        dir.join("registry.json").display(),
+    );
+    if let Some(agent) = default_agent {
+        let _ = writeln!(text, "agent = \"{agent}\"");
+    }
+    for (name, agent) in agents {
+        let _ = write!(text, "\n[agents.{name}]\ncommand = {:?}", agent.command);
+        if !agent.args.is_empty() {
+            let args = agent
+                .args
+                .iter()
+                .map(|arg| format!("{arg:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(text, "\nargs = [{args}]");
+        }
+        if !agent.env.is_empty() {
+            let env = agent
+                .env
+                .iter()
+                .map(|(key, value)| format!("{key} = {value:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(text, "\nenv = {{ {env} }}");
+        }
+        if agent.allow_outside_cwd {
+            text.push_str("\nallow_outside_cwd = true");
+        }
+        if let Some(permission) = agent.permission {
+            let name = serde_json::to_value(permission)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let _ = write!(text, "\npermission = \"{name}\"");
+        }
+        if let Some(db) = &agent.sessions_db {
+            let _ = write!(text, "\nsessions_db = {:?}", db.display().to_string());
+        }
+        text.push('\n');
+    }
+    let path = dir.join("config.toml");
+    std::fs::write(&path, text).expect("write config");
+    path
 }
 
 /// Build an app state rooted at `dir`, with a `fake` agent (loadSession,
@@ -77,13 +131,13 @@ pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
             ..fake
         },
     );
-    test_state_with_agents(dir, agents)
+    test_state_with_agents(dir, &agents)
 }
 
 /// Build an app state rooted at `dir` over an explicit agent map.
 pub fn test_state_with_agents(
     dir: &Path,
-    agents: BTreeMap<String, AgentConfig>,
+    agents: &BTreeMap<String, AgentConfig>,
 ) -> (Arc<AppState>, Tools) {
     test_state_full(dir, None, agents)
 }
@@ -92,18 +146,11 @@ pub fn test_state_with_agents(
 pub fn test_state_full(
     dir: &Path,
     default_agent: Option<&str>,
-    agents: BTreeMap<String, AgentConfig>,
+    agents: &BTreeMap<String, AgentConfig>,
 ) -> (Arc<AppState>, Tools) {
-    let config = Config {
-        defaults: Defaults {
-            agent: default_agent.map(str::to_string),
-            permission: PermissionPolicy::Allow,
-            transcript_dir: dir.join("transcripts"),
-            registry: dir.join("registry.json"),
-        },
-        agents,
-    };
-    let state = AppState::new(config).expect("app state");
+    let path = write_config(dir, default_agent, agents);
+    let config = Config::load(&path).expect("config loads");
+    let state = AppState::new(config, path).expect("app state");
     let tools = acpsub::build_tools(state.clone()).expect("tools");
     (state, tools)
 }
@@ -156,6 +203,8 @@ pub fn spawn_args(cwd: &Path, prompt: &str) -> Value {
         "agent": "fake",
         "cwd": cwd,
         "prompt": prompt,
+        "model": "b",
+        "mode": "bypass",
     })
 }
 
