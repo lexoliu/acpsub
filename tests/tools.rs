@@ -5,6 +5,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
+use acpsub::Status;
 use acpsub::config::AgentConfig;
 use common::*;
 use serde_json::json;
@@ -328,7 +329,7 @@ async fn send_steer_becomes_turn_on_serializing_agent() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     let mut args = spawn_args(dir.path(), "hold");
     args["agent"] = json!("queueagent");
     let sid = spawn_id(&tools, args).await;
@@ -352,16 +353,30 @@ async fn send_steer_becomes_turn_on_serializing_agent() {
     assert_eq!(steered["state"], "steered", "{steered}");
     assert_eq!(steered["turn"], 1, "{steered}");
 
-    // `wait` may observe the `done` gap between turn 1 settling and the
-    // steer-turn materializing; poll until all three turns are recorded.
-    let mut status = json!({});
-    for _ in 0..200 {
-        status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
-        if status["state"] == "done" && status["turns"] == 3 {
-            break;
+    // Wait on the real signal, not a poll deadline: `rt.notify` fires when
+    // turn 1 settles, when the steered prompt materializes as its own turn,
+    // and when each turn ends — so block on it until all three turns are
+    // recorded. The timeout only turns a hang into a failure.
+    let sub = state.get(&sid).expect("live subagent");
+    let three_turns = async {
+        loop {
+            let notified = sub.rt.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = sub.rt.inner.lock().expect("inner poisoned");
+                if inner.turns.len() == 3 && matches!(inner.status, Status::Done(_)) {
+                    return;
+                }
+            }
+            notified.await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), three_turns)
+        .await
+        .expect("subagent did not record three turns");
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(status["state"], "done", "{status}");
     assert_eq!(status["turns"], 3, "{status}");
     assert_eq!(status["queued"], json!([]), "{status}");
