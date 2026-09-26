@@ -22,6 +22,9 @@ async fn spawn_wait_reply() {
     let sid = spawned["session_id"].as_str().expect("session_id");
     assert!(sid.starts_with("sess-"), "{sid}");
     assert!(spawned.get("name").is_none(), "no name handle: {spawned}");
+    // The result reports the model and mode the agent accepted.
+    assert_eq!(spawned["model"], "b", "{spawned}");
+    assert_eq!(spawned["mode"], "bypass", "{spawned}");
 
     let done = wait(&tools, sid, 60).await;
     assert_eq!(done["state"], "done");
@@ -59,6 +62,8 @@ async fn send_followup_turn() {
     assert_eq!(status["turns"], 2);
     assert_eq!(status["state"], "done");
     assert_eq!(status["last_stop_reason"], "end_turn");
+    assert_eq!(status["model"], "b", "{status}");
+    assert_eq!(status["mode"], "bypass", "{status}");
 
     let first = call_json(
         &tools,
@@ -549,7 +554,8 @@ async fn fs_read_inside_and_outside_cwd() {
     // The wideopen agent may leave its cwd.
     let sid = spawn_id(
         &tools,
-        json!({"agent": "wideopen", "cwd": dir.path(), "prompt": "READ /etc/hosts"}),
+        json!({"agent": "wideopen", "cwd": dir.path(), "prompt": "READ /etc/hosts",
+               "model": "b", "mode": "bypass"}),
     )
     .await;
     let done = wait(&tools, &sid, 60).await;
@@ -657,7 +663,7 @@ async fn adopt_registered_session_resumes() {
     let adopted = call_json(
         &tools,
         "adopt",
-        json!({"session_id": sid.as_str(), "prompt": "again"}),
+        json!({"session_id": sid.as_str(), "prompt": "again", "model": "b", "mode": "bypass"}),
     )
     .await;
     assert_eq!(adopted["session_id"], sid);
@@ -684,7 +690,12 @@ async fn adopt_without_prompt_idles_until_send() {
     wait(&tools, &sid, 60).await;
     call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
 
-    let adopted = call_json(&tools, "adopt", json!({"session_id": sid.as_str()})).await;
+    let adopted = call_json(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "model": "b", "mode": "bypass"}),
+    )
+    .await;
     assert_eq!(adopted["state"], "idle", "{adopted}");
 
     call_json(
@@ -714,7 +725,12 @@ async fn adopt_requires_load_capability() {
     wait(&tools, &sid, 60).await;
     call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
 
-    let err = call_err(&tools, "adopt", json!({"session_id": sid.as_str()})).await;
+    let err = call_err(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "model": "b", "mode": "bypass"}),
+    )
+    .await;
     assert!(err.contains("does not support session/load"), "{err}");
 }
 
@@ -731,7 +747,7 @@ async fn adopt_external_session_with_explicit_cwd() {
         &tools,
         "adopt",
         json!({"session_id": "ext-42", "agent": "fake",
-               "cwd": dir.path(), "prompt": "hi"}),
+               "cwd": dir.path(), "prompt": "hi", "model": "b", "mode": "bypass"}),
     )
     .await;
     assert_eq!(adopted["session_id"], "ext-42");
@@ -752,7 +768,7 @@ async fn adopt_without_discoverable_cwd_errors() {
     let err = call_err(
         &tools,
         "adopt",
-        json!({"session_id": "ghost", "agent": "fake"}),
+        json!({"session_id": "ghost", "agent": "fake", "model": "b", "mode": "bypass"}),
     )
     .await;
     assert!(err.contains("cannot determine cwd"), "{err}");
@@ -787,12 +803,12 @@ async fn adopt_discovers_cwd_from_sessions_db() {
         ..fake_agent_config()
     };
     let (_state, tools) =
-        test_state_with_agents(dir.path(), BTreeMap::from([("fake".to_string(), fake)]));
+        test_state_with_agents(dir.path(), &BTreeMap::from([("fake".to_string(), fake)]));
 
     let adopted = call_json(
         &tools,
         "adopt",
-        json!({"session_id": "ext-9", "prompt": "hi"}),
+        json!({"session_id": "ext-9", "prompt": "hi", "model": "b", "mode": "bypass"}),
     )
     .await;
     assert_eq!(adopted["session_id"], "ext-9");
@@ -818,7 +834,12 @@ async fn adopt_rejects_live_and_concurrent() {
     let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
     wait(&tools, &sid, 60).await;
 
-    let err = call_err(&tools, "adopt", json!({"session_id": sid.as_str()})).await;
+    let err = call_err(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "model": "b", "mode": "bypass"}),
+    )
+    .await;
     assert!(err.contains("already live"), "{err}");
 
     call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
@@ -826,15 +847,25 @@ async fn adopt_rejects_live_and_concurrent() {
     let first = {
         let tools = tools.clone();
         let sid = sid.clone();
-        tokio::spawn(
-            async move { call(&tools, "adopt", json!({"session_id": sid.as_str()})).await },
-        )
+        tokio::spawn(async move {
+            call(
+                &tools,
+                "adopt",
+                json!({"session_id": sid.as_str(), "model": "b", "mode": "bypass"}),
+            )
+            .await
+        })
     };
     let second = {
         let tools = tools.clone();
-        tokio::spawn(
-            async move { call(&tools, "adopt", json!({"session_id": sid.as_str()})).await },
-        )
+        tokio::spawn(async move {
+            call(
+                &tools,
+                "adopt",
+                json!({"session_id": sid.as_str(), "model": "b", "mode": "bypass"}),
+            )
+            .await
+        })
     };
     let mut succeeded = 0;
     let mut errors = Vec::new();
@@ -869,7 +900,7 @@ async fn adopt_agent_mismatch_rejected() {
     let err = call_err(
         &tools,
         "adopt",
-        json!({"session_id": sid.as_str(), "agent": "noload"}),
+        json!({"session_id": sid.as_str(), "agent": "noload", "model": "b", "mode": "bypass"}),
     )
     .await;
     assert!(err.contains("registered to agent 'fake'"), "{err}");
@@ -886,7 +917,8 @@ async fn adopt_empty_session_id_rejected() {
     let err = call_err(
         &tools,
         "adopt",
-        json!({"session_id": "", "agent": "fake", "cwd": dir.path()}),
+        json!({"session_id": "", "agent": "fake", "cwd": dir.path(),
+               "model": "b", "mode": "bypass"}),
     )
     .await;
     assert!(err.contains("must not be empty"), "{err}");
@@ -904,14 +936,19 @@ async fn default_agent_resolution() {
 
     // No default, three agents: omitting `agent` errors.
     let (_state, tools) = test_state(dir.path());
-    let err = call_err(&tools, "spawn", json!({"cwd": dir.path(), "prompt": "hi"})).await;
+    let err = call_err(
+        &tools,
+        "spawn",
+        json!({"cwd": dir.path(), "prompt": "hi", "model": "b", "mode": "bypass"}),
+    )
+    .await;
     assert!(err.contains("no agent specified"), "{err}");
 
     // A configured default is used.
     let (_state, tools) = test_state_full(
         dir.path(),
         Some("fake"),
-        BTreeMap::from([
+        &BTreeMap::from([
             ("fake".to_string(), fake_agent_config()),
             (
                 "other".to_string(),
@@ -922,16 +959,24 @@ async fn default_agent_resolution() {
             ),
         ]),
     );
-    let sid = spawn_id(&tools, json!({"cwd": dir.path(), "prompt": "hi"})).await;
+    let sid = spawn_id(
+        &tools,
+        json!({"cwd": dir.path(), "prompt": "hi", "model": "b", "mode": "bypass"}),
+    )
+    .await;
     wait(&tools, &sid, 60).await;
 
     // A single configured agent is the implicit default.
     let dir2 = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state_with_agents(
         dir2.path(),
-        BTreeMap::from([("fake".to_string(), fake_agent_config())]),
+        &BTreeMap::from([("fake".to_string(), fake_agent_config())]),
     );
-    let sid = spawn_id(&tools, json!({"cwd": dir2.path(), "prompt": "hi"})).await;
+    let sid = spawn_id(
+        &tools,
+        json!({"cwd": dir2.path(), "prompt": "hi", "model": "b", "mode": "bypass"}),
+    )
+    .await;
     let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done");
 }
@@ -959,7 +1004,8 @@ async fn list_and_unknown_sessions() {
     let err = call_err(
         &tools,
         "spawn",
-        json!({"agent": "nobody", "cwd": dir.path(), "prompt": "hi"}),
+        json!({"agent": "nobody", "cwd": dir.path(), "prompt": "hi",
+               "model": "b", "mode": "bypass"}),
     )
     .await;
     assert!(err.contains("unknown agent 'nobody'"), "{err}");
@@ -1053,7 +1099,7 @@ async fn agent_death_mid_turn_marks_failed() {
     let adopted = call_json(
         &tools,
         "adopt",
-        json!({"session_id": sid.as_str(), "prompt": "hi"}),
+        json!({"session_id": sid.as_str(), "prompt": "hi", "model": "b", "mode": "bypass"}),
     )
     .await;
     assert_eq!(adopted["session_id"], sid);
@@ -1161,7 +1207,8 @@ async fn fs_write_inside_and_outside_cwd() {
     let sid = spawn_id(
         &tools,
         json!({"agent": "wideopen", "cwd": dir.path(),
-               "prompt": format!("WRITE {}", outside_file.display())}),
+               "prompt": format!("WRITE {}", outside_file.display()),
+               "model": "b", "mode": "bypass"}),
     )
     .await;
     let done = wait(&tools, &sid, 60).await;
@@ -1190,12 +1237,13 @@ async fn spawn_with_missing_command_fails() {
             },
         ),
     ]);
-    let (_state, tools) = test_state_with_agents(dir.path(), agents);
+    let (_state, tools) = test_state_with_agents(dir.path(), &agents);
 
     let err = call_err(
         &tools,
         "spawn",
-        json!({"agent": "missing", "cwd": dir.path(), "prompt": "hi"}),
+        json!({"agent": "missing", "cwd": dir.path(), "prompt": "hi",
+               "model": "b", "mode": "bypass"}),
     )
     .await;
     assert!(err.contains("cannot spawn agent"), "{err}");
@@ -1271,4 +1319,72 @@ async fn permit_with_unknown_request_id() {
     )
     .await;
     assert!(err.contains("no pending permission request"), "{err}");
+}
+
+/// `model` and `mode` are required `spawn`/`adopt` arguments: a missing one
+/// is a tool error naming the field.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_and_adopt_require_model_and_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    for (tool, base) in [
+        ("spawn", json!({"cwd": dir.path(), "prompt": "hi"})),
+        ("adopt", json!({"session_id": "s-1", "cwd": dir.path()})),
+    ] {
+        let mut missing_model = base.clone();
+        missing_model["mode"] = json!("bypass");
+        let err = call_err(&tools, tool, missing_model).await;
+        assert!(err.contains("model"), "{tool}: {err}");
+
+        let mut missing_mode = base.clone();
+        missing_mode["model"] = json!("b");
+        let err = call_err(&tools, tool, missing_mode).await;
+        assert!(err.contains("mode"), "{tool}: {err}");
+    }
+}
+
+/// The config file is re-read per call: an agent removed from it is gone
+/// from `agents` and unspawnable without a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_agent_disappears_without_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let listed = call_json(&tools, "agents", json!({})).await;
+    assert!(
+        listed["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["name"] == "fake"),
+        "{listed}"
+    );
+
+    write_config(
+        dir.path(),
+        None,
+        &BTreeMap::from([("other".to_string(), fake_agent_config())]),
+    );
+    let listed = call_json(&tools, "agents", json!({})).await;
+    let names: Vec<&str> = listed["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["name"].as_str())
+        .collect();
+    assert_eq!(names, ["other"], "{listed}");
+    let err = call_err(&tools, "spawn", spawn_args(dir.path(), "hi")).await;
+    assert!(err.contains("unknown agent 'fake'"), "{err}");
+}
+
+/// A config file that fails to parse is a tool error — never a fallback to
+/// a previously loaded config.
+#[tokio::test(flavor = "multi_thread")]
+async fn broken_config_is_a_tool_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    std::fs::write(dir.path().join("config.toml"), "not toml [[[").unwrap();
+    let err = call_err(&tools, "spawn", spawn_args(dir.path(), "hi")).await;
+    assert!(err.contains("cannot parse config"), "{err}");
+    let err = call_err(&tools, "agents", json!({})).await;
+    assert!(err.contains("cannot parse config"), "{err}");
 }

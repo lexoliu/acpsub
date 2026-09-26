@@ -86,12 +86,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Resolve the config path from `--config` or the default location.
+fn config_path(path: Option<PathBuf>) -> acpsub::Result<PathBuf> {
+    path.or_else(default_config_path)
+        .ok_or_else(|| acpsub::Error::NoHome("~/.config/acpsub/config.toml".to_string()))
+}
+
 /// Load the config from `--config` or the default path.
 fn load_config(path: Option<PathBuf>) -> acpsub::Result<Config> {
-    let path = path
-        .or_else(default_config_path)
-        .ok_or_else(|| acpsub::Error::NoHome("~/.config/acpsub/config.toml".to_string()))?;
-    Config::load(&path)
+    Config::load(&config_path(path)?)
 }
 
 /// `acpsub serve`: MCP over stdio; diagnostics on stderr and `--log-file`.
@@ -118,8 +121,9 @@ async fn serve(
         registry.init();
     }
 
-    let config = load_config(config)?;
-    let state = AppState::new(config)?;
+    let config_path = config_path(config)?;
+    let config = Config::load(&config_path)?;
+    let state = AppState::new(config, config_path)?;
     let tools = build_tools(state)?;
     let mut server = aither_mcp::McpServer::stdio(tools, "acpsub", env!("CARGO_PKG_VERSION"));
     server.run().await.map_err(|error| {
@@ -135,24 +139,6 @@ fn agents(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let mut out = String::new();
     for (name, agent) in &config.agents {
         let mut line = format!("{name}\t{} {}", agent.command, agent.args.join(" "));
-        if let Some(mode) = &agent.mode {
-            let _ = write!(line, "\tmode={mode}");
-        }
-        if !agent.config.is_empty() {
-            let options = agent
-                .config
-                .iter()
-                .map(|(id, value)| {
-                    let value = match value {
-                        acpsub::config::ConfigValue::Select(v) => v.clone(),
-                        acpsub::config::ConfigValue::Toggle(v) => v.to_string(),
-                    };
-                    format!("{id}={value}")
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            let _ = write!(line, "\tconfig={{{options}}}");
-        }
         if agent.allow_outside_cwd {
             line.push_str("\tallow_outside_cwd");
         }

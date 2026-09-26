@@ -146,7 +146,12 @@ pub enum PermissionPolicy {
     Ask,
 }
 
-/// A configured ACP agent: the command to spawn plus session options.
+/// A configured ACP agent: how to launch it.
+///
+/// The command, its arguments and environment, the cwd boundary, and the
+/// permission policy. Session options (`model`, `mode`, other
+/// `session/set_config_option` values) are `spawn`/`adopt` arguments,
+/// never configured here.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// Program to spawn (resolved through `PATH`).
@@ -155,12 +160,6 @@ pub struct AgentConfig {
     pub args: Vec<String>,
     /// Extra environment variables for the agent process.
     pub env: BTreeMap<String, String>,
-    /// Session mode to activate with `session/set_mode` after `session/new` or
-    /// `session/load`.
-    pub mode: Option<String>,
-    /// Session config options applied with `session/set_config_option`, after
-    /// `set_mode`.
-    pub config: BTreeMap<String, ConfigValue>,
     /// Whether the agent may read/write files outside the session `cwd`.
     pub allow_outside_cwd: bool,
     /// Per-agent permission policy override.
@@ -229,9 +228,6 @@ struct RawAgentConfig {
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
-    mode: Option<String>,
-    #[serde(default)]
-    config: BTreeMap<String, ConfigValue>,
     #[serde(default)]
     allow_outside_cwd: bool,
     permission: Option<PermissionPolicy>,
@@ -272,8 +268,6 @@ impl RawAgentConfig {
             command: self.command,
             args: self.args,
             env: self.env,
-            mode: self.mode,
-            config: self.config,
             allow_outside_cwd: self.allow_outside_cwd,
             permission: self.permission,
             sessions_db: self.sessions_db.as_deref().map(expand_tilde),
@@ -311,14 +305,11 @@ registry = "/tmp/acpsub-registry.json"
 [agents.devin]
 command = "devin"
 args = ["acp"]
-mode = "bypass"
-config = { model = "swe-2-max" }
 allow_outside_cwd = false
 
 [agents.claude]
 command = "npx"
 args = ["-y", "@zed-industries/claude-code-acp"]
-mode = "bypassPermissions"
 permission = "ask"
 env = { FOO = "bar" }
 "#;
@@ -332,11 +323,6 @@ env = { FOO = "bar" }
         let devin = &config.agents["devin"];
         assert_eq!(devin.command, "devin");
         assert_eq!(devin.args, ["acp"]);
-        assert_eq!(devin.mode.as_deref(), Some("bypass"));
-        assert_eq!(
-            devin.config["model"],
-            ConfigValue::Select("swe-2-max".to_string())
-        );
         let claude = &config.agents["claude"];
         assert_eq!(claude.permission, Some(PermissionPolicy::Ask));
         assert_eq!(claude.env["FOO"], "bar");
@@ -374,6 +360,17 @@ env = { FOO = "bar" }
         let err = Config::parse("[agents.a]\ncommand = \"x\"\nbogus = 1\n")
             .expect_err("unknown key rejected");
         assert!(err.to_string().contains("bogus"));
+    }
+
+    /// `mode` and `config` were removed: they are `spawn`/`adopt` arguments
+    /// now, and a config still carrying them fails loudly.
+    #[test]
+    fn removed_session_keys_are_rejected() {
+        for key in ["mode = \"bypass\"", "config = { model = \"x\" }"] {
+            let text = format!("[agents.a]\ncommand = \"x\"\n{key}\n");
+            let err = Config::parse(&text).expect_err("removed key rejected");
+            assert!(err.to_string().contains(key.split(' ').next().unwrap()));
+        }
     }
 
     #[test]

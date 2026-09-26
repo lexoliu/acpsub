@@ -35,8 +35,12 @@ const STDERR_QUOTE_LINES: usize = 20;
 /// Shared app state behind every tool.
 #[derive(Debug)]
 pub struct AppState {
-    /// The loaded config file.
-    pub config: Config,
+    /// Path of the config file; re-read on every `spawn`/`adopt`/`agents`
+    /// call so the running server always reflects the file on disk.
+    pub config_path: PathBuf,
+    /// Directory holding `<session_id>.jsonl` transcript files (from the
+    /// config loaded at startup).
+    pub transcript_dir: PathBuf,
     /// Live subagents by session id.
     pub live: Mutex<HashMap<String, Arc<Subagent>>>,
     /// Session ids reserved by an in-flight `adopt`, before the subagent is
@@ -61,16 +65,32 @@ impl AppState {
     /// # Panics
     ///
     /// Panics if the registry mutex is poisoned.
-    pub fn new(config: Config) -> Result<Arc<Self>> {
-        let registry_path = config.defaults.registry.clone();
+    pub fn new(config: Config, config_path: PathBuf) -> Result<Arc<Self>> {
+        let registry_path = config.defaults.registry;
         Ok(Arc::new(Self {
-            config,
+            config_path,
+            transcript_dir: config.defaults.transcript_dir,
             live: Mutex::new(HashMap::new()),
             reserved: Mutex::new(HashSet::new()),
             registry: Mutex::new(Registry::load(&registry_path)?),
             registry_write: tokio::sync::Mutex::new(()),
             registry_path,
         }))
+    }
+
+    /// Re-read and parse the config file.
+    ///
+    /// `spawn`, `adopt`, and `agents` call this so a running server always
+    /// reflects the file on disk: edits take effect without a restart, and
+    /// a missing or unparsable file is an error — never a fallback to a
+    /// previously loaded config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigMissing`], [`Error::ConfigRead`], or
+    /// [`Error::ConfigParse`].
+    pub fn load_config(&self) -> Result<Config> {
+        Config::load(&self.config_path)
     }
 
     /// Get a live subagent by session id.
@@ -322,6 +342,10 @@ pub struct Subagent {
     pub permission: PermissionPolicy,
     /// Whether agent fs/* requests may leave `cwd`.
     pub allow_outside_cwd: bool,
+    /// The model the agent accepted (`session/set_config_option` `model`).
+    pub model: serde_json::Value,
+    /// The mode the agent accepted (`session/set_mode`).
+    pub mode: String,
     /// The transcript file path.
     pub transcript_path: PathBuf,
     /// The ACP client handle.
@@ -364,9 +388,13 @@ pub struct Launch {
     /// First turn's prompt, if the launch should start one. `adopt` may bind
     /// the session without prompting.
     pub prompt: Option<String>,
-    /// `session/set_mode` override; falls back to the agent's configured mode.
-    pub mode: Option<String>,
-    /// `session/set_config_option` overrides merged over the agent's `config`.
+    /// Session mode to activate with `session/set_mode`. Required — no
+    /// default exists.
+    pub mode: String,
+    /// Session model to set with `session/set_config_option` on the `model`
+    /// option. Required — no default exists.
+    pub model: String,
+    /// Extra `session/set_config_option` values applied after `model`.
     pub config: BTreeMap<String, ConfigValue>,
     /// Permission policy override.
     pub permission: Option<PermissionPolicy>,
@@ -389,8 +417,8 @@ pub struct Launch {
 /// # Panics
 ///
 /// Panics if a state mutex is poisoned.
-pub async fn launch(state: &Arc<AppState>, args: Launch) -> Result<Arc<Subagent>> {
-    let agent_cfg = state.config.agent(&args.agent)?.clone();
+pub async fn launch(state: &Arc<AppState>, config: &Config, args: Launch) -> Result<Arc<Subagent>> {
+    let agent_cfg = config.agent(&args.agent)?.clone();
     let cwd = args.cwd.canonicalize().map_err(|source| {
         Error::io(format!("cannot resolve cwd {}", args.cwd.display()), source)
     })?;
@@ -405,7 +433,7 @@ pub async fn launch(state: &Arc<AppState>, args: Launch) -> Result<Arc<Subagent>
             return Err(Error::SessionLive(session_id.clone()));
         }
     }
-    let result = launch_inner(state, &args, agent_cfg, cwd).await;
+    let result = launch_inner(state, config, &args, agent_cfg, cwd).await;
     if result.is_err()
         && let Some(session_id) = &args.load
     {
@@ -422,6 +450,7 @@ pub async fn launch(state: &Arc<AppState>, args: Launch) -> Result<Arc<Subagent>
 /// the handshake, register and go live, start the first turn if prompted.
 async fn launch_inner(
     state: &Arc<AppState>,
+    config: &Config,
     args: &Launch,
     agent_cfg: AgentConfig,
     cwd: PathBuf,
@@ -429,7 +458,7 @@ async fn launch_inner(
     let permission = args
         .permission
         .or(agent_cfg.permission)
-        .unwrap_or(state.config.defaults.permission);
+        .unwrap_or(config.defaults.permission);
     let rt = Arc::new(SubRuntime {
         inner: Mutex::new(Inner {
             status: Status::Idle,
@@ -467,8 +496,8 @@ async fn launch_inner(
     let (client, conn, stderr_pump) = connect(&agent_cfg, &cwd, handler, rt.clone())?;
 
     // On any handshake failure, kill the child before returning the error.
-    let session_id = match handshake(state, &client, &rt, args, &agent_cfg).await {
-        Ok(session_id) => session_id,
+    let accepted = match handshake(state, &client, &rt, args).await {
+        Ok(accepted) => accepted,
         Err(error) => {
             rt.closing.store(true, Ordering::Relaxed);
             client.close();
@@ -476,9 +505,9 @@ async fn launch_inner(
             return Err(error);
         }
     };
+    let session_id = accepted.session_id.clone();
 
-    let transcript_path = state
-        .config
+    let transcript_path = config
         .defaults
         .transcript_dir
         .join(format!("{session_id}.jsonl"));
@@ -498,6 +527,8 @@ async fn launch_inner(
         cwd,
         permission,
         allow_outside_cwd: agent_cfg.allow_outside_cwd,
+        model: accepted.model,
+        mode: accepted.mode,
         transcript_path,
         client,
         conn: Mutex::new(Some(conn)),
@@ -598,17 +629,28 @@ fn connect(
     Ok((client, conn, stderr_pump))
 }
 
+/// What the agent accepted during the handshake: the session id and the
+/// effective model and mode, read back from the `session/set_mode` /
+/// `session/set_config_option` answers.
+struct Accepted {
+    /// ACP session id (agent-assigned for `session/new`, the adopted id for
+    /// `session/load`).
+    session_id: String,
+    /// The `model` option's current value after `set_config_option`.
+    model: serde_json::Value,
+    /// The mode `session/set_mode` accepted.
+    mode: String,
+}
+
 /// `initialize`, `session/new` or `session/load`, `set_mode`, and the
 /// `set_config_option` calls; upserts the registry entry. Returns the
-/// session id (agent-assigned for `session/new`, the adopted id for
-/// `session/load`).
+/// session id and the model/mode the agent accepted.
 async fn handshake(
     state: &Arc<AppState>,
     client: &AcpClient<SubagentHandler>,
     rt: &SubRuntime,
     args: &Launch,
-    agent_cfg: &AgentConfig,
-) -> Result<String> {
+) -> Result<Accepted> {
     let agent_error = |source: ClientError| Error::Agent {
         agent: args.agent.clone(),
         source,
@@ -644,18 +686,19 @@ async fn handshake(
         inner.config_options = config_options.unwrap_or_default();
         inner.turn_offset = turn_offset;
     }
-    if let Some(mode) = args.mode.clone().or_else(|| agent_cfg.mode.clone()) {
-        client
-            .set_mode(&session_id, &mode)
-            .await
-            .map_err(agent_error)?;
+    client
+        .set_mode(&session_id, &args.mode)
+        .await
+        .map_err(agent_error)?;
+    {
         let mut inner = rt.inner.lock().expect("inner poisoned");
         if let Some(modes) = &mut inner.modes {
-            modes.current_mode_id = mode;
+            modes.current_mode_id.clone_from(&args.mode);
         }
     }
-    let mut options = agent_cfg.config.clone();
-    options.extend(args.config.clone());
+    let mut options = args.config.clone();
+    options.insert("model".to_string(), ConfigValue::Select(args.model.clone()));
+    let mut accepted_model = serde_json::Value::from(args.model.clone());
     for (id, value) in options {
         let value = match value {
             ConfigValue::Select(value) => aither_acp::SessionConfigValue::from(value),
@@ -665,6 +708,17 @@ async fn handshake(
             .set_config_option(&session_id, &id, value)
             .await
             .map_err(agent_error)?;
+        // The option list the agent returns is what it accepted; the
+        // reported model is the `model` option's value after that call.
+        if id == "model"
+            && let Some(current) = updated
+                .iter()
+                .find(|option| option.id == "model")
+                .and_then(|option| option.current_value.as_ref())
+            && let Ok(value) = serde_json::to_value(current)
+        {
+            accepted_model = value;
+        }
         rt.inner.lock().expect("inner poisoned").config_options = updated;
     }
     // A registered session keeps its `created` timestamp and turn count;
@@ -690,7 +744,11 @@ async fn handshake(
         })
         .await?;
     debug!(%session_id, agent = %args.agent, "subagent session established");
-    Ok(session_id)
+    Ok(Accepted {
+        session_id,
+        model: accepted_model,
+        mode: args.mode.clone(),
+    })
 }
 
 /// Connection task epilogue: a dead agent marks the subagent failed unless

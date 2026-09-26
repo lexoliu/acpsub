@@ -72,6 +72,8 @@ fn spawned_view(sub: &Subagent) -> Value {
         "session_id": sub.session_id,
         "agent": sub.agent,
         "state": state,
+        "model": sub.model,
+        "mode": sub.mode,
         "cwd": sub.cwd,
         "transcript": sub.transcript_path,
     })
@@ -173,8 +175,9 @@ async fn close_sub(sub: &Subagent) {
 ///
 /// Returns immediately with `session_id` — the handle every other tool
 /// addresses (`wait` for the reply, `send` for follow-ups, `transcript` for
-/// the full log). The turn runs in the background. To take over an existing
-/// session instead of starting a new one, use `adopt`.
+/// the full log), plus the `model` and `mode` the agent accepted. The turn
+/// runs in the background. To take over an existing session instead of
+/// starting a new one, use `adopt`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SpawnArgs {
     /// Configured agent key (`[agents.<key>]` in the config file). Optional:
@@ -185,11 +188,16 @@ struct SpawnArgs {
     cwd: PathBuf,
     /// The first turn's prompt — the task for the subagent.
     prompt: String,
-    /// Session mode to set (`session/set_mode`), overriding the agent's
-    /// configured `mode`.
-    mode: Option<String>,
-    /// Session config options to set (`session/set_config_option`), merged
-    /// over the agent's configured `config`: option id → string or boolean.
+    /// Required: the model to run, set via `session/set_config_option` on
+    /// the `model` option. There is no configured default — the value the
+    /// agent accepted comes back in the result.
+    model: String,
+    /// Required: the session mode to activate (`session/set_mode`). There
+    /// is no configured default — the value the agent accepted comes back
+    /// in the result.
+    mode: String,
+    /// Extra session config options to set (`session/set_config_option`),
+    /// applied after `model`: option id → string or boolean.
     config: Option<BTreeMap<String, ConfigValue>>,
     /// Permission policy for this subagent: `allow` auto-approves, `deny`
     /// auto-rejects, `ask` queues requests for the `permit` tool.
@@ -206,14 +214,17 @@ impl Tool for SpawnTool {
     type Res = Value;
 
     async fn call(&self, args: SpawnArgs) -> aither_core::Result<Value> {
-        let (agent, _) = self.0.config.resolve_agent(args.agent.as_deref())?;
+        let config = self.0.load_config()?;
+        let (agent, _) = config.resolve_agent(args.agent.as_deref())?;
         let sub = launch(
             &self.0,
+            &config,
             Launch {
                 agent: agent.clone(),
                 cwd: args.cwd,
                 prompt: Some(args.prompt),
                 mode: args.mode,
+                model: args.model,
                 config: args.config.unwrap_or_default(),
                 permission: args.permission,
                 load: None,
@@ -250,6 +261,10 @@ struct AdoptArgs {
     /// or the agent's session database. Required only when neither knows the
     /// session.
     cwd: Option<PathBuf>,
+    /// Required: the model to run, as in `spawn`.
+    model: String,
+    /// Required: the session mode to activate, as in `spawn`.
+    mode: String,
     /// Permission policy override, as in `spawn`.
     permission: Option<PermissionPolicy>,
 }
@@ -285,7 +300,8 @@ impl Tool for AdoptTool {
             .agent
             .as_deref()
             .or_else(|| registered.as_ref().map(|entry| entry.agent.as_str()));
-        let (agent, agent_cfg) = self.0.config.resolve_agent(requested)?;
+        let config = self.0.load_config()?;
+        let (agent, agent_cfg) = config.resolve_agent(requested)?;
         let cwd = if let Some(cwd) = args
             .cwd
             .or_else(|| registered.as_ref().map(|entry| entry.cwd.clone()))
@@ -311,11 +327,13 @@ impl Tool for AdoptTool {
         };
         let sub = launch(
             &self.0,
+            &config,
             Launch {
                 agent: agent.clone(),
                 cwd,
                 prompt: args.prompt,
-                mode: None,
+                mode: args.mode,
+                model: args.model,
                 config: BTreeMap::new(),
                 permission: args.permission,
                 load: Some(args.session_id),
@@ -669,6 +687,8 @@ impl StatusTool {
                 "agent": sub.agent,
                 "live": true,
                 "state": status.name(),
+                "model": sub.model,
+                "mode": sub.mode,
                 "cwd": sub.cwd,
                 "turns": turns,
                 "queued": queued,
@@ -941,8 +961,6 @@ impl Tool for TranscriptTool {
             Some(sub) => sub.transcript_path.clone(),
             None => self
                 .0
-                .config
-                .defaults
                 .transcript_dir
                 .join(format!("{}.jsonl", args.session_id)),
         };
@@ -1141,13 +1159,15 @@ impl Tool for AgentsTool {
     type Res = Value;
 
     fn call(&self, _args: AgentsArgs) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        std::future::ready(Ok(self.agents()))
+        std::future::ready(self.agents().map_err(Into::into))
     }
 }
 
 impl AgentsTool {
-    /// Synchronous body: `agents` only reads shared state.
-    fn agents(&self) -> Value {
+    /// Synchronous body: `agents` re-reads the config file and reads shared
+    /// state.
+    fn agents(&self) -> Result<Value> {
+        let config = self.0.load_config()?;
         // Per-agent: ids of its live subagents and the info the first such
         // process reported (agent_info, modes, config options).
         let live: Vec<Arc<Subagent>> = self
@@ -1158,14 +1178,12 @@ impl AgentsTool {
             .values()
             .cloned()
             .collect();
-        let implicit_default = self
-            .0
-            .config
+        let implicit_default = config
             .resolve_agent(None)
             .map(|(name, _)| name.clone())
             .ok();
         let mut out = Vec::new();
-        for (name, agent) in &self.0.config.agents {
+        for (name, agent) in &config.agents {
             let subs: Vec<&str> = live
                 .iter()
                 .filter(|sub| sub.agent == *name)
@@ -1175,7 +1193,6 @@ impl AgentsTool {
                 "name": name,
                 "command": agent.command,
                 "args": agent.args,
-                "mode": agent.mode,
                 "allow_outside_cwd": agent.allow_outside_cwd,
                 "default": implicit_default.as_ref() == Some(name),
                 "subagents": subs,
@@ -1216,7 +1233,7 @@ impl AgentsTool {
             }
             out.push(view);
         }
-        json!({"agents": out})
+        Ok(json!({"agents": out}))
     }
 }
 

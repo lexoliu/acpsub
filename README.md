@@ -51,32 +51,36 @@ registry = "~/.local/share/acpsub/registry.json"
 [agents.devin]
 command = "devin"
 args = ["acp"]
-mode = "bypass"                            # session/set_mode after session/new
-config = { model = "swe-2-max" }           # session/set_config_option id → value
 allow_outside_cwd = false                  # refuse fs/* paths outside cwd
 # sessions_db = "~/Library/Application Support/devin/sessions.db"
 
 [agents.claude]
 command = "npx"
 args = ["-y", "@zed-industries/claude-code-acp"]
-mode = "bypassPermissions"
 ```
 
 `~` expands in all paths. See `config.example.toml`.
 
+`[agents.<name>]` only describes how to launch the agent — session options
+are never configured there. `spawn`/`adopt` take `model` and `mode` as
+required arguments; a missing one is a tool error naming the field, and the
+result reports the model and mode the agent accepted.
+
 A missing config file is an error naming the path — create it first. `agents`
-with no `[agents.*]` entries serves no agents.
+with no `[agents.*]` entries serves no agents. The file is re-read on every
+`spawn`/`adopt`/`agents` call, so edits take effect without a restart and a
+file that fails to parse is a tool error, never a stale fallback.
 
 ## Tools
 
 | tool | arguments | behaviour |
 |---|---|---|
-| `spawn` | `cwd, prompt, agent?, mode?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{session_id, agent, state}` at once — the session id is the handle for every other call. |
-| `adopt` | `session_id, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, or an external one such as a Devin session created elsewhere. Returns `{session_id, agent, state}`; with `prompt` the first turn starts immediately. |
+| `spawn` | `cwd, prompt, model, mode, agent?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. |
+| `adopt` | `session_id, model, mode, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, or an external one such as a Devin session created elsewhere. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
 | `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not surface an error), returning `{state: "steered", turn}`. On a promptable subagent all three just start the turn: `{state: "running"}`. |
 | `wait` | `session_id, timeout_secs` (default 600, min 60, max 3600; prefer 300–1800) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?}`. |
 | `wait_any` | `session_ids, timeout_secs` | First of them to leave `running`. |
-| `status` | `session_id` | State, cwd, agent, turns, queued prompts, transcript path — instant check. |
+| `status` | `session_id` | State, cwd, agent, model, mode, turns, queued prompts, transcript path — instant check. |
 | `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
 | `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
 | `permit` | `session_id, request_id, option_id` | Answer a queued `ask`-policy permission request. |

@@ -162,7 +162,7 @@ args = ["{script}"]
         "tools/call",
         &json!({
             "name": "spawn",
-            "arguments": {"cwd": dir.path(), "prompt": "hi"},
+            "arguments": {"cwd": dir.path(), "prompt": "hi", "model": "b", "mode": "bypass"},
         }),
     );
     let spawned = tool_json(&spawned);
