@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aither_acp::{
-    AcpClient, ClientError, ConfigOption, ContentBlock, Implementation, PlanEntry, PromptResult,
-    RequestPermissionOutcome, SessionModeState, StopReason, TextContent, ToolCall,
-    ToolCallLocation, ToolCallStatus, ToolKind,
+    AcpClient, ClientError, ConfigOption, ConfigOptionValue, ConfigSelectOptions, ContentBlock,
+    Implementation, PlanEntry, PromptResult, RequestPermissionOutcome, SessionModeState,
+    StopReason, TextContent, ToolCall, ToolCallLocation, ToolCallStatus, ToolKind,
 };
 use aither_mcp::transport::ChildProcessTransport;
 use serde::Serialize;
@@ -631,14 +631,16 @@ fn connect(
 
 /// What the agent accepted during the handshake: the session id and the
 /// effective model and mode, read back from the `session/set_mode` /
-/// `session/set_config_option` answers.
+/// `session/set_config_option` answers — the agent's own report, not the
+/// requested strings echoed back.
 struct Accepted {
     /// ACP session id (agent-assigned for `session/new`, the adopted id for
     /// `session/load`).
     session_id: String,
     /// The `model` option's current value after `set_config_option`.
     model: serde_json::Value,
-    /// The mode `session/set_mode` accepted.
+    /// The session's current mode after `set_mode`, from the agent's
+    /// `current_mode_update` or its acceptance of the request.
     mode: String,
 }
 
@@ -672,6 +674,13 @@ async fn handshake(
             .map_err(agent_error)?;
         (result.session_id, result.modes, result.config_options)
     };
+    // Check every requested value against what the agent advertised before
+    // applying anything: an unverifiable or unknown value fails the launch
+    // and the process is closed by the caller, so no half-configured
+    // session is registered.
+    let config_options = config_options.unwrap_or_default();
+    let (modes, options) = check_advertised(&args.agent, args, modes, &config_options)?;
+    let current_mode = modes.current_mode_id.clone();
     let turn_offset = state
         .registry
         .lock()
@@ -682,22 +691,19 @@ async fn handshake(
         let mut inner = rt.inner.lock().expect("inner poisoned");
         inner.session_id.clone_from(&session_id);
         inner.agent_info = init.agent_info;
-        inner.modes = modes;
-        inner.config_options = config_options.unwrap_or_default();
+        inner.modes = Some(modes);
+        inner.config_options = config_options;
         inner.turn_offset = turn_offset;
     }
     client
         .set_mode(&session_id, &args.mode)
         .await
         .map_err(agent_error)?;
-    {
-        let mut inner = rt.inner.lock().expect("inner poisoned");
-        if let Some(modes) = &mut inner.modes {
-            modes.current_mode_id.clone_from(&args.mode);
-        }
-    }
-    let mut options = args.config.clone();
-    options.insert("model".to_string(), ConfigValue::Select(args.model.clone()));
+    note_set_mode(
+        &mut rt.inner.lock().expect("inner poisoned"),
+        &current_mode,
+        &args.mode,
+    );
     let mut accepted_model = serde_json::Value::from(args.model.clone());
     for (id, value) in options {
         let value = match value {
@@ -721,6 +727,7 @@ async fn handshake(
         }
         rt.inner.lock().expect("inner poisoned").config_options = updated;
     }
+    let accepted_mode = confirmed_mode(&mut rt.inner.lock().expect("inner poisoned"));
     // A registered session keeps its `created` timestamp and turn count;
     // a new one gets a fresh entry.
     let agent = args.agent.clone();
@@ -747,8 +754,146 @@ async fn handshake(
     Ok(Accepted {
         session_id,
         model: accepted_model,
-        mode: args.mode.clone(),
+        mode: accepted_mode,
     })
+}
+
+/// Check `args`' mode, model and config values against what the agent
+/// advertised in `session/new`/`session/load`, before anything is applied:
+/// a mode the agent does not list, a config id it does not advertise, or a
+/// select value outside the advertised set fails the launch.
+///
+/// Returns the advertised mode state and the merged `model` + `config`
+/// option map to apply.
+fn check_advertised(
+    agent: &str,
+    args: &Launch,
+    modes: Option<SessionModeState>,
+    config_options: &[ConfigOption],
+) -> Result<(SessionModeState, BTreeMap<String, ConfigValue>)> {
+    let modes = modes.ok_or_else(|| Error::ModesNotAdvertised {
+        agent: agent.to_string(),
+        value: args.mode.clone(),
+    })?;
+    let valid: Vec<String> = modes
+        .available_modes
+        .iter()
+        .map(|mode| mode.id.clone())
+        .collect();
+    if !valid.contains(&args.mode) {
+        return Err(Error::UnknownMode {
+            agent: agent.to_string(),
+            value: args.mode.clone(),
+            valid,
+        });
+    }
+    let mut options = args.config.clone();
+    options.insert("model".to_string(), ConfigValue::Select(args.model.clone()));
+    for (id, value) in &options {
+        check_config_option(agent, config_options, id, value)?;
+    }
+    Ok((modes, options))
+}
+
+/// Record the mode `set_mode` left in effect: a `current_mode_update`
+/// received while the call was in flight already reported it; with none,
+/// the agent's acceptance of the request stands.
+fn note_set_mode(inner: &mut Inner, prior: &str, requested: &str) {
+    let modes = inner.modes.as_mut().expect("modes recorded");
+    if modes.current_mode_id == prior {
+        requested.clone_into(&mut modes.current_mode_id);
+    }
+}
+
+/// The agent-confirmed mode after every set call: a `mode` config option's
+/// current value, when the agent exposes one, is its own post-set report —
+/// it can differ from the request when `set_mode` succeeded but kept
+/// another mode. Without such an option the modes state's current id —
+/// a `current_mode_update` when one arrived, else the accepted request —
+/// is the report.
+fn confirmed_mode(inner: &mut Inner) -> String {
+    let confirmed = inner
+        .config_options
+        .iter()
+        .find(|option| option.id == "mode" || option.category.as_deref() == Some("mode"))
+        .and_then(|option| option.current_value.as_ref())
+        .and_then(|value| match value {
+            ConfigOptionValue::Selected(id) => Some(id.clone()),
+            ConfigOptionValue::Toggle(_) => None,
+        });
+    let modes = inner.modes.as_mut().expect("modes recorded");
+    if let Some(confirmed) = confirmed {
+        modes.current_mode_id = confirmed;
+    }
+    modes.current_mode_id.clone()
+}
+
+/// Check a `model`/`config` value against the options the agent advertised
+/// in `session/new`/`session/load`: the option must be advertised at all,
+/// and a `select` value must be one of its listed values — an option with
+/// no advertised values leaves the request uncheckable.
+fn check_config_option(
+    agent: &str,
+    options: &[ConfigOption],
+    id: &str,
+    value: &ConfigValue,
+) -> Result<()> {
+    let option = options
+        .iter()
+        .find(|option| option.id == id)
+        .ok_or_else(|| Error::UnknownConfigOption {
+            agent: agent.to_string(),
+            id: id.to_string(),
+            known: options.iter().map(|option| option.id.clone()).collect(),
+        })?;
+    let valid: Vec<String> = option
+        .options
+        .as_ref()
+        .map(|options| match options {
+            ConfigSelectOptions::Flat(flat) => {
+                flat.iter().map(|option| option.value.clone()).collect()
+            }
+            ConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter().map(|option| option.value.clone()))
+                .collect(),
+        })
+        .unwrap_or_default();
+    let uncheckable = |value: String| Error::ConfigOptionValuesMissing {
+        agent: agent.to_string(),
+        id: id.to_string(),
+        value,
+    };
+    let unknown = |value: String| Error::UnknownConfigValue {
+        agent: agent.to_string(),
+        id: id.to_string(),
+        value,
+        valid: valid.clone(),
+    };
+    match value {
+        ConfigValue::Select(value) => {
+            if valid.is_empty() {
+                Err(uncheckable(value.clone()))
+            } else if valid.contains(value) {
+                Ok(())
+            } else {
+                Err(unknown(value.clone()))
+            }
+        }
+        // A `boolean` option advertises no `options`; true/false is its
+        // whole domain. For anything else a toggle cannot be checked.
+        ConfigValue::Toggle(flag) => {
+            if option.kind.as_deref() == Some("boolean")
+                || matches!(option.current_value, Some(ConfigOptionValue::Toggle(_)))
+            {
+                Ok(())
+            } else if valid.is_empty() {
+                Err(uncheckable(flag.to_string()))
+            } else {
+                Err(unknown(flag.to_string()))
+            }
+        }
+    }
 }
 
 /// Connection task epilogue: a dead agent marks the subagent failed unless

@@ -1358,6 +1358,174 @@ async fn spawn_and_adopt_require_model_and_mode() {
     }
 }
 
+/// `spawn` validates `mode`, `model`, and `config` values against what the
+/// agent advertised in `session/new`: an unknown value fails naming itself
+/// and the valid choices, and the spawned process is closed — nothing stays
+/// live or registered.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_rejects_unadvertised_mode_model_config() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+
+    let mut args = spawn_args(dir.path(), "hi");
+    args["mode"] = json!("dangerous");
+    let err = call_err(&tools, "spawn", args).await;
+    assert!(err.contains("dangerous"), "{err}");
+    assert!(err.contains("default"), "{err}");
+    assert!(err.contains("bypass"), "{err}");
+
+    let mut args = spawn_args(dir.path(), "hi");
+    args["model"] = json!("hal-9000");
+    let err = call_err(&tools, "spawn", args).await;
+    assert!(err.contains("hal-9000"), "{err}");
+    assert!(err.contains("valid: a, b"), "{err}");
+
+    // A `config` key the agent does not advertise is rejected as well.
+    let mut args = spawn_args(dir.path(), "hi");
+    args["config"] = json!({"thinking": "high"});
+    let err = call_err(&tools, "spawn", args).await;
+    assert!(err.contains("thinking"), "{err}");
+    assert!(err.contains("known: model"), "{err}");
+
+    // Nothing survived: no live subagent and no registry entry.
+    assert!(
+        state.live.lock().expect("live").is_empty(),
+        "no live subagent"
+    );
+    assert!(
+        state.reserved.lock().expect("reserved").is_empty(),
+        "no reserved session id"
+    );
+    assert!(
+        !dir.path().join("registry.json").exists(),
+        "nothing registered"
+    );
+
+    // A valid pair spawns and reports the agent's current values.
+    let spawned = call_json(&tools, "spawn", spawn_args(dir.path(), "hi")).await;
+    assert_eq!(spawned["model"], "b", "{spawned}");
+    assert_eq!(spawned["mode"], "bypass", "{spawned}");
+}
+
+/// The reported `mode`/`model` are the agent-confirmed values, not the
+/// request echoed back: `FAKE_MODE_IGNORED` makes `session/set_mode` a
+/// silent no-op, so the `mode` config option keeps reporting the mode the
+/// session actually runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_reports_agent_confirmed_mode() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let agents = BTreeMap::from([(
+        "stuck".to_string(),
+        AgentConfig {
+            env: BTreeMap::from([("FAKE_MODE_IGNORED".to_string(), "1".to_string())]),
+            ..fake_agent_config()
+        },
+    )]);
+    let (_state, tools) = test_state_with_agents(dir.path(), &agents);
+
+    let mut args = spawn_args(dir.path(), "hi");
+    args["agent"] = json!("stuck");
+    let spawned = call_json(&tools, "spawn", args).await;
+    assert_eq!(spawned["mode"], "default", "{spawned}");
+    assert_eq!(spawned["model"], "b", "{spawned}");
+
+    // The `agents` view reports the same agent-confirmed mode.
+    let listed = call_json(&tools, "agents", json!({})).await;
+    let stuck = listed["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "stuck")
+        .expect("stuck agent");
+    assert_eq!(stuck["modes"]["current"], "default", "{stuck}");
+}
+
+/// An agent that advertises no mode list, or a `model` option with no
+/// values, leaves the parameter uncheckable — the call fails instead of
+/// proceeding unverified.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_rejects_unverifiable_mode_and_model() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake_agent_config();
+    let agents = BTreeMap::from([
+        (
+            "nomodes".to_string(),
+            AgentConfig {
+                env: BTreeMap::from([("FAKE_NO_MODES".to_string(), "1".to_string())]),
+                ..fake.clone()
+            },
+        ),
+        (
+            "noopts".to_string(),
+            AgentConfig {
+                env: BTreeMap::from([("FAKE_NO_OPTIONS".to_string(), "1".to_string())]),
+                ..fake
+            },
+        ),
+    ]);
+    let (state, tools) = test_state_with_agents(dir.path(), &agents);
+
+    let mut args = spawn_args(dir.path(), "hi");
+    args["agent"] = json!("nomodes");
+    let err = call_err(&tools, "spawn", args).await;
+    assert!(err.contains("cannot check mode 'bypass'"), "{err}");
+
+    let mut args = spawn_args(dir.path(), "hi");
+    args["agent"] = json!("noopts");
+    let err = call_err(&tools, "spawn", args).await;
+    assert!(err.contains("cannot check 'b'"), "{err}");
+
+    assert!(state.live.lock().expect("live").is_empty());
+}
+
+/// `adopt` applies the same check to `session/load` results: a bad mode is
+/// rejected and the reserved session id is freed for a valid retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_rejects_unadvertised_mode() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+
+    let err = call_err(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "model": "b", "mode": "dangerous"}),
+    )
+    .await;
+    assert!(err.contains("dangerous"), "{err}");
+    assert!(err.contains("bypass"), "{err}");
+
+    // The failed adopt released the session id: a valid pair adopts and
+    // reports the agent's current mode and model.
+    let adopted = call_json(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    assert_eq!(adopted["session_id"], sid);
+    assert_eq!(adopted["mode"], "bypass", "{adopted}");
+    assert_eq!(adopted["model"], "b", "{adopted}");
+}
+
 /// The config file is re-read per call: an agent removed from it is gone
 /// from `agents` and unspawnable without a restart.
 #[tokio::test(flavor = "multi_thread")]
