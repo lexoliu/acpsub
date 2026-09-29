@@ -217,12 +217,12 @@ pub async fn spawn_id(tools: &Tools, args: Value) -> String {
         .to_string()
 }
 
-/// `wait` with a bounded timeout.
-pub async fn wait(tools: &Tools, session_id: &str, timeout_secs: u64) -> Value {
+/// `wait` with an expected turn duration.
+pub async fn wait(tools: &Tools, session_id: &str, expect_secs: u64) -> Value {
     call_json(
         tools,
         "wait",
-        json!({"session_id": session_id, "timeout_secs": timeout_secs}),
+        json!({"session_id": session_id, "expect_secs": expect_secs}),
     )
     .await
 }

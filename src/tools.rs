@@ -27,12 +27,6 @@ use crate::state::{
 };
 use crate::transcript::{RenderOptions, render};
 
-/// `wait`'s minimum timeout: shorter polls belong to `status`.
-const MIN_WAIT_SECS: u64 = 60;
-/// `wait`'s default timeout.
-const DEFAULT_WAIT_SECS: u64 = 600;
-/// `wait`'s maximum timeout.
-const MAX_WAIT_SECS: u64 = 3600;
 /// `wait_any` polls the named subagents this often.
 const WAIT_ANY_POLL: Duration = Duration::from_millis(50);
 /// How long `send` waits for a synchronous rejection of a steer before
@@ -79,9 +73,43 @@ fn spawned_view(sub: &Subagent) -> Value {
     })
 }
 
-/// A `wait`-style result for one subagent.
-fn wait_view(sub: &Subagent, started: Instant) -> Value {
-    let (status, reply, tool_calls, pending, turn_n, queued) = {
+/// Seconds until the running turn's `expect_secs` budget is spent —
+/// negative once it has passed; `None` when the subagent is not running.
+/// A `running` subagent always has a recorded start — the current turn's
+/// `started_at`, or a just-chained turn's `pending_turn_start` — so a
+/// missing one is a broken invariant, never a case to wait through
+/// unbounded.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] when the invariant is violated.
+fn turn_budget_remaining(sub: &Subagent, expect_secs: u64) -> Result<Option<f64>> {
+    let inner = sub.rt.inner.lock().expect("inner poisoned");
+    if !matches!(inner.status, Status::Running) {
+        return Ok(None);
+    }
+    let Some(started) = inner
+        .current
+        .as_ref()
+        .and_then(|turn| turn.started_at)
+        .or(inner.pending_turn_start)
+    else {
+        return Err(Error::Internal {
+            session_id: sub.session_id.clone(),
+            detail: "status is running but no turn start is recorded".to_string(),
+        });
+    };
+    drop(inner);
+    let elapsed = jiff::Timestamp::now().duration_since(started).as_secs_f64();
+    #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
+    Ok(Some(expect_secs as f64 - elapsed))
+}
+
+/// A `wait`-style result for one subagent. `overrun` marks that the turn
+/// outlived `expect_secs`: the result reports `overrun`, the turn's own
+/// elapsed time, and its latest tool call.
+fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
+    let (status, reply, tool_calls, pending, turn_n, queued, turn_elapsed, latest) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
         let turn = inner.current.as_ref().or_else(|| inner.turns.last());
         let pending = inner.pending.first().map(|perm| {
@@ -109,6 +137,14 @@ fn wait_view(sub: &Subagent, started: Instant) -> Value {
             pending,
             turn.map(|turn| turn.n),
             inner.queue.len(),
+            turn.and_then(|turn| turn.started_at)
+                .map(|started| jiff::Timestamp::now().duration_since(started).as_secs_f64()),
+            turn.and_then(|turn| {
+                turn.latest_tool_call
+                    .as_ref()
+                    .and_then(|id| turn.tool_calls.get(id))
+                    .cloned()
+            }),
         )
     };
     let mut view = json!({
@@ -120,6 +156,16 @@ fn wait_view(sub: &Subagent, started: Instant) -> Value {
         "queued": queued,
         "elapsed_secs": started.elapsed().as_secs_f64(),
     });
+    if overrun {
+        view["state"] = json!("overrun");
+        if let Some(elapsed) = turn_elapsed {
+            view["elapsed_secs"] = json!(elapsed);
+        }
+        if let Some(latest) = latest {
+            view["latest_tool_call"] = serde_json::to_value(latest)
+                .expect("ToolCallSummary holds only owned primitives; serialization cannot fail");
+        }
+    }
     match &status {
         Status::Done(reason) => {
             view["stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
@@ -456,7 +502,7 @@ impl Tool for SendTool {
                 match status {
                     Status::Idle | Status::Done(_) | Status::Cancelled => {
                         let (turn_n, fut) =
-                            begin_turn(&sub, args.prompt, Gate::Check, false).await?;
+                            begin_turn(&self.0, &sub, args.prompt, Gate::Check, false).await?;
                         spawn_turn_task(self.0.clone(), &sub, fut, turn_n);
                     }
                     Status::Running | Status::NeedsPermission => {
@@ -510,25 +556,26 @@ impl Tool for SendTool {
 // wait / wait_any
 // ---------------------------------------------------------------------------
 
-/// Block until a subagent's turn ends, a permission request needs an answer,
-/// or the timeout expires.
+/// Block until a subagent's turn ends, a permission request needs an
+/// answer, or the turn has run past `expect_secs`.
 ///
 /// Returns the subagent state (`done`/`cancelled`/`failed`/
-/// `needs_permission`/`running`), the turn's `reply` (concatenated agent
-/// message text), its tool calls, and — when `needs_permission` — the
-/// `pending_permission` request to answer with `permit`.
+/// `needs_permission`), the turn's `reply` (concatenated agent message
+/// text), its tool calls, and — when `needs_permission` — the
+/// `pending_permission` request to answer with `permit`. When the turn has
+/// run longer than `expect_secs` the result is `overrun`, carrying the
+/// turn's elapsed time and its latest tool call: an overrun is to be
+/// investigated (`status`, `transcript`, a `send` steer), not re-waited
+/// with a larger expectation.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitArgs {
     /// Session id, as returned by `spawn`/`adopt`.
     session_id: String,
-    /// Seconds to wait (default 600, min 60, max 3600). Prefer long waits —
-    /// 300–1800 (5–30 min): the block is event-driven and returns early on
-    /// any state change, so a generous timeout is free, while every expiry
-    /// costs a model turn just to re-issue the wait on a still-`running`
-    /// result. Keep it under 1800 to stay inside the 30-min prompt-cache
-    /// TTL. On expiry the result reports the still-current state. For an
-    /// instant check use `status` — timeouts under 60 are rejected.
-    timeout_secs: Option<u64>,
+    /// Required: how long the awaited turn is expected to take, in seconds.
+    /// Measured from the turn's recorded start — re-issuing a wait never
+    /// extends it. The wait returns early on any state change, so an
+    /// accurate expectation is free.
+    expect_secs: u64,
 }
 
 struct WaitTool(Arc<AppState>);
@@ -541,49 +588,36 @@ impl Tool for WaitTool {
     type Res = Value;
 
     async fn call(&self, args: WaitArgs) -> aither_core::Result<Value> {
-        if let Some(secs) = args.timeout_secs
-            && secs < MIN_WAIT_SECS
-        {
-            return Err(Error::TimeoutBelowMin { got: secs }.into());
-        }
         let sub = self.0.get(&args.session_id)?;
-        let timeout = Duration::from_secs(
-            args.timeout_secs
-                .unwrap_or(DEFAULT_WAIT_SECS)
-                .min(MAX_WAIT_SECS),
-        );
         let started = Instant::now();
-        loop {
-            {
-                let inner = sub.rt.inner.lock().expect("inner poisoned");
-                if !matches!(inner.status, Status::Running) {
-                    break;
+        let overrun = loop {
+            match turn_budget_remaining(&sub, args.expect_secs)? {
+                None => break false,
+                Some(remaining) if remaining <= 0.0 => break true,
+                Some(remaining) => {
+                    tokio::select! {
+                        () = sub.rt.notify.notified() => {},
+                        () = tokio::time::sleep(Duration::from_secs_f64(remaining.min(0.25))) => {},
+                    }
                 }
             }
-            let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-            tokio::select! {
-                () = sub.rt.notify.notified() => {},
-                () = tokio::time::sleep(remaining.min(Duration::from_millis(250))) => {},
-            }
-        }
-        Ok(wait_view(&sub, started))
+        };
+        Ok(wait_view(&sub, started, overrun))
     }
 }
 
-/// Block until the first of several subagents leaves `running`, then return
-/// that one's wait-style result.
+/// Block until the first of several subagents leaves `running` — a turn
+/// end, a permission request, or an `overrun` once its turn has run past
+/// `expect_secs` — then return that one's wait-style result. An overrun is
+/// to be investigated, not re-waited with a larger number.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitAnyArgs {
     /// Session ids to watch.
     session_ids: Vec<String>,
-    /// Seconds to wait (default 600, min 60, max 3600). Prefer 300–1800
-    /// (5–30 min), as with `wait`: early return on the first finisher is
-    /// free, but each expiry burns a model turn re-issuing the wait.
-    /// Timeouts under 60 are rejected — use `status` for instant checks.
-    timeout_secs: Option<u64>,
+    /// Required: how long the awaited turns are expected to take, in
+    /// seconds. Measured from each turn's recorded start — re-issuing a
+    /// wait never extends it.
+    expect_secs: u64,
 }
 
 struct WaitAnyTool(Arc<AppState>);
@@ -596,40 +630,26 @@ impl Tool for WaitAnyTool {
     type Res = Value;
 
     async fn call(&self, args: WaitAnyArgs) -> aither_core::Result<Value> {
-        if let Some(secs) = args.timeout_secs
-            && secs < MIN_WAIT_SECS
-        {
-            return Err(Error::TimeoutBelowMin { got: secs }.into());
-        }
         let subs = args
             .session_ids
             .iter()
             .map(|session_id| self.0.get(session_id))
             .collect::<Result<Vec<_>>>()?;
-        let timeout = Duration::from_secs(
-            args.timeout_secs
-                .unwrap_or(DEFAULT_WAIT_SECS)
-                .min(MAX_WAIT_SECS),
-        );
         let started = Instant::now();
         loop {
+            let mut poll = WAIT_ANY_POLL;
             for sub in &subs {
-                let done = {
-                    let inner = sub.rt.inner.lock().expect("inner poisoned");
-                    !matches!(inner.status, Status::Running)
-                };
-                if done {
-                    return Ok(wait_view(sub, started));
+                match turn_budget_remaining(sub, args.expect_secs)? {
+                    None => return Ok(wait_view(sub, started, false)),
+                    Some(remaining) if remaining <= 0.0 => {
+                        return Ok(wait_view(sub, started, true));
+                    }
+                    Some(remaining) => {
+                        poll = poll.min(Duration::from_secs_f64(remaining));
+                    }
                 }
             }
-            if timeout.saturating_sub(started.elapsed()).is_zero() {
-                return Ok(json!({
-                    "state": "running",
-                    "session_ids": args.session_ids,
-                    "elapsed_secs": started.elapsed().as_secs_f64(),
-                }));
-            }
-            tokio::time::sleep(WAIT_ANY_POLL).await;
+            tokio::time::sleep(poll).await;
         }
     }
 }

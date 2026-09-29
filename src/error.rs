@@ -121,13 +121,6 @@ pub enum Error {
         offered: Vec<String>,
     },
 
-    /// `wait`/`wait_any` received a `timeout_secs` below the minimum.
-    #[error("timeout_secs {got} is below the 60s minimum; use `status` for an instant state check")]
-    TimeoutBelowMin {
-        /// The rejected timeout.
-        got: u64,
-    },
-
     /// The requested turn does not exist.
     #[error("session '{session_id}' has no turn {turn} (has {have})")]
     NoSuchTurn {
@@ -231,6 +224,15 @@ pub enum Error {
         path: PathBuf,
         /// Underlying JSON error.
         source: serde_json::Error,
+    },
+
+    /// An internal invariant was violated — an acpsub bug, not bad input.
+    #[error("internal error on session '{session_id}': {detail}")]
+    Internal {
+        /// Session id.
+        session_id: String,
+        /// What invariant broke.
+        detail: String,
     },
 
     /// A filesystem or registry I/O error.

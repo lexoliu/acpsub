@@ -451,10 +451,11 @@ async fn wait_returns_when_cancel_runs_concurrently() {
     assert_eq!(done["stop_reason"], "cancelled");
 }
 
-/// Timeouts under the 60s floor are rejected on both wait tools; an instant
-/// check is `status`'s job.
+/// `wait` returns `overrun` once the turn has run past `expect_secs` —
+/// measured from the turn's start — reporting the turn's elapsed time and
+/// its latest tool call. The turn keeps running underneath.
 #[tokio::test(flavor = "multi_thread")]
-async fn wait_rejects_timeout_below_min() {
+async fn wait_overruns_past_expected_duration() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
@@ -463,20 +464,182 @@ async fn wait_rejects_timeout_below_min() {
     let (_state, tools) = test_state(dir.path());
     let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
 
-    let err = call_err(
+    let out = wait(&tools, &sid, 1).await;
+    assert_eq!(out["state"], "overrun", "{out}");
+    assert!(
+        out["elapsed_secs"].as_f64().expect("elapsed_secs") >= 1.0,
+        "{out}"
+    );
+    assert_eq!(out["latest_tool_call"]["id"], "tc-1", "{out}");
+
+    // The subagent itself is still running — overrun is a report, not a
+    // state transition.
+    let status = call_json(&tools, "status", json!({"session_id": sid})).await;
+    assert_eq!(status["state"], "running", "{status}");
+    call_json(&tools, "cancel", json!({"session_id": sid})).await;
+}
+
+/// A turn that finishes within `expect_secs` returns its normal terminal
+/// state.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_within_expected_duration_returns_done() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["stop_reason"], "end_turn");
+}
+
+/// Re-issuing `wait` cannot extend the budget: both waits overrun at the
+/// same wall-clock point, measured from the turn's recorded start.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_overrun_is_measured_from_turn_start() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+
+    let first = wait(&tools, &sid, 2).await;
+    assert_eq!(first["state"], "overrun", "{first}");
+
+    // The budget ran out at turn_start + 2s: a second wait overruns at
+    // once rather than getting a fresh 2 seconds.
+    let reissued = std::time::Instant::now();
+    let second = wait(&tools, &sid, 2).await;
+    assert!(
+        reissued.elapsed() < std::time::Duration::from_secs(1),
+        "re-issued wait must not extend the budget: {second}"
+    );
+    assert_eq!(second["state"], "overrun", "{second}");
+    assert!(
+        second["elapsed_secs"].as_f64().expect("elapsed_secs")
+            > first["elapsed_secs"].as_f64().expect("elapsed_secs"),
+        "elapsed keeps growing from the turn's start: {second}"
+    );
+    call_json(&tools, "cancel", json!({"session_id": sid})).await;
+}
+
+/// `expect_secs` is required on both wait tools — there is no default.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_requires_expect_secs() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+
+    let err = call_err(&tools, "wait", json!({"session_id": sid.as_str()})).await;
+    assert!(err.contains("expect_secs"), "{err}");
+    let err = call_err(&tools, "wait_any", json!({"session_ids": [sid.as_str()]})).await;
+    assert!(err.contains("expect_secs"), "{err}");
+    call_json(&tools, "cancel", json!({"session_id": sid})).await;
+}
+
+/// A `wait` spanning a queued-turn handoff sees a recorded start through
+/// the gap: the chained turn's budget is measured from the moment its
+/// slot was reserved — `running` never lacks a turn start.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_overruns_on_chained_turn() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    // "gather" holds turn 1 open until a steered prompt arrives.
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
+
+    // Park a prompt client-side, then finish turn 1 with a steer: the
+    // queued prompt chains as turn 2 — a "wait" turn that never ends.
+    call_json(
         &tools,
-        "wait",
-        json!({"session_id": sid.as_str(), "timeout_secs": 30}),
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "wait", "policy": "queued"}),
     )
     .await;
-    assert!(err.contains("below the 60s minimum"), "{err}");
-    let err = call_err(
+    call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "go", "policy": "steer"}),
+    )
+    .await;
+
+    let out = wait(&tools, &sid, 2).await;
+    assert_eq!(out["state"], "overrun", "{out}");
+    assert!(
+        out["elapsed_secs"].as_f64().expect("elapsed_secs") >= 2.0,
+        "{out}"
+    );
+    call_json(&tools, "cancel", json!({"session_id": sid})).await;
+}
+
+/// A steered prompt that the agent runs as a turn of its own materializes
+/// a `current` with a recorded start; `wait` budgets from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_overruns_on_materialized_steer_turn() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    // queueagent parks a concurrent prompt agent-side and runs it as its
+    // own turn after "hold" ends.
+    let mut args = spawn_args(dir.path(), "hold");
+    args["agent"] = json!("queueagent");
+    let sid = spawn_id(&tools, args).await;
+    call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "wait", "policy": "steer"}),
+    )
+    .await;
+
+    let out = wait(&tools, &sid, 2).await;
+    assert_eq!(out["state"], "overrun", "{out}");
+    assert!(
+        out["elapsed_secs"].as_f64().expect("elapsed_secs") >= 2.0,
+        "{out}"
+    );
+    call_json(&tools, "cancel", json!({"session_id": sid})).await;
+}
+
+/// `wait_any` reports the first subagent whose turn overruns, with that
+/// turn's elapsed time and latest tool call.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_any_reports_overrun() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+
+    let out = call_json(
         &tools,
         "wait_any",
-        json!({"session_ids": [sid.as_str()], "timeout_secs": 1}),
+        json!({"session_ids": [sid.as_str()], "expect_secs": 1}),
     )
     .await;
-    assert!(err.contains("below the 60s minimum"), "{err}");
+    assert_eq!(out["state"], "overrun", "{out}");
+    assert_eq!(out["session_id"], sid, "{out}");
+    assert!(
+        out["elapsed_secs"].as_f64().expect("elapsed_secs") >= 1.0,
+        "{out}"
+    );
+    assert_eq!(out["latest_tool_call"]["id"], "tc-1", "{out}");
+    call_json(&tools, "cancel", json!({"session_id": sid})).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1039,7 +1202,7 @@ async fn wait_any_returns_first_done() {
     let first = call_json(
         &tools,
         "wait_any",
-        json!({"session_ids": [sid1.as_str(), sid2.as_str()], "timeout_secs": 60}),
+        json!({"session_ids": [sid1.as_str(), sid2.as_str()], "expect_secs": 60}),
     )
     .await;
     assert_eq!(first["session_id"], sid2, "{first}");

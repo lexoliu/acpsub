@@ -28,6 +28,11 @@ pub struct RegistryEntry {
     /// RFC 3339 timestamp of the last completed turn, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn: Option<String>,
+    /// RFC 3339 timestamp of when the in-flight turn started, if any. The
+    /// base `wait`/`wait_any`'s `expect_secs` is measured from, so a
+    /// re-issued wait can never extend the budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started: Option<String>,
     /// Number of completed turns.
     #[serde(default)]
     pub turns: u64,
@@ -161,6 +166,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 created: "2026-09-10T00:00:00Z".to_string(),
                 last_turn: None,
+                turn_started: None,
                 turns: 2,
             },
         );
@@ -206,6 +212,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 created: "t".to_string(),
                 last_turn: Some("t2".to_string()),
+                turn_started: None,
                 turns: 1,
             },
         );
