@@ -189,15 +189,18 @@ struct SpawnArgs {
     /// The first turn's prompt — the task for the subagent.
     prompt: String,
     /// Required: the model to run, set via `session/set_config_option` on
-    /// the `model` option. There is no configured default — the value the
-    /// agent accepted comes back in the result.
+    /// the `model` option. There is no configured default. The value must
+    /// be one the agent advertises for `model`; the value it reports as
+    /// current comes back in the result.
     model: String,
     /// Required: the session mode to activate (`session/set_mode`). There
-    /// is no configured default — the value the agent accepted comes back
-    /// in the result.
+    /// is no configured default. The value must be one of the modes the
+    /// agent advertises; the mode it reports as current comes back in the
+    /// result.
     mode: String,
     /// Extra session config options to set (`session/set_config_option`),
-    /// applied after `model`: option id → string or boolean.
+    /// applied after `model`: option id → string or boolean. Every id and
+    /// value must be one the agent advertises.
     config: Option<BTreeMap<String, ConfigValue>>,
     /// Permission policy for this subagent: `allow` auto-approves, `deny`
     /// auto-rejects, `ask` queues requests for the `permit` tool.

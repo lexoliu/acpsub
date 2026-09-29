@@ -167,6 +167,63 @@ pub enum Error {
     #[error("config option '{0}' must be a string or boolean")]
     BadConfigValue(String),
 
+    /// The agent advertised no mode list, so `mode` cannot be checked.
+    #[error("agent '{agent}' advertises no session modes; cannot check mode '{value}'")]
+    ModesNotAdvertised {
+        /// Agent config key.
+        agent: String,
+        /// The requested mode.
+        value: String,
+    },
+
+    /// The requested mode is not among the agent's advertised modes.
+    #[error("unknown mode '{value}' for agent '{agent}'{}", if valid.is_empty() { "; it advertises none".to_string() } else { format!(" (valid: {})", valid.join(", ")) })]
+    UnknownMode {
+        /// Agent config key.
+        agent: String,
+        /// The rejected mode.
+        value: String,
+        /// Mode ids the agent advertised.
+        valid: Vec<String>,
+    },
+
+    /// The agent advertises no config option under this id.
+    #[error("agent '{agent}' advertises no config option '{id}'{}", if known.is_empty() { "; it advertises none".to_string() } else { format!(" (known: {})", known.join(", ")) })]
+    UnknownConfigOption {
+        /// Agent config key.
+        agent: String,
+        /// The rejected config option id.
+        id: String,
+        /// Option ids the agent advertised.
+        known: Vec<String>,
+    },
+
+    /// The config option exists but the agent advertises no values for it.
+    #[error(
+        "agent '{agent}' advertises no values for config option '{id}'; cannot check '{value}'"
+    )]
+    ConfigOptionValuesMissing {
+        /// Agent config key.
+        agent: String,
+        /// The config option id.
+        id: String,
+        /// The requested value.
+        value: String,
+    },
+
+    /// The requested value is not among the option's advertised values.
+    #[error("unknown value '{value}' for config option '{id}' on agent '{agent}' (valid: {})", .valid.join(", "))]
+    UnknownConfigValue {
+        /// Agent config key.
+        agent: String,
+        /// The config option id.
+        id: String,
+        /// The rejected value.
+        value: String,
+        /// Values the agent advertised.
+        valid: Vec<String>,
+    },
+
     /// The registry file exists but does not parse.
     #[error("cannot parse {path}: {source}")]
     RegistryParse {

@@ -106,6 +106,20 @@ impl ClientHandler for SubagentHandler {
             warn!(subagent = %self.rt.session_label(), %error, "transcript append failed");
         }
         let mut inner = self.rt.inner.lock().expect("inner poisoned");
+        // Mode and config updates are agent-reported session state, not
+        // turn data: they apply even when no turn is open (e.g. during the
+        // launch handshake, where `set_mode` is answered by an update).
+        match &notification.update {
+            SessionUpdate::CurrentModeUpdate(mode) => {
+                if let Some(modes) = inner.modes.as_mut() {
+                    modes.current_mode_id.clone_from(&mode.current_mode_id);
+                }
+            }
+            SessionUpdate::ConfigOptionUpdate(update) => {
+                inner.config_options.clone_from(&update.config_options);
+            }
+            _ => {}
+        }
         let Some(turn) = inner.current.as_mut() else {
             return;
         };

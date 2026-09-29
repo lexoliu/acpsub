@@ -34,6 +34,11 @@ current one ends (agents that serialize prompts instead of injecting).
 session/cancel answers the pending prompt (and every steer) with
 stopReason cancelled.
 FAKE_NO_LOAD=1 in the environment makes the agent not advertise loadSession.
+FAKE_NO_MODES=1 makes session/new and session/load return no mode list.
+FAKE_NO_OPTIONS=1 makes the advertised `model` config option carry no
+selectable values.
+FAKE_MODE_IGNORED=1 makes session/set_mode a no-op: the call succeeds but
+the session's mode — reported by the `mode` config option — never changes.
 Session ids are `sess-<pid>-<n>` so concurrently spawned agents never
 collide.
 """
@@ -69,6 +74,8 @@ steered = []        # request ids of prompts injected mid-turn
 queued = []         # (request_id, text) parked in FAKE_QUEUE_PROMPTS mode
 session_id = ""
 session_count = 0
+current_mode = "default"  # the mode the session is actually in
+current_model = "a"       # the model the session is actually using
 next_req = 0
 outbound = {}       # request id -> kind: perm | fs | fsw | term-create |
                     #   term-kill-create | term-kill | term-wait |
@@ -245,6 +252,58 @@ def begin_turn(request_id, text):
     finish_prompt()
 
 
+def session_modes():
+    """Modes advertised in session/new and session/load; FAKE_NO_MODES=1
+    omits the list."""
+    if os.environ.get("FAKE_NO_MODES") == "1":
+        return None
+    return {
+        "currentModeId": current_mode,
+        "availableModes": [
+            {"id": "default", "name": "Default"},
+            {"id": "bypass", "name": "Bypass"},
+        ],
+    }
+
+
+def session_config_options():
+    """Config options advertised in session/new and session/load, with the
+    values currently in effect; FAKE_NO_OPTIONS=1 gives `model` no
+    selectable values."""
+    model = {
+        "id": "model",
+        "name": "Model",
+        "type": "select",
+        "category": "model",
+        "currentValue": current_model,
+    }
+    if os.environ.get("FAKE_NO_OPTIONS") != "1":
+        model["options"] = [
+            {"value": "a", "name": "A"},
+            {"value": "b", "name": "B"},
+        ]
+    mode = {
+        "id": "mode",
+        "name": "Mode",
+        "type": "select",
+        "category": "mode",
+        "currentValue": current_mode,
+        "options": [
+            {"value": "default", "name": "Default"},
+            {"value": "bypass", "name": "Bypass"},
+        ],
+    }
+    return [model, mode]
+
+
+def session_result(request_id, result):
+    modes = session_modes()
+    if modes is not None:
+        result["modes"] = modes
+    result["configOptions"] = session_config_options()
+    respond(request_id, result)
+
+
 def on_prompt(request_id, params):
     global session_id
     session_id = params.get("sessionId", session_id)
@@ -387,31 +446,7 @@ for line in sys.stdin:
         elif method == "session/new":
             session_count += 1
             session_id = f"sess-{os.getpid()}-{session_count}"
-            respond(
-                request_id,
-                {
-                    "sessionId": session_id,
-                    "modes": {
-                        "currentModeId": "default",
-                        "availableModes": [
-                            {"id": "default", "name": "Default"},
-                            {"id": "bypass", "name": "Bypass"},
-                        ],
-                    },
-                    "configOptions": [
-                        {
-                            "id": "model",
-                            "name": "Model",
-                            "type": "select",
-                            "currentValue": "a",
-                            "options": [
-                                {"value": "a", "name": "A"},
-                                {"value": "b", "name": "B"},
-                            ],
-                        }
-                    ],
-                },
-            )
+            session_result(request_id, {"sessionId": session_id})
         elif method == "session/load":
             session_id = params.get("sessionId", session_id)
             update(
@@ -421,32 +456,29 @@ for line in sys.stdin:
                     "content": {"type": "text", "text": "loaded user message"},
                 },
             )
-            respond(
-                request_id,
-                {
-                    "modes": {
-                        "currentModeId": "default",
-                        "availableModes": [{"id": "default", "name": "Default"}],
-                    }
-                },
-            )
+            session_result(request_id, {})
         elif method == "session/set_mode":
+            # FAKE_MODE_IGNORED=1 accepts the call but never switches mode:
+            # no update is sent and the `mode` config option keeps reporting
+            # the mode the session actually runs. Otherwise the accepted
+            # mode is applied and reported like a real agent — a
+            # current_mode_update ahead of the (empty) response.
+            if os.environ.get("FAKE_MODE_IGNORED") != "1":
+                current_mode = params["modeId"]
+                update(
+                    session_id,
+                    {
+                        "sessionUpdate": "current_mode_update",
+                        "currentModeId": current_mode,
+                    },
+                )
             respond(request_id, {})
         elif method == "session/set_config_option":
-            respond(
-                request_id,
-                {
-                    "configOptions": [
-                        {
-                            "id": params["configId"],
-                            "name": "Model",
-                            "type": "select",
-                            "currentValue": params["value"],
-                            "options": [],
-                        }
-                    ]
-                },
-            )
+            if params["configId"] == "model":
+                current_model = params["value"]
+            elif params["configId"] == "mode":
+                current_mode = params["value"]
+            respond(request_id, {"configOptions": session_config_options()})
         elif method == "session/prompt":
             on_prompt(request_id, params)
         else:
