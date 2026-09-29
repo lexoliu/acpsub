@@ -78,8 +78,8 @@ file that fails to parse is a tool error, never a stale fallback.
 | `spawn` | `cwd, prompt, model, mode, agent?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. |
 | `adopt` | `session_id, model, mode, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, or an external one such as a Devin session created elsewhere. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
 | `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not surface an error), returning `{state: "steered", turn}`. On a promptable subagent all three just start the turn: `{state: "running"}`. |
-| `wait` | `session_id, timeout_secs` (default 600, min 60, max 3600; prefer 300–1800) | Block until the turn ends, a permission is needed, or the timeout. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?}`. |
-| `wait_any` | `session_ids, timeout_secs` | First of them to leave `running`. |
+| `wait` | `session_id, expect_secs` | Block until the turn ends, a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?}`; a turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. |
+| `wait_any` | `session_ids, expect_secs` | First of them to leave `running` — a turn end, a permission request, or an `overrun`. |
 | `status` | `session_id` | State, cwd, agent, model, mode, turns, queued prompts, transcript path — instant check. |
 | `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
 | `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
@@ -99,11 +99,13 @@ for unknown ones it asks the agent's session database (`sessions_db`) for the
 session's working directory, and errors asking for an explicit `cwd` when the
 lookup finds nothing.
 
-The wait is event-driven: a long `timeout_secs` costs nothing while the
-subagent runs and returns early on any state change, but every expiry costs
-the orchestrator a model turn to re-issue the wait on a still-`running`
-result. Prefer 300–1800s (5–30 min), staying under the 30-min prompt-cache
-TTL. Timeouts under 60s are rejected — use `status` for an instant check.
+The wait is event-driven and returns early on any state change, so
+`expect_secs` is an honest expectation of the turn's duration, not a cap
+on how long you are willing to block. When a turn outlives it the result
+is `overrun` with the turn's elapsed time and latest tool call — an
+overrun is a signal to investigate (`status`, `transcript`, a `send`
+steer), never to re-wait with a larger number. For an instant check use
+`status`.
 
 ## Model
 
@@ -111,7 +113,9 @@ TTL. Timeouts under 60s are rejected — use `status` for an instant check.
   addressed by its `session_id`. States: `idle | running | needs_permission |
   done(stop_reason) | cancelled | failed | closed`.
 - **Registry** (`registry.json`): `session_id → {agent, cwd, created,
-  last_turn, turns}`, written atomically. `adopt` on a registered (or
+  last_turn, turn_started?, turns}`, written atomically. `turn_started` is
+  set while a turn is in flight — it is the base `expect_secs` measures
+  from. `adopt` on a registered (or
   externally created) session id whose agent advertised `loadSession` runs
   `session/load` to resume it.
 - **Transcript**: every `session/update`, prompt, and turn end is appended to

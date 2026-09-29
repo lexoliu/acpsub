@@ -196,10 +196,15 @@ pub struct ToolCallSummary {
 pub struct Turn {
     /// 1-based turn number.
     pub n: u64,
+    /// Wall-clock start — recorded in the registry as `turn_started` and
+    /// the base `wait`'s `expect_secs` is measured from.
+    pub started_at: Option<jiff::Timestamp>,
     /// Concatenated `agent_message_chunk` text — the turn's reply.
     pub reply: String,
     /// Tool calls by id.
     pub tool_calls: BTreeMap<String, ToolCallSummary>,
+    /// Id of the tool call most recently seen in an update.
+    pub latest_tool_call: Option<String>,
     /// Latest plan entries.
     pub plan: Vec<PlanEntry>,
     /// Latest mode id seen in `current_mode_update`.
@@ -241,6 +246,11 @@ pub struct Inner {
     pub turns: Vec<Turn>,
     /// The running turn, if any.
     pub current: Option<Turn>,
+    /// Start recorded for a turn whose slot was reserved by a queue pop
+    /// (`settle_turn`/`steer_resolved`) but whose `begin_turn` has not run
+    /// yet — the status is `Running` throughout the gap, so `wait`'s
+    /// `expect_secs` budget measures from it until `current` exists.
+    pub pending_turn_start: Option<jiff::Timestamp>,
     /// Permission requests awaiting `permit`, oldest first.
     pub pending: Vec<PendingPermission>,
     /// Prompts parked by `send` with `policy: "queued"`, oldest first. Fired
@@ -471,6 +481,7 @@ async fn launch_inner(
             turn_offset: 0,
             turns: Vec::new(),
             current: None,
+            pending_turn_start: None,
             pending: Vec::new(),
             queue: VecDeque::new(),
             steer_pending: VecDeque::new(),
@@ -745,6 +756,7 @@ async fn handshake(
                     cwd: cwd.clone(),
                     created: now(),
                     last_turn: None,
+                    turn_started: None,
                     turns: 0,
                 },
             ),
@@ -969,7 +981,7 @@ pub(crate) fn prompt_slot_free(inner: &Inner) -> bool {
 /// Panics if a state mutex is poisoned.
 pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: String) -> Result<()> {
     let _wire = sub.rt.prompt_send.lock().await;
-    let (turn_n, fut) = begin_turn(sub, prompt, Gate::Check, false).await?;
+    let (turn_n, fut) = begin_turn(&state, sub, prompt, Gate::Check, false).await?;
     spawn_turn_task(state, sub, fut, turn_n);
     Ok(())
 }
@@ -1000,11 +1012,13 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
 ///
 /// Panics if a state mutex is poisoned.
 pub(crate) async fn begin_turn(
+    state: &Arc<AppState>,
     sub: &Arc<Subagent>,
     prompt: String,
     gate: Gate,
     queued: bool,
 ) -> Result<(u64, PromptFut)> {
+    let started = jiff::Timestamp::now();
     let turn_n = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         let ready = match gate {
@@ -1025,8 +1039,10 @@ pub(crate) async fn begin_turn(
         let n = inner.turn_offset + inner.turns.len() as u64 + 1;
         inner.current = Some(Turn {
             n,
+            started_at: Some(started),
             ..Turn::default()
         });
+        inner.pending_turn_start = None;
         inner.status = Status::Running;
         n
     };
@@ -1041,6 +1057,18 @@ pub(crate) async fn begin_turn(
         drop(inner);
         sub.rt.notify.notify_waiters();
         return Err(Error::io("cannot write transcript", source));
+    }
+    // The registry records the turn's start: `wait`'s `expect_secs` budget
+    // is measured from it and survives a server restart.
+    if let Err(error) = state
+        .update_registry(|registry| {
+            if let Some(entry) = registry.get_mut(&sub.session_id) {
+                entry.turn_started = Some(started.to_string());
+            }
+        })
+        .await
+    {
+        warn!(%error, "registry persist failed");
     }
     sub.rt.notify.notify_waiters();
 
@@ -1196,6 +1224,7 @@ pub(crate) async fn steer_resolved(
             && !inner.queue.is_empty();
         let prompt = if kick {
             inner.status = Status::Running;
+            inner.pending_turn_start = Some(jiff::Timestamp::now());
             inner.queue.pop_front()
         } else {
             None
@@ -1266,6 +1295,10 @@ fn settle_turn(rt: &SubRuntime, reason: StopReason) -> (Option<String>, VecDeque
     } else if inner.steer_pending.is_empty()
         && let Some(next) = inner.queue.pop_front()
     {
+        // The chained turn's slot is reserved now; `begin_turn` stamps its
+        // own start. `Running` must never lack a recorded start — `wait`'s
+        // budget would otherwise have nothing to measure from.
+        inner.pending_turn_start = Some(jiff::Timestamp::now());
         (Some(next), VecDeque::new())
     } else {
         inner.status = Status::Done(reason);
@@ -1328,7 +1361,7 @@ fn spawn_chained(
     tokio::spawn(async move {
         let _wire = wire;
         match state.get(&session_id) {
-            Ok(sub) => match begin_turn(&sub, prompt, Gate::Chained, true).await {
+            Ok(sub) => match begin_turn(&state, &sub, prompt, Gate::Chained, true).await {
                 Ok((n, fut)) => spawn_turn_task(state, &sub, fut, n),
                 Err(error) => warn!(%error, "queued turn failed to start"),
             },
@@ -1404,6 +1437,7 @@ async fn finish_turn(
             if let Some(entry) = registry.get_mut(&session_id) {
                 entry.turns = turns;
                 entry.last_turn = Some(now());
+                entry.turn_started = None;
             }
         })
         .await;

@@ -84,8 +84,10 @@ impl ClientHandler for SubagentHandler {
                 let n = inner.turn_offset + inner.turns.len() as u64 + 1;
                 inner.current = Some(Turn {
                     n,
+                    started_at: Some(jiff::Timestamp::now()),
                     ..Turn::default()
                 });
+                inner.pending_turn_start = None;
                 inner.steer_owner = inner.steer_pending.front().copied();
                 inner.status = Status::Running;
             }
@@ -130,6 +132,7 @@ impl ClientHandler for SubagentHandler {
                 }
             }
             SessionUpdate::ToolCall(call) => {
+                turn.latest_tool_call = Some(call.tool_call_id.clone());
                 turn.tool_calls.insert(
                     call.tool_call_id.clone(),
                     ToolCallSummary {
@@ -142,6 +145,7 @@ impl ClientHandler for SubagentHandler {
                 );
             }
             SessionUpdate::ToolCallUpdate(update) => {
+                turn.latest_tool_call = Some(update.tool_call_id.clone());
                 let entry = turn
                     .tool_calls
                     .entry(update.tool_call_id.clone())
