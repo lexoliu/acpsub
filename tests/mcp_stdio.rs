@@ -42,6 +42,12 @@ impl Server {
 
     /// Send a request and read lines until its response arrives.
     fn request(&mut self, method: &str, params: &Value) -> Value {
+        self.request_notified(method, params).0
+    }
+
+    /// Send a request and read lines until its response arrives, collecting
+    /// every notification seen meanwhile.
+    fn request_notified(&mut self, method: &str, params: &Value) -> (Value, Vec<Value>) {
         let id = self.next_id;
         self.next_id += 1;
         let request = json!({
@@ -52,12 +58,16 @@ impl Server {
         });
         writeln!(self.stdin, "{request}").expect("write request");
         self.stdin.flush().expect("flush");
+        let mut notifications = Vec::new();
         loop {
             let mut line = String::new();
             self.stdout.read_line(&mut line).expect("read response");
             let msg: Value = serde_json::from_str(line.trim()).expect("response is json");
             if msg.get("id").and_then(Value::as_i64) == Some(id) {
-                return msg;
+                return (msg, notifications);
+            }
+            if msg.get("method").is_some() {
+                notifications.push(msg);
             }
         }
     }
@@ -181,4 +191,103 @@ args = ["{script}"]
     let list = server.request("tools/call", &json!({"name": "list", "arguments": {}}));
     let list = tool_json(&list);
     assert_eq!(list["subagents"][0]["session_id"], session_id);
+}
+
+/// A `tools/call` carrying `_meta.progressToken` gets `notifications/progress`
+/// on the wire while `wait` blocks — the keep-alive MCP hosts need.
+#[test]
+fn mcp_wait_reports_progress() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[defaults]
+permission = "allow"
+transcript_dir = "{dir}/transcripts"
+registry = "{dir}/registry.json"
+
+[agents.fake]
+command = "python3"
+args = ["{script}"]
+"#,
+            dir = dir.path().display(),
+            script = fake_agent_script().display(),
+        ),
+    )
+    .unwrap();
+
+    let mut server = Server::spawn(&config);
+    server.request(
+        "initialize",
+        &json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "e2e", "version": "0"},
+        }),
+    );
+    server.notify("notifications/initialized");
+
+    // The fake agent's "wait" turn never completes: the wait returns on
+    // its own `expect_secs` overrun, having reported meanwhile. The
+    // production interval is 10 s, so 12 s sees the first report and the
+    // first interval repeat.
+    let spawned = server.request(
+        "tools/call",
+        &json!({
+            "name": "spawn",
+            "arguments": {"cwd": dir.path(), "prompt": "wait", "model": "b", "mode": "bypass"},
+        }),
+    );
+    let session_id = tool_json(&spawned)["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let (waited, notifications) = server.request_notified(
+        "tools/call",
+        &json!({
+            "name": "wait",
+            "arguments": {"session_id": session_id, "expect_secs": 12},
+            "_meta": {"progressToken": "tok-1"},
+        }),
+    );
+
+    let progress: Vec<&Value> = notifications
+        .iter()
+        .filter(|msg| msg["method"] == "notifications/progress")
+        .collect();
+    assert!(
+        progress.len() >= 2,
+        "expected the first report and an interval repeat, got {notifications:?}"
+    );
+    let values: Vec<f64> = progress
+        .iter()
+        .map(|msg| msg["params"]["progress"].as_f64().expect("progress"))
+        .collect();
+    assert!(
+        values.windows(2).all(|w| w[1] > w[0]),
+        "progress must increase: {values:?}"
+    );
+    for msg in &progress {
+        assert_eq!(msg["params"]["progressToken"], "tok-1", "{msg}");
+        assert_eq!(msg["params"]["total"].as_f64(), Some(12.0), "{msg}");
+        let message = msg["params"]["message"].as_str().expect("message");
+        assert!(message.contains(&session_id), "{message}");
+    }
+    // The first report can precede the agent's tool_call update; later ones
+    // carry its title.
+    assert!(
+        progress.iter().any(|msg| msg["params"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("fake-tool"))),
+        "no message names the latest tool call: {progress:?}"
+    );
+    let waited = tool_json(&waited);
+    assert_eq!(waited["state"], "overrun", "{waited}");
 }

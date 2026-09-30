@@ -25,5 +25,5 @@ pub use config::{AgentConfig, Config, Defaults, PermissionPolicy, default_config
 pub use error::{Error, Result};
 pub use registry::{Registry, RegistryEntry};
 pub use state::{AppState, Status, Subagent};
-pub use tools::build_tools;
+pub use tools::{build_tools, build_tools_with_progress_interval};
 pub use transcript::{RenderOptions, TranscriptWriter, render};

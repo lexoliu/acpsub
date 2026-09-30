@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use aither_acp::{ConfigOption, ConfigOptionValue, ConfigSelectOptions, RequestPermissionOutcome};
-use aither_core::llm::tool::{Tool, Tools};
+use aither_core::llm::tool::{Progress, Tool, ToolContext, Tools};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,10 +29,31 @@ use crate::transcript::{RenderOptions, render};
 
 /// `wait_any` polls the named subagents this often.
 const WAIT_ANY_POLL: Duration = Duration::from_millis(50);
+/// How often `wait`/`wait_any` report progress to the caller while
+/// blocked.
+///
+/// MCP hosts abandon a `tools/call` that produces neither a response nor
+/// progress — Claude Code aborts one after 1800 s of silence — so the
+/// interval sits far below that limit: frequent enough that the request is
+/// never anywhere near idle, sparse enough that the notifications stay
+/// noise.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 /// How long `send` waits for a synchronous rejection of a steer before
 /// reporting `steered`; an accepted steer resolves only at turn end, so a
 /// longer wait would just stall the caller.
 const STEER_ACK: Duration = Duration::from_millis(250);
+/// Largest `expect_secs` a `wait`/`wait_any` accepts when the call has no
+/// progress channel — [`ToolContext::is_listening`] is false.
+///
+/// The MCP progress specification ties `notifications/progress` to the
+/// request's `progressToken`, so a call without one has no keep-alive: it
+/// produces nothing on the wire until it returns, and a host abandons a
+/// `tools/call` idle for 1800 s (Claude Code's limit). 600 s stays far
+/// below that — the call returns long before even a stricter host would
+/// give up — while an expectation beyond it could never come back and is
+/// rejected up front.
+/// <https://modelcontextprotocol.io/specification/2025-06-18/basic/utilities/progress>
+const NO_LISTENER_EXPECT_LIMIT: u64 = 600;
 
 /// Build the full tool set over `state`.
 ///
@@ -41,12 +62,33 @@ const STEER_ACK: Duration = Duration::from_millis(250);
 /// Returns an error if a tool fails to register (duplicate name or empty
 /// description — both would be a bug in this crate).
 pub fn build_tools(state: Arc<AppState>) -> aither_core::Result<Tools> {
+    build_tools_with_progress_interval(state, PROGRESS_INTERVAL)
+}
+
+/// [`build_tools`] with an explicit report interval: the seam tests
+/// inject a short interval through — production callers use
+/// [`build_tools`], which reports every [`PROGRESS_INTERVAL`].
+///
+/// # Errors
+///
+/// Returns an error if a tool fails to register (duplicate name or empty
+/// description — both would be a bug in this crate).
+pub fn build_tools_with_progress_interval(
+    state: Arc<AppState>,
+    progress_interval: Duration,
+) -> aither_core::Result<Tools> {
     let mut tools = Tools::new();
     tools.register(SpawnTool(state.clone()))?;
     tools.register(AdoptTool(state.clone()))?;
     tools.register(SendTool(state.clone()))?;
-    tools.register(WaitTool(state.clone()))?;
-    tools.register(WaitAnyTool(state.clone()))?;
+    tools.register(WaitTool {
+        state: state.clone(),
+        interval: progress_interval,
+    })?;
+    tools.register(WaitAnyTool {
+        state: state.clone(),
+        interval: progress_interval,
+    })?;
     tools.register(StatusTool(state.clone()))?;
     tools.register(ResultTool(state.clone()))?;
     tools.register(CancelTool(state.clone()))?;
@@ -73,17 +115,16 @@ fn spawned_view(sub: &Subagent) -> Value {
     })
 }
 
-/// Seconds until the running turn's `expect_secs` budget is spent —
-/// negative once it has passed; `None` when the subagent is not running.
-/// A `running` subagent always has a recorded start — the current turn's
-/// `started_at`, or a just-chained turn's `pending_turn_start` — so a
-/// missing one is a broken invariant, never a case to wait through
-/// unbounded.
+/// Seconds the running turn has been going; `None` when the subagent is
+/// not running. A `running` subagent always has a recorded start — the
+/// current turn's `started_at`, or a just-chained turn's
+/// `pending_turn_start` — so a missing one is a broken invariant, never a
+/// case to wait through unbounded.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Internal`] when the invariant is violated.
-fn turn_budget_remaining(sub: &Subagent, expect_secs: u64) -> Result<Option<f64>> {
+fn turn_elapsed(sub: &Subagent) -> Result<Option<f64>> {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
     if !matches!(inner.status, Status::Running) {
         return Ok(None);
@@ -100,16 +141,58 @@ fn turn_budget_remaining(sub: &Subagent, expect_secs: u64) -> Result<Option<f64>
         });
     };
     drop(inner);
-    let elapsed = jiff::Timestamp::now().duration_since(started).as_secs_f64();
+    Ok(Some(
+        jiff::Timestamp::now().duration_since(started).as_secs_f64(),
+    ))
+}
+
+/// The progress report a blocked wait sends for `sub`: `progress` is the
+/// turn's elapsed seconds against `total = expect_secs`, and the message
+/// names the session and its latest tool call title.
+fn wait_progress(sub: &Subagent, elapsed: f64, expect_secs: u64) -> Progress {
+    let title = {
+        let inner = sub.rt.inner.lock().expect("inner poisoned");
+        inner.current.as_ref().and_then(|turn| {
+            turn.latest_tool_call
+                .as_ref()
+                .and_then(|id| turn.tool_calls.get(id))
+                .map(|call| call.title.clone())
+        })
+    };
+    let message = title.map_or_else(
+        || sub.session_id.clone(),
+        |title| format!("{}: {title}", sub.session_id),
+    );
     #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
-    Ok(Some(expect_secs as f64 - elapsed))
+    Progress::new(elapsed)
+        .with_total(expect_secs as f64)
+        .with_message(message)
+}
+
+/// Reject a blocked wait that could never return: without a progress
+/// listener the call stays silent until it returns, and a host abandons a
+/// silent `tools/call` long before an expectation beyond
+/// [`NO_LISTENER_EXPECT_LIMIT`] plays out.
+///
+/// # Errors
+///
+/// Returns [`Error::ExpectExceedsNoToken`] when `!cx.is_listening()` and
+/// `expect_secs` exceeds the ceiling.
+const fn check_expect(cx: &ToolContext, expect_secs: u64) -> Result<()> {
+    if !cx.is_listening() && expect_secs > NO_LISTENER_EXPECT_LIMIT {
+        return Err(Error::ExpectExceedsNoToken {
+            expect_secs,
+            ceiling_secs: NO_LISTENER_EXPECT_LIMIT,
+        });
+    }
+    Ok(())
 }
 
 /// A `wait`-style result for one subagent. `overrun` marks that the turn
 /// outlived `expect_secs`: the result reports `overrun`, the turn's own
 /// elapsed time, and its latest tool call.
 fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
-    let (status, reply, tool_calls, pending, turn_n, queued, turn_elapsed, latest) = {
+    let (status, reply, tool_calls, pending, turn_n, queued, elapsed, latest) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
         let turn = inner.current.as_ref().or_else(|| inner.turns.last());
         let pending = inner.pending.first().map(|perm| {
@@ -158,7 +241,7 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
     });
     if overrun {
         view["state"] = json!("overrun");
-        if let Some(elapsed) = turn_elapsed {
+        if let Some(elapsed) = elapsed {
             view["elapsed_secs"] = json!(elapsed);
         }
         if let Some(latest) = latest {
@@ -262,7 +345,7 @@ impl Tool for SpawnTool {
     type Arguments = SpawnArgs;
     type Res = Value;
 
-    async fn call(&self, args: SpawnArgs) -> aither_core::Result<Value> {
+    async fn call(&self, args: SpawnArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let config = self.0.load_config()?;
         let (agent, _) = config.resolve_agent(args.agent.as_deref())?;
         let sub = launch(
@@ -327,7 +410,7 @@ impl Tool for AdoptTool {
     type Arguments = AdoptArgs;
     type Res = Value;
 
-    async fn call(&self, args: AdoptArgs) -> aither_core::Result<Value> {
+    async fn call(&self, args: AdoptArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let registered = self
             .0
             .registry
@@ -444,7 +527,7 @@ impl Tool for SendTool {
     type Arguments = SendArgs;
     type Res = Value;
 
-    async fn call(&self, args: SendArgs) -> aither_core::Result<Value> {
+    async fn call(&self, args: SendArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let sub = self.0.get(&args.session_id)?;
         match args.policy {
             SendPolicy::Try => {
@@ -578,7 +661,10 @@ struct WaitArgs {
     expect_secs: u64,
 }
 
-struct WaitTool(Arc<AppState>);
+struct WaitTool {
+    state: Arc<AppState>,
+    interval: Duration,
+}
 
 impl Tool for WaitTool {
     fn name(&self) -> Cow<'static, str> {
@@ -587,17 +673,31 @@ impl Tool for WaitTool {
     type Arguments = WaitArgs;
     type Res = Value;
 
-    async fn call(&self, args: WaitArgs) -> aither_core::Result<Value> {
-        let sub = self.0.get(&args.session_id)?;
+    async fn call(&self, args: WaitArgs, mut cx: ToolContext) -> aither_core::Result<Value> {
+        check_expect(&cx, args.expect_secs)?;
+        let sub = self.state.get(&args.session_id)?;
         let started = Instant::now();
+        #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
+        let expect = args.expect_secs as f64;
+        let interval = self.interval;
+        let mut next_report = started;
         let overrun = loop {
-            match turn_budget_remaining(&sub, args.expect_secs)? {
+            match turn_elapsed(&sub)? {
                 None => break false,
-                Some(remaining) if remaining <= 0.0 => break true,
-                Some(remaining) => {
+                Some(elapsed) if elapsed >= expect => break true,
+                Some(elapsed) => {
+                    let now = Instant::now();
+                    if now >= next_report {
+                        cx.report_progress(wait_progress(&sub, elapsed, args.expect_secs))
+                            .await?;
+                        next_report = now + interval;
+                    }
+                    let wake = (expect - elapsed)
+                        .min(0.25)
+                        .min(next_report.saturating_duration_since(now).as_secs_f64());
                     tokio::select! {
                         () = sub.rt.notify.notified() => {},
-                        () = tokio::time::sleep(Duration::from_secs_f64(remaining.min(0.25))) => {},
+                        () = tokio::time::sleep(Duration::from_secs_f64(wake)) => {},
                     }
                 }
             }
@@ -620,7 +720,10 @@ struct WaitAnyArgs {
     expect_secs: u64,
 }
 
-struct WaitAnyTool(Arc<AppState>);
+struct WaitAnyTool {
+    state: Arc<AppState>,
+    interval: Duration,
+}
 
 impl Tool for WaitAnyTool {
     fn name(&self) -> Cow<'static, str> {
@@ -629,27 +732,46 @@ impl Tool for WaitAnyTool {
     type Arguments = WaitAnyArgs;
     type Res = Value;
 
-    async fn call(&self, args: WaitAnyArgs) -> aither_core::Result<Value> {
+    async fn call(&self, args: WaitAnyArgs, mut cx: ToolContext) -> aither_core::Result<Value> {
+        check_expect(&cx, args.expect_secs)?;
         let subs = args
             .session_ids
             .iter()
-            .map(|session_id| self.0.get(session_id))
+            .map(|session_id| self.state.get(session_id))
             .collect::<Result<Vec<_>>>()?;
         let started = Instant::now();
+        #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
+        let expect = args.expect_secs as f64;
+        let interval = self.interval;
+        let mut next_report = started;
         loop {
             let mut poll = WAIT_ANY_POLL;
+            // Report the longest-running watched turn: it is the one a
+            // host-side idle timer would be most anxious about.
+            let mut longest: Option<(f64, &Arc<Subagent>)> = None;
             for sub in &subs {
-                match turn_budget_remaining(sub, args.expect_secs)? {
+                match turn_elapsed(sub)? {
                     None => return Ok(wait_view(sub, started, false)),
-                    Some(remaining) if remaining <= 0.0 => {
+                    Some(elapsed) if elapsed >= expect => {
                         return Ok(wait_view(sub, started, true));
                     }
-                    Some(remaining) => {
-                        poll = poll.min(Duration::from_secs_f64(remaining));
+                    Some(elapsed) => {
+                        poll = poll.min(Duration::from_secs_f64(expect - elapsed));
+                        if longest.is_none_or(|(max, _)| elapsed > max) {
+                            longest = Some((elapsed, sub));
+                        }
                     }
                 }
             }
-            tokio::time::sleep(poll).await;
+            let now = Instant::now();
+            if now >= next_report
+                && let Some((elapsed, sub)) = longest
+            {
+                cx.report_progress(wait_progress(sub, elapsed, args.expect_secs))
+                    .await?;
+                next_report = now + interval;
+            }
+            tokio::time::sleep(poll.min(next_report.saturating_duration_since(now))).await;
         }
     }
 }
@@ -675,7 +797,11 @@ impl Tool for StatusTool {
     type Arguments = StatusArgs;
     type Res = Value;
 
-    fn call(&self, args: StatusArgs) -> impl Future<Output = aither_core::Result<Value>> + Send {
+    fn call(
+        &self,
+        args: StatusArgs,
+        _cx: ToolContext,
+    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
         std::future::ready(self.status(args).map_err(Into::into))
     }
 }
@@ -768,7 +894,11 @@ impl Tool for ResultTool {
     type Arguments = ResultArgs;
     type Res = Value;
 
-    fn call(&self, args: ResultArgs) -> impl Future<Output = aither_core::Result<Value>> + Send {
+    fn call(
+        &self,
+        args: ResultArgs,
+        _cx: ToolContext,
+    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
         std::future::ready(self.result(&args).map_err(Into::into))
     }
 }
@@ -833,7 +963,7 @@ impl Tool for CancelTool {
     type Arguments = CancelArgs;
     type Res = Value;
 
-    async fn call(&self, args: CancelArgs) -> aither_core::Result<Value> {
+    async fn call(&self, args: CancelArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let sub = self.0.get(&args.session_id)?;
         let (dropped, turn_n) = {
             let mut inner = sub.rt.inner.lock().expect("inner poisoned");
@@ -851,7 +981,7 @@ impl Tool for CancelTool {
         record_queue_dropped(&sub.rt, turn_n, dropped).await;
         sub.rt.notify.notify_waiters();
         sub.client
-            .cancel(&sub.session_id)
+            .cancel(sub.session_id.as_str())
             .await
             .map_err(|source| Error::Agent {
                 agent: args.session_id.clone(),
@@ -884,7 +1014,11 @@ impl Tool for PermitTool {
     type Arguments = PermitArgs;
     type Res = Value;
 
-    fn call(&self, args: PermitArgs) -> impl Future<Output = aither_core::Result<Value>> + Send {
+    fn call(
+        &self,
+        args: PermitArgs,
+        _cx: ToolContext,
+    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
         std::future::ready(self.permit(&args).map_err(Into::into))
     }
 }
@@ -973,7 +1107,7 @@ impl Tool for TranscriptTool {
     type Arguments = TranscriptArgs;
     type Res = String;
 
-    async fn call(&self, args: TranscriptArgs) -> aither_core::Result<String> {
+    async fn call(&self, args: TranscriptArgs, _cx: ToolContext) -> aither_core::Result<String> {
         let path = match self
             .0
             .live
@@ -1051,7 +1185,11 @@ impl Tool for ListTool {
     type Arguments = ListArgs;
     type Res = Value;
 
-    fn call(&self, _args: ListArgs) -> impl Future<Output = aither_core::Result<Value>> + Send {
+    fn call(
+        &self,
+        _args: ListArgs,
+        _cx: ToolContext,
+    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
         std::future::ready(Ok(self.list()))
     }
 }
@@ -1098,7 +1236,7 @@ impl Tool for CloseTool {
     type Arguments = CloseArgs;
     type Res = Value;
 
-    async fn call(&self, args: CloseArgs) -> aither_core::Result<Value> {
+    async fn call(&self, args: CloseArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let sub = {
             self.0
                 .live
@@ -1143,7 +1281,7 @@ impl Tool for ForgetTool {
     type Arguments = ForgetArgs;
     type Res = Value;
 
-    async fn call(&self, args: ForgetArgs) -> aither_core::Result<Value> {
+    async fn call(&self, args: ForgetArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let sub = {
             self.0
                 .live
@@ -1181,7 +1319,11 @@ impl Tool for AgentsTool {
     type Arguments = AgentsArgs;
     type Res = Value;
 
-    fn call(&self, _args: AgentsArgs) -> impl Future<Output = aither_core::Result<Value>> + Send {
+    fn call(
+        &self,
+        _args: AgentsArgs,
+        _cx: ToolContext,
+    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
         std::future::ready(self.agents().map_err(Into::into))
     }
 }
