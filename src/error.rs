@@ -97,6 +97,18 @@ pub enum Error {
         status: String,
     },
 
+    /// A `wait`/`wait_any` expected longer than the ceiling for a call
+    /// without a progress channel.
+    #[error(
+        "expect_secs {expect_secs} exceeds the {ceiling_secs} s ceiling: the caller sent no progress token, so the call produces no keep-alive and the host would abandon it first"
+    )]
+    ExpectExceedsNoToken {
+        /// The requested `expect_secs`.
+        expect_secs: u64,
+        /// The ceiling it exceeded.
+        ceiling_secs: u64,
+    },
+
     /// The subagent has no running turn to cancel.
     #[error("session '{0}' has no running turn")]
     NotRunning(String),

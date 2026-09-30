@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use acpsub::config::AgentConfig;
 use acpsub::{AppState, Config};
-use aither_core::llm::tool::{ToolResult, Tools};
+use aither_core::llm::tool::{ToolContext, ToolResult, Tools};
 use serde_json::{Value, json};
 
 /// Path to the fake agent script.
@@ -151,14 +152,29 @@ pub fn test_state_full(
     let path = write_config(dir, default_agent, agents);
     let config = Config::load(&path).expect("config loads");
     let state = AppState::new(config, path).expect("app state");
-    let tools = acpsub::build_tools(state.clone()).expect("tools");
+    // The test-harness constructor: a short report interval so progress
+    // tests see several reports inside a test-length wait.
+    let tools =
+        acpsub::build_tools_with_progress_interval(state.clone(), Duration::from_millis(50))
+            .expect("tools");
     (state, tools)
 }
 
 /// Call a tool; errors surface as `Err(message)`.
 pub async fn call(tools: &Tools, name: &str, args: Value) -> Result<ToolResult, String> {
+    call_with(tools, name, args, ToolContext::new()).await
+}
+
+/// Call a tool with an explicit context — progress tests attach a
+/// listening sink.
+pub async fn call_with(
+    tools: &Tools,
+    name: &str,
+    args: Value,
+    cx: ToolContext,
+) -> Result<ToolResult, String> {
     tools
-        .call(name, &args.to_string())
+        .call(name, &args.to_string(), cx)
         .await
         .map_err(|error| error.to_string())
 }

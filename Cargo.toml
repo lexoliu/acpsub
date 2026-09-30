@@ -11,9 +11,9 @@ keywords = ["acp", "mcp", "agent", "subagent"]
 categories = ["api-bindings", "command-line-utilities"]
 
 [dependencies]
-aither-core = "0.3"
-aither-mcp = { version = "0.3", default-features = false, features = ["server", "client"] }
-aither-acp = "0.3"
+aither-core = "0.4"
+aither-mcp = { version = "0.4", default-features = false, features = ["server", "client"] }
+aither-acp = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1.2"
@@ -28,6 +28,18 @@ futures-lite = "2"
 async-process = "2"
 jiff = "0.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# aither's ToolContext (per-call progress reporting) is not released yet:
+# consume every aither crate from the exact upstream commit that lands it,
+# never a moving branch, until a release carries it.
+[patch.crates-io]
+aither-core = { git = "https://github.com/lexoliu/aither", rev = "01f728894d88d7aa263cbd118728aed1d48b6f6d" }
+aither-mcp = { git = "https://github.com/lexoliu/aither", rev = "01f728894d88d7aa263cbd118728aed1d48b6f6d" }
+aither-acp = { git = "https://github.com/lexoliu/aither", rev = "01f728894d88d7aa263cbd118728aed1d48b6f6d" }
+aither-agent = { git = "https://github.com/lexoliu/aither", rev = "01f728894d88d7aa263cbd118728aed1d48b6f6d" }
+aither-attachments = { git = "https://github.com/lexoliu/aither", rev = "01f728894d88d7aa263cbd118728aed1d48b6f6d" }
+aither-derive = { git = "https://github.com/lexoliu/aither", rev = "01f728894d88d7aa263cbd118728aed1d48b6f6d" }
+aither-sandbox = { git = "https://github.com/lexoliu/aither", rev = "01f728894d88d7aa263cbd118728aed1d48b6f6d" }
 
 [dev-dependencies]
 tempfile = "3"

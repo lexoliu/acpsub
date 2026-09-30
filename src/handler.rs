@@ -59,9 +59,11 @@ impl ClientHandler for SubagentHandler {
             fs: FileSystemCapability {
                 read_text_file: true,
                 write_text_file: true,
+                meta: None,
             },
             terminal: true,
             meta: None,
+            ..ClientCapabilities::default()
         }
     }
 

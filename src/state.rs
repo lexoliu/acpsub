@@ -11,8 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use aither_acp::{
     AcpClient, ClientError, ConfigOption, ConfigOptionValue, ConfigSelectOptions, ContentBlock,
-    Implementation, PlanEntry, PromptResult, RequestPermissionOutcome, SessionModeState,
-    StopReason, TextContent, ToolCall, ToolCallLocation, ToolCallStatus, ToolKind,
+    Implementation, InitializeResult, PlanEntry, PromptParams, PromptResult,
+    RequestPermissionOutcome, SessionLoadParams, SessionModeState, SessionNewParams,
+    SessionSetConfigOptionParams, SessionSetModeParams, StopReason, TextContent, ToolCall,
+    ToolCallLocation, ToolCallStatus, ToolKind,
 };
 use aither_mcp::transport::ChildProcessTransport;
 use serde::Serialize;
@@ -655,6 +657,33 @@ struct Accepted {
     mode: String,
 }
 
+/// `session/new` or `session/load` — the latter only when the agent
+/// advertised `loadSession`. Returns the session id and the modes and
+/// config options the agent advertised.
+async fn open_session(
+    client: &AcpClient<SubagentHandler>,
+    init: &InitializeResult,
+    args: &Launch,
+    agent_error: &(impl Fn(ClientError) -> Error + Sync),
+) -> Result<(String, Option<SessionModeState>, Option<Vec<ConfigOption>>)> {
+    if let Some(load) = &args.load {
+        if !init.agent_capabilities.load_session {
+            return Err(Error::LoadUnsupported(args.agent.clone()));
+        }
+        let result = client
+            .load_session(SessionLoadParams::new(load.clone(), args.cwd.clone()))
+            .await
+            .map_err(agent_error)?;
+        Ok((load.clone(), result.modes, result.config_options))
+    } else {
+        let result = client
+            .new_session(SessionNewParams::new(args.cwd.clone()))
+            .await
+            .map_err(agent_error)?;
+        Ok((result.session_id, result.modes, result.config_options))
+    }
+}
+
 /// `initialize`, `session/new` or `session/load`, `set_mode`, and the
 /// `set_config_option` calls; upserts the registry entry. Returns the
 /// session id and the model/mode the agent accepted.
@@ -669,22 +698,8 @@ async fn handshake(
         source,
     };
     let init = client.initialize().await.map_err(agent_error)?;
-    let (session_id, modes, config_options) = if let Some(load) = &args.load {
-        if !init.agent_capabilities.load_session {
-            return Err(Error::LoadUnsupported(args.agent.clone()));
-        }
-        let result = client
-            .load_session(load, args.cwd.clone(), vec![])
-            .await
-            .map_err(agent_error)?;
-        (load.clone(), result.modes, result.config_options)
-    } else {
-        let result = client
-            .new_session(args.cwd.clone(), vec![])
-            .await
-            .map_err(agent_error)?;
-        (result.session_id, result.modes, result.config_options)
-    };
+    let (session_id, modes, config_options) =
+        open_session(client, &init, args, &agent_error).await?;
     // Check every requested value against what the agent advertised before
     // applying anything: an unverifiable or unknown value fails the launch
     // and the process is closed by the caller, so no half-configured
@@ -707,7 +722,10 @@ async fn handshake(
         inner.turn_offset = turn_offset;
     }
     client
-        .set_mode(&session_id, &args.mode)
+        .set_mode(SessionSetModeParams::new(
+            session_id.clone(),
+            args.mode.clone(),
+        ))
         .await
         .map_err(agent_error)?;
     note_set_mode(
@@ -722,7 +740,11 @@ async fn handshake(
             ConfigValue::Toggle(value) => aither_acp::SessionConfigValue::from(value),
         };
         let updated = client
-            .set_config_option(&session_id, &id, value)
+            .set_config_option(SessionSetConfigOptionParams::new(
+                session_id.clone(),
+                id.clone(),
+                value,
+            ))
             .await
             .map_err(agent_error)?;
         // The option list the agent returns is what it accepted; the
@@ -1105,13 +1127,14 @@ async fn enqueue_prompt(
     let session_id = session_id.to_string();
     let mut prompt: PromptFut = Box::pin(async move {
         client
-            .prompt(
-                &session_id,
+            .prompt(PromptParams::new(
+                session_id,
                 vec![ContentBlock::Text(TextContent {
                     text: prompt,
                     annotations: None,
+                    meta: None,
                 })],
-            )
+            ))
             .await
     });
     let ready = futures_lite::future::poll_fn(|cx| match prompt.as_mut().poll(cx) {
