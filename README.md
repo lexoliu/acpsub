@@ -57,6 +57,11 @@ allow_outside_cwd = false                  # refuse fs/* paths outside cwd
 [agents.claude]
 command = "npx"
 args = ["-y", "@zed-industries/claude-code-acp"]
+
+[agents.codex]
+command = "codex-acp"
+steer = "folded"                         # folds a mid-turn prompt into the
+                                         # running turn and never answers it
 ```
 
 `~` expands in all paths. See `config.example.toml`.
@@ -77,7 +82,7 @@ file that fails to parse is a tool error, never a stale fallback.
 |---|---|---|
 | `spawn` | `cwd, prompt, model, mode, agent?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. |
 | `adopt` | `session_id, model, mode, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, or an external one such as a Devin session created elsewhere. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
-| `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not surface an error), returning `{state: "steered", turn}`. On a promptable subagent all three just start the turn: `{state: "running"}`. |
+| `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not surface an error; agents configured `steer = "folded"` never answer it and the steer settles folded at the turn's end), returning `{state: "steered", turn}`. On a promptable subagent all three just start the turn: `{state: "running"}`. |
 | `wait` | `session_id, expect_secs` | Block until the turn ends, a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?}`; a turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. |
 | `wait_any` | `session_ids, expect_secs` | First of them to leave `running` — a turn end, a permission request, or an `overrun`. |
 | `status` | `session_id` | State, cwd, agent, model, mode, turns, queued prompts, transcript path — instant check. |
@@ -133,6 +138,12 @@ steer), never to re-wait with a larger number. For an instant check use
   that serializes concurrent prompts rather than injecting them, a steer
   that lands behind the turn's end becomes a turn of its own — acpsub tracks
   it from the `session/update` traffic and holds the queue until it ends.
+  Some agents fold a mid-turn prompt into the running turn but never answer
+  its request (codex-acp); declare `steer = "folded"` for them so a steer
+  still pending when its target turn ends settles as folded — a
+  `steer_end: folded` transcript record — and stops blocking the session,
+  while one that landed behind the turn's end still runs and resolves as a
+  turn of its own.
 - **cwd boundary**: `fs/*` and `terminal/*` requests are refused outside the
   subagent's `cwd` unless the agent has `allow_outside_cwd = true`.
 

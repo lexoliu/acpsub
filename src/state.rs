@@ -22,7 +22,7 @@ use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::config::{AgentConfig, Config, ConfigValue, PermissionPolicy};
+use crate::config::{AgentConfig, Config, ConfigValue, PermissionPolicy, SteerSemantics};
 use crate::error::{Error, Result};
 use crate::handler::SubagentHandler;
 use crate::registry::{Registry, RegistryEntry, persist};
@@ -260,11 +260,21 @@ pub struct Inner {
     /// or fails, and on `cancel`/`close`/`forget`/agent disconnect.
     pub queue: VecDeque<String>,
     /// Ids of steered prompts whose `session/prompt` result is still in
-    /// flight, oldest first — the wire order their turns would run in. A
-    /// steer that lands after its target turn ended runs as a turn of its
-    /// own; the first untracked `session/update` materializes a `current`
-    /// for it (see `steer_owner`), and the queue holds until they resolve.
+    /// flight and still holds the prompt slot, oldest first — the wire
+    /// order their turns would run in. A steer that lands after its target
+    /// turn ended runs as a turn of its own; the first untracked
+    /// `session/update` materializes a `current` for it (see
+    /// `steer_owner`), and the queue holds until they resolve.
     pub steer_pending: VecDeque<u64>,
+    /// Steers settled as folded at their target turn's end whose
+    /// `session/prompt` response is still outstanding, oldest first —
+    /// always older than every `steer_pending` id. Only a
+    /// [`SteerSemantics::Folded`] agent produces these; the contract says
+    /// they never resolve — but when one was actually a late arrival that
+    /// runs as a turn of its own, the first untracked `session/update`
+    /// still materializes a `current` owned by it and its response
+    /// settles that turn.
+    pub steer_folded: VecDeque<u64>,
     /// The pending steer that owns the materialized `current` turn — set
     /// when `current` was not opened by a `send`/`spawn`/`adopt` prompt but
     /// synthesized for untracked `session/update` traffic.
@@ -285,6 +295,9 @@ pub struct SubRuntime {
     /// `Arc` so a queued-turn handoff can move the owned guard into the
     /// chained task.
     pub prompt_send: Arc<tokio::sync::Mutex<()>>,
+    /// The agent's declared steer contract (config `steer`): what a
+    /// `session/prompt` sent mid-turn becomes.
+    pub steer: SteerSemantics,
     /// The JSONL transcript file.
     pub transcript: tokio::sync::Mutex<TranscriptWriter>,
     /// Live terminals by id.
@@ -487,10 +500,12 @@ async fn launch_inner(
             pending: Vec::new(),
             queue: VecDeque::new(),
             steer_pending: VecDeque::new(),
+            steer_folded: VecDeque::new(),
             steer_owner: None,
         }),
         notify: Notify::new(),
         prompt_send: Arc::new(tokio::sync::Mutex::new(())),
+        steer: agent_cfg.steer,
         transcript: tokio::sync::Mutex::new(TranscriptWriter::deferred()),
         terminals: Terminals::new(HashMap::new()),
         stderr_tail: Mutex::new(VecDeque::new()),
@@ -944,6 +959,7 @@ fn on_disconnect(rt: &SubRuntime) {
     inner.pending.clear();
     inner.queue.clear();
     inner.steer_pending.clear();
+    inner.steer_folded.clear();
     inner.steer_owner = None;
     inner.current = None;
     drop(inner);
@@ -986,6 +1002,18 @@ pub(crate) enum Gate {
 /// flight on the wire — its turn, if the agent runs it as one, comes first.
 pub(crate) fn prompt_slot_free(inner: &Inner) -> bool {
     inner.status.accepts_prompt() && inner.steer_pending.is_empty()
+}
+
+/// The oldest steer that could still produce turn traffic. Settled-folded
+/// steers precede every pending one — a steer moves to `steer_folded` only
+/// at a turn's end, before any newer steer exists — so the folded queue's
+/// front wins.
+pub(crate) fn oldest_steer(inner: &Inner) -> Option<u64> {
+    inner
+        .steer_folded
+        .front()
+        .copied()
+        .or_else(|| inner.steer_pending.front().copied())
 }
 
 /// Begin a prompt turn on an established session.
@@ -1155,8 +1183,10 @@ async fn enqueue_prompt(
 /// (devin treats it as an injected user message steering the active task)
 /// fold the text into the turn; the returned future resolves with that
 /// turn's own result — or with a rejection from agents that do not accept a
-/// concurrent prompt. A steer that lands after the target turn ended runs
-/// as a turn of its own: [`steer_resolved`] reconciles which it became.
+/// concurrent prompt, or not at all on a [`SteerSemantics::Folded`] agent,
+/// where [`settle_turn`] settles it at the turn's end. A steer that lands
+/// after the target turn ended runs as a turn of its own:
+/// [`steer_resolved`] reconciles which it became.
 ///
 /// Returns the steer id, the target turn's number, and the prompt call's
 /// future, which the caller either awaits briefly for a synchronous
@@ -1212,8 +1242,11 @@ pub(crate) fn steer_end_record(
 /// so its resolution IS that turn's end and [`finish_turn`] settles it;
 /// or it errored — a rejection transfers ownership of a materialized turn
 /// to the next pending steer, since the traffic cannot be the rejected
-/// one's. When the last in-flight steer resolves without owning a turn and
-/// the queue was held for it, the first queued prompt chains here.
+/// one's. A steer already settled `folded` resolves through the same
+/// paths: it left `steer_pending` at its target turn's end, but a late
+/// arrival's own turn still closes here. When the last in-flight steer
+/// resolves without owning a turn and the queue was held for it, the
+/// first queued prompt chains here.
 ///
 /// Returns the outcome back to the caller (a synchronous `send(steer)` path
 /// reports rejections from it).
@@ -1227,10 +1260,11 @@ pub(crate) async fn steer_resolved(
     let (mine, kick, turn_n) = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         inner.steer_pending.retain(|&id| id != steer_id);
+        inner.steer_folded.retain(|&id| id != steer_id);
         let mine = if inner.steer_owner == Some(steer_id) {
             inner.steer_owner = None;
             if outcome.is_err()
-                && let Some(&owner) = inner.steer_pending.front()
+                && let Some(owner) = oldest_steer(&inner)
             {
                 inner.steer_owner = Some(owner);
                 false
@@ -1305,14 +1339,19 @@ pub(crate) type PromptFut =
 /// (the status stays `running` — no `done` interlude), anything else settles
 /// `done`. A steered prompt still in flight may materialize as a turn ahead
 /// of the queue on the wire, so the queue pops only once they all resolve.
-/// Returns the prompt to chain and the prompts the queue dropped.
-fn settle_turn(rt: &SubRuntime, reason: StopReason) -> (Option<String>, VecDeque<String>) {
+/// Returns the prompt to chain, the prompts the queue dropped, and the ids
+/// of steers settled as folded.
+fn settle_turn(
+    rt: &SubRuntime,
+    reason: StopReason,
+) -> (Option<String>, VecDeque<String>, Vec<u64>) {
     let mut inner = rt.inner.lock().expect("inner poisoned");
     if let Some(mut turn) = inner.current.take() {
         turn.stop_reason = Some(reason);
         inner.turns.push(turn);
     }
-    let outcome = if reason == StopReason::Cancelled {
+    let folded = fold_pending_steers(rt, &mut inner);
+    let (next, dropped) = if reason == StopReason::Cancelled {
         inner.status = Status::Cancelled;
         (None, std::mem::take(&mut inner.queue))
     } else if inner.steer_pending.is_empty()
@@ -1328,18 +1367,35 @@ fn settle_turn(rt: &SubRuntime, reason: StopReason) -> (Option<String>, VecDeque
         (None, VecDeque::new())
     };
     drop(inner);
-    outcome
+    (next, dropped, folded)
+}
+
+/// A `folded`-semantics agent never answers a steered prompt it folded
+/// into the turn that just ended: settle every still-pending steer as
+/// folded so the prompt slot frees and the queue can chain. The ids move
+/// to `steer_folded`, not oblivion — a steer that actually landed late
+/// runs as a turn of its own and still needs to own it.
+///
+/// Returns the settled steer ids for their `steer_end: folded` records.
+fn fold_pending_steers(rt: &SubRuntime, inner: &mut Inner) -> Vec<u64> {
+    if rt.steer != SteerSemantics::Folded {
+        return Vec::new();
+    }
+    let folded: Vec<u64> = inner.steer_pending.drain(..).collect();
+    inner.steer_folded.extend(folded.iter().copied());
+    folded
 }
 
 /// Push the finished turn into `turns`, mark the subagent `failed`, and
-/// return the dropped queue.
-fn fail_turn(rt: &SubRuntime, reason: String) -> VecDeque<String> {
+/// return the dropped queue and the ids of steers settled as folded.
+fn fail_turn(rt: &SubRuntime, reason: String) -> (VecDeque<String>, Vec<u64>) {
     let mut inner = rt.inner.lock().expect("inner poisoned");
     if let Some(turn) = inner.current.take() {
         inner.turns.push(turn);
     }
+    let folded = fold_pending_steers(rt, &mut inner);
     inner.status = Status::Failed(reason);
-    std::mem::take(&mut inner.queue)
+    (std::mem::take(&mut inner.queue), folded)
 }
 
 /// Append a `queue_dropped` transcript record, when any prompts dropped.
@@ -1357,6 +1413,21 @@ pub(crate) async fn record_queue_dropped(
     }
     if let Err(error) = rt.transcript.lock().await.append(&record).await {
         warn!(%error, "transcript write failed");
+    }
+}
+
+/// Append a `steer_end: folded` record for each steer settled as folded
+/// at a turn's end.
+async fn record_steers_folded(rt: &SubRuntime, turn_n: u64, steers: Vec<u64>) {
+    for _ in steers {
+        let record = serde_json::json!({
+            "ts": now(),
+            "turn": turn_n,
+            "steer_end": "folded",
+        });
+        if let Err(error) = rt.transcript.lock().await.append(&record).await {
+            warn!(%error, "transcript write failed");
+        }
     }
 }
 
@@ -1421,7 +1492,8 @@ async fn finish_turn(
             if let Err(error) = rt.transcript.lock().await.append(&record).await {
                 warn!(%error, "transcript write failed");
             }
-            let (next, dropped) = settle_turn(&rt, reason);
+            let (next, dropped, folded) = settle_turn(&rt, reason);
+            record_steers_folded(&rt, turn_n, folded).await;
             if let Some(prompt) = next {
                 spawn_chained(state.clone(), session_id.clone(), prompt, wire);
             } else {
@@ -1446,7 +1518,9 @@ async fn finish_turn(
             if let Err(error) = rt.transcript.lock().await.append(&record).await {
                 warn!(%error, "transcript write failed");
             }
-            record_queue_dropped(&rt, Some(turn_n), fail_turn(&rt, reason)).await;
+            let (dropped, folded) = fail_turn(&rt, reason);
+            record_steers_folded(&rt, turn_n, folded).await;
+            record_queue_dropped(&rt, Some(turn_n), dropped).await;
             drop(wire);
         }
     }

@@ -146,6 +146,33 @@ pub enum PermissionPolicy {
     Ask,
 }
 
+/// What an agent does with a `session/prompt` sent while a turn is
+/// running — a `send` with `policy: "steer"`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SteerSemantics {
+    /// Every steered `session/prompt` is answered: it resolves folded into
+    /// the running turn's result, with a rejection, or — when it landed
+    /// behind the target turn's end — with its own turn's result.
+    #[default]
+    Answered,
+    /// The agent folds a mid-turn prompt into the running turn and never
+    /// answers the request (codex-acp). A steer still pending when its
+    /// target turn ends is settled as folded; one that landed behind the
+    /// turn's end still runs — and resolves — as a turn of its own.
+    Folded,
+}
+
 /// A configured ACP agent: how to launch it.
 ///
 /// The command, its arguments and environment, the cwd boundary, and the
@@ -164,6 +191,12 @@ pub struct AgentConfig {
     pub allow_outside_cwd: bool,
     /// Per-agent permission policy override.
     pub permission: Option<PermissionPolicy>,
+    /// Steer contract: what a `session/prompt` sent mid-turn (a `send`
+    /// with `policy: "steer"`) becomes. `answered` (default) — the agent
+    /// answers every steered prompt; `folded` — it folds the prompt into
+    /// the running turn and never answers the request (codex-acp), so a
+    /// steer still pending when its target turn ends is settled as folded.
+    pub steer: SteerSemantics,
     /// SQLite database mapping session ids to working directories, consulted
     /// by `adopt` to discover `cwd` (devin CLI layout: a `sessions` table
     /// with `id` and `working_directory` columns). When unset for a `devin`
@@ -231,6 +264,8 @@ struct RawAgentConfig {
     #[serde(default)]
     allow_outside_cwd: bool,
     permission: Option<PermissionPolicy>,
+    #[serde(default)]
+    steer: SteerSemantics,
     sessions_db: Option<String>,
 }
 
@@ -270,6 +305,7 @@ impl RawAgentConfig {
             env: self.env,
             allow_outside_cwd: self.allow_outside_cwd,
             permission: self.permission,
+            steer: self.steer,
             sessions_db: self.sessions_db.as_deref().map(expand_tilde),
         }
     }
