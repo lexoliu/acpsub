@@ -27,6 +27,11 @@ text joins the turn via "steer:<text>" in the reply. FAKE_NO_STEER=1 makes
 the agent reject a concurrent prompt instead. FAKE_QUEUE_PROMPTS=1 makes
 the agent park a concurrent prompt and run it as its own turn after the
 current one ends (agents that serialize prompts instead of injecting).
+FAKE_FOLD_STEER=1 makes the agent fold a concurrent prompt into the
+running turn and never answer its request (codex-acp) — unless its text
+starts with "LATE ", which plays a steer that landed behind the turn's
+end: the running turn finishes and the steer runs, and answers, as a turn
+of its own.
 
 - "hold" -> the turn stays open until a queued prompt arrives
   (FAKE_QUEUE_PROMPTS mode only).
@@ -312,8 +317,9 @@ def on_prompt(request_id, params):
         sys.exit(3)
     if pending_prompt is not None:
         # A prompt arriving while a turn runs is a steer injection — unless
-        # FAKE_NO_STEER=1 rejects it, or FAKE_QUEUE_PROMPTS=1 parks it
-        # agent-side to run as its own turn after this one ends.
+        # FAKE_NO_STEER=1 rejects it, FAKE_QUEUE_PROMPTS=1 parks it
+        # agent-side to run as its own turn after this one ends, or
+        # FAKE_FOLD_STEER=1 folds it in and leaves its request unanswered.
         if os.environ.get("FAKE_NO_STEER") == "1":
             send(
                 {
@@ -322,6 +328,25 @@ def on_prompt(request_id, params):
                     "error": {"code": -32600, "message": "prompt in flight"},
                 }
             )
+            return
+        if os.environ.get("FAKE_FOLD_STEER") == "1":
+            if text.startswith("LATE "):
+                # The steer landed behind the turn's end: the running turn
+                # finishes, then the steer runs — and answers — as a turn
+                # of its own.
+                queued.append((request_id, text[5:]))
+                finish_prompt()
+            else:
+                collected.append("steer:" + text)
+                update(
+                    session_id,
+                    {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": text},
+                    },
+                )
+                if pending_text == "gather":
+                    finish_prompt()
             return
         if os.environ.get("FAKE_QUEUE_PROMPTS") == "1":
             queued.append((request_id, text))

@@ -406,6 +406,148 @@ async fn send_steer_becomes_turn_on_serializing_agent() {
     );
 }
 
+/// On an agent declared `steer = "folded"`, a steer the agent folds into
+/// the running turn is never answered: when the target turn ends the steer
+/// settles as folded (`steer_end: folded`), the prompt slot frees, and a
+/// later `send` runs — the deadlock of issue #47.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_steer_folded_settles_at_turn_end() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let mut args = spawn_args(dir.path(), "gather");
+    args["agent"] = json!("foldagent");
+    let sid = spawn_id(&tools, args).await;
+
+    // "gather" holds turn 1 open until the steer arrives; the agent folds
+    // it in, ends the turn, and never answers the steer's session/prompt.
+    let steered = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "kick", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["turn"], 1, "{steered}");
+
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(
+        done["reply"].as_str().unwrap().contains("steer:kick"),
+        "{done}"
+    );
+
+    // The folded steer no longer blocks the slot: a `try` prompt runs.
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "hi", "policy": "try"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done");
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["turns"], 2, "{status}");
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
+    assert!(text.contains("=== [turn 1] STEER\nkick"), "{text}");
+    assert!(text.contains("=== [turn 1] STEER END folded"), "{text}");
+    assert!(text.contains("=== [turn 2] USER\nhi"), "{text}");
+}
+
+/// On a `folded` agent, a steer that landed behind its target turn's end
+/// still runs as a turn of its own: its untracked `session/update` traffic
+/// materializes a `current` owned by the settled-folded steer, and the
+/// steer's own `session/prompt` response settles that turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_steer_folded_late_becomes_own_turn() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let mut args = spawn_args(dir.path(), "wait");
+    args["agent"] = json!("foldagent");
+    let sid = spawn_id(&tools, args).await;
+
+    // "LATE" marks the steer that reaches the agent after turn 1 ended:
+    // the fake ends turn 1, then runs the steer as its own turn whose
+    // response resolves normally. The PERMISSION marker stalls that turn
+    // on a permission round-trip, so acpsub settles turn 1 — and the
+    // settled-folded steer owns the materialized turn — before the
+    // steer's updates finish arriving.
+    let steered = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "LATE PERMISSION go", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(steered["state"], "steered", "{steered}");
+
+    // Turn 1 ends, the settled-folded steer's own turn materializes from
+    // its updates, and the steer's response settles it — wait on the
+    // notify signal until both turns are recorded. The timeout only turns
+    // a hang into a failure.
+    let sub = state.get(&sid).expect("live subagent");
+    let two_turns = async {
+        loop {
+            let notified = sub.rt.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = sub.rt.inner.lock().expect("inner poisoned");
+                if inner.turns.len() == 2 && matches!(inner.status, Status::Done(_)) {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), two_turns)
+        .await
+        .expect("subagent did not record two turns");
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["state"], "done", "{status}");
+    assert_eq!(status["turns"], 2, "{status}");
+
+    let second = call_json(
+        &tools,
+        "result",
+        json!({"session_id": sid.as_str(), "turn": 2}),
+    )
+    .await;
+    assert!(
+        second["reply"].as_str().unwrap().contains("perm:allow-1"),
+        "{second}"
+    );
+
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
+    assert!(
+        text.contains("=== [turn 1] STEER\nLATE PERMISSION go"),
+        "{text}"
+    );
+    assert!(text.contains("=== [turn 1] STEER END folded"), "{text}");
+    assert!(text.contains("=== [turn 2] END end_turn"), "{text}");
+    assert!(text.contains("=== [turn 2] STEER END end_turn"), "{text}");
+
+    // The slot is free afterwards: a `try` prompt runs turn 3.
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "again", "policy": "try"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_mid_turn() {
     if !python3() {

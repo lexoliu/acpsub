@@ -277,6 +277,7 @@ async fn close_sub(sub: &Subagent) {
         }
         inner.queue.clear();
         inner.steer_pending.clear();
+        inner.steer_folded.clear();
         inner.steer_owner = None;
         if matches!(inner.status, Status::Running | Status::NeedsPermission) {
             inner.status = Status::Cancelled;
@@ -500,7 +501,12 @@ struct SendArgs {
     /// `steer` — inject the prompt into the running turn (a second
     /// `session/prompt` while it is in flight); agents that support
     /// mid-turn injection fold it into the active task, agents that do not
-    /// surface an error.
+    /// surface an error. How the request resolves depends on the agent's
+    /// configured `steer` semantics: an `answered` agent (the default)
+    /// answers every steered prompt, while a `folded` agent (codex-acp)
+    /// never answers one it folded into a turn — acpsub settles such a
+    /// steer when its target turn ends. On either, a steer that landed
+    /// behind the turn's end still runs and resolves as a turn of its own.
     policy: SendPolicy,
 }
 

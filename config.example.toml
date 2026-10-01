@@ -22,6 +22,12 @@ args = ["acp"]
 allow_outside_cwd = false                # refuse fs/* paths outside cwd
 # env = { API_KEY = "..." }              # extra environment for the process
 # permission = "ask"                     # per-agent override of the default
+# steer = "folded"                       # answered | folded — what a mid-turn
+                                       # `send` steer becomes; `folded` agents
+                                       # (codex-acp) fold the prompt into the
+                                       # running turn and never answer the
+                                       # request, so acpsub settles it when
+                                       # that turn ends
 # sessions_db = "~/path/sessions.db"     # sqlite db mapping session id -> cwd
                                        # for `adopt` without an explicit cwd
                                        # (devin defaults to its own store)

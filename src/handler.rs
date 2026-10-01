@@ -18,7 +18,9 @@ use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::config::PermissionPolicy;
-use crate::state::{PendingPermission, Status, SubRuntime, ToolCallSummary, Turn, now};
+use crate::state::{
+    PendingPermission, Status, SubRuntime, ToolCallSummary, Turn, now, oldest_steer,
+};
 use crate::terminal::{self, Terminal};
 
 /// Handles one subagent's agent-to-client traffic.
@@ -74,13 +76,14 @@ impl ClientHandler for SubagentHandler {
     async fn session_update(&self, notification: SessionNotification) {
         // A `session/update` with no current turn means the agent is running
         // a turn we did not open: a steered prompt that landed after its
-        // target turn ended. Materialize `current` for the oldest pending
-        // steer so the update — and the turn — is tracked; `steer_resolved`
-        // settles it when the steer's `session/prompt` resolves.
+        // target turn ended. Materialize `current` for the oldest
+        // outstanding steer — pending or settled-folded — so the update and
+        // the turn are tracked; `steer_resolved` settles it when the
+        // steer's `session/prompt` resolves.
         let (turn_n, materialized) = {
             let mut inner = self.rt.inner.lock().expect("inner poisoned");
             let materialized = inner.current.is_none()
-                && !inner.steer_pending.is_empty()
+                && oldest_steer(&inner).is_some()
                 && !matches!(inner.status, Status::Failed(_));
             if materialized {
                 let n = inner.turn_offset + inner.turns.len() as u64 + 1;
@@ -90,7 +93,7 @@ impl ClientHandler for SubagentHandler {
                     ..Turn::default()
                 });
                 inner.pending_turn_start = None;
-                inner.steer_owner = inner.steer_pending.front().copied();
+                inner.steer_owner = oldest_steer(&inner);
                 inner.status = Status::Running;
             }
             (

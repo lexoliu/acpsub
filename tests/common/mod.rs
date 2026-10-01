@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use acpsub::config::AgentConfig;
+use acpsub::config::{AgentConfig, SteerSemantics};
 use acpsub::{AppState, Config};
 use aither_core::llm::tool::{ToolContext, ToolResult, Tools};
 use serde_json::{Value, json};
@@ -35,6 +35,7 @@ pub fn fake_agent_config() -> AgentConfig {
         env: BTreeMap::new(),
         allow_outside_cwd: false,
         permission: None,
+        steer: SteerSemantics::Answered,
         sessions_db: None,
     }
 }
@@ -84,6 +85,13 @@ pub fn write_config(
                 .unwrap_or_default();
             let _ = write!(text, "\npermission = \"{name}\"");
         }
+        if agent.steer != SteerSemantics::Answered {
+            let name = serde_json::to_value(agent.steer)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let _ = write!(text, "\nsteer = \"{name}\"");
+        }
         if let Some(db) = &agent.sessions_db {
             let _ = write!(text, "\nsessions_db = {:?}", db.display().to_string());
         }
@@ -98,7 +106,9 @@ pub fn write_config(
 /// accepts `set_mode`/`set_config_option`), a `noload` agent (same script
 /// with `FAKE_NO_LOAD=1`), a `nosteer` agent (`FAKE_NO_STEER=1`, rejects a
 /// concurrent prompt), a `queueagent` (`FAKE_QUEUE_PROMPTS=1`, parks a
-/// concurrent prompt and runs it as its own turn), and a `wideopen` agent
+/// concurrent prompt and runs it as its own turn), a `foldagent`
+/// (`FAKE_FOLD_STEER=1` and `steer = "folded"`, folds a concurrent prompt
+/// into the running turn and never answers it), and a `wideopen` agent
 /// allowed outside its cwd.
 pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
     let mut agents = BTreeMap::new();
@@ -122,6 +132,14 @@ pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
         "queueagent".to_string(),
         AgentConfig {
             env: BTreeMap::from([("FAKE_QUEUE_PROMPTS".to_string(), "1".to_string())]),
+            ..fake.clone()
+        },
+    );
+    agents.insert(
+        "foldagent".to_string(),
+        AgentConfig {
+            env: BTreeMap::from([("FAKE_FOLD_STEER".to_string(), "1".to_string())]),
+            steer: SteerSemantics::Folded,
             ..fake.clone()
         },
     );
