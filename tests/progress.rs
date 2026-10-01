@@ -148,6 +148,99 @@ async fn silent_short_expect_proceeds() {
     assert_eq!(waited["state"], "overrun", "{waited}");
 }
 
+/// A `wait` bound to turn A must return A's result when A ends — even
+/// when a queued turn B has already chained and started. Reports name A's
+/// elapsed seconds throughout, so they never drop when B takes over.
+#[tokio::test]
+async fn wait_returns_the_turn_it_started_on() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let tools = Arc::new(tools);
+    // Turn A: "gather" holds open until a steered prompt arrives.
+    let session_id = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
+    // Park turn B on the client-side queue: it chains the moment A ends.
+    let queued = call_json(
+        &tools,
+        "send",
+        json!({"session_id": session_id.as_str(), "prompt": "wait", "policy": "queued"}),
+    )
+    .await;
+    assert_eq!(queued["state"], "queued", "{queued}");
+
+    let (tx, mut reports) = mpsc::unbounded_channel();
+    let waiting = {
+        let tools = Arc::clone(&tools);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            call_with(
+                &tools,
+                "wait",
+                json!({"session_id": session_id, "expect_secs": EXPECT_SECS}),
+                ToolContext::with_progress(Collect(tx)),
+            )
+            .await
+        })
+    };
+    // A few reports in on turn A, then end it with a steer: B chains at
+    // once, so any further report would name B's smaller elapsed if the
+    // wait followed "whatever is running" instead of its own turn.
+    let mut progress = Vec::new();
+    for _ in 0..3 {
+        let (p, _) = tokio::time::timeout(Duration::from_secs(5), reports.recv())
+            .await
+            .expect("a progress report within 5 s")
+            .expect("sink alive while the call waits");
+        progress.push(p.progress());
+    }
+    let steered = call_json(
+        &tools,
+        "send",
+        json!({"session_id": session_id.as_str(), "prompt": "go", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(steered["state"], "steered", "{steered}");
+
+    let result: ToolResult = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut waiting = waiting;
+        loop {
+            tokio::select! {
+                res = &mut waiting => break res.expect("wait task").expect("wait call"),
+                report = reports.recv() => {
+                    // The sink closes when the call returns; the join arm
+                    // resolves on the next poll.
+                    let Some((p, _)) = report else { continue };
+                    if let Some(&last) = progress.last() {
+                        assert!(
+                            p.progress() > last,
+                            "progress must increase: {last} -> {}",
+                            p.progress()
+                        );
+                    }
+                    progress.push(p.progress());
+                }
+            }
+        }
+    })
+    .await
+    .expect("wait returned once its own turn ended");
+    assert!(!result.is_error(), "call returned an error result");
+    let text = result.render_for_model().expect("render");
+    let waited: Value = serde_json::from_str(&text).expect("tool result is json");
+    assert_eq!(waited["state"], "done", "{waited}");
+    assert_eq!(waited["turn"], 1, "{waited}");
+    assert!(
+        waited["reply"].as_str().unwrap().contains("steer:go"),
+        "{waited}"
+    );
+
+    // Turn B is the chained "wait" prompt; end it so the test agent exits.
+    call_json(&tools, "cancel", json!({"session_id": session_id.as_str()})).await;
+}
+
 /// `wait` reports the turn's elapsed time every interval while blocked.
 #[tokio::test]
 async fn wait_reports_progress_at_the_interval() {

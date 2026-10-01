@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use aither_acp::{ConfigOption, ConfigOptionValue, ConfigSelectOptions, RequestPermissionOutcome};
+use aither_acp::{
+    ConfigOption, ConfigOptionValue, ConfigSelectOptions, RequestPermissionOutcome, StopReason,
+};
 use aither_core::llm::tool::{Progress, Tool, ToolContext, Tools};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -22,8 +24,9 @@ use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Gate, Launch, Status, Subagent, begin_turn, launch, prompt_slot_free,
-    record_queue_dropped, spawn_turn_task, start_turn, steer_resolved, steer_turn, steer_waiter,
+    AppState, Gate, Launch, Status, Subagent, begin_turn, launch, next_turn_number,
+    prompt_slot_free, record_queue_dropped, spawn_turn_task, start_turn, steer_resolved,
+    steer_turn, steer_waiter,
 };
 use crate::transcript::{RenderOptions, render};
 
@@ -115,35 +118,92 @@ fn spawned_view(sub: &Subagent) -> Value {
     })
 }
 
-/// Seconds the running turn has been going; `None` when the subagent is
-/// not running. A `running` subagent always has a recorded start — the
-/// current turn's `started_at`, or a just-chained turn's
-/// `pending_turn_start` — so a missing one is a broken invariant, never a
-/// case to wait through unbounded.
+/// The turn `wait`/`wait_any` binds to at call time: the number of the
+/// turn in flight, or — during the chained-turn gap, when the queue pop
+/// already reserved the slot but `begin_turn` has not stamped `current`
+/// yet — of the turn that is about to start. `None` when the subagent is
+/// not `running`: the call returns at once, unchanged. A queued turn that
+/// starts afterwards does not extend the wait.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Internal`] when the invariant is violated.
-fn turn_elapsed(sub: &Subagent) -> Result<Option<f64>> {
+/// Returns [`Error::Internal`] when the status is `running` but no turn
+/// start is recorded — a broken invariant, never a case to wait through
+/// unbounded.
+fn awaited_turn(sub: &Subagent) -> Result<Option<u64>> {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
     if !matches!(inner.status, Status::Running) {
         return Ok(None);
     }
-    let Some(started) = inner
-        .current
-        .as_ref()
-        .and_then(|turn| turn.started_at)
-        .or(inner.pending_turn_start)
-    else {
-        return Err(Error::Internal {
-            session_id: sub.session_id.clone(),
-            detail: "status is running but no turn start is recorded".to_string(),
-        });
-    };
+    if let Some(turn) = &inner.current {
+        return Ok(Some(turn.n));
+    }
+    if inner.pending_turn_start.is_some() {
+        return Ok(Some(next_turn_number(&inner)));
+    }
     drop(inner);
-    Ok(Some(
-        jiff::Timestamp::now().duration_since(started).as_secs_f64(),
-    ))
+    Err(Error::Internal {
+        session_id: sub.session_id.clone(),
+        detail: "status is running but no turn start is recorded".to_string(),
+    })
+}
+
+/// What the turn a wait is bound to is doing.
+enum Awaited {
+    /// Still in flight: its elapsed seconds, measured from its own
+    /// recorded start.
+    Running(f64),
+    /// No longer the in-flight turn — settled into `turns`, superseded by
+    /// a chained or materialized turn, parked on a permission request
+    /// (the wait returns to report it), or gone with the session.
+    Ended,
+}
+
+/// Poll the turn `n` a wait is bound to: its elapsed seconds while it is
+/// still in flight, [`Awaited::Ended`] once it is not. Tracking the turn
+/// number — not "whatever is running now" — is what keeps a queued turn
+/// chaining after the awaited one from extending the wait or resetting
+/// its progress.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] when the awaited turn is in flight but has
+/// no recorded start.
+fn awaited_elapsed(sub: &Subagent, n: u64) -> Result<Awaited> {
+    let inner = sub.rt.inner.lock().expect("inner poisoned");
+    let missing_start = || Error::Internal {
+        session_id: sub.session_id.clone(),
+        detail: "status is running but no turn start is recorded".to_string(),
+    };
+    if let Some(turn) = inner.current.as_ref().filter(|turn| turn.n == n) {
+        // Only `running` means still in flight: `needs_permission` parks
+        // the turn on a request the wait returns to report, and `close`
+        // cancels the session without clearing `current`.
+        if !matches!(inner.status, Status::Running) {
+            return Ok(Awaited::Ended);
+        }
+        let Some(started) = turn.started_at.or(inner.pending_turn_start) else {
+            return Err(missing_start());
+        };
+        return Ok(Awaited::Running(
+            jiff::Timestamp::now().duration_since(started).as_secs_f64(),
+        ));
+    }
+    // The gap the awaited turn was predicted in: the slot is still
+    // reserved (`Running`, no `current` yet) until `begin_turn` runs.
+    if matches!(inner.status, Status::Running)
+        && inner.current.is_none()
+        && next_turn_number(&inner) == n
+    {
+        let Some(started) = inner.pending_turn_start else {
+            return Err(missing_start());
+        };
+        return Ok(Awaited::Running(
+            jiff::Timestamp::now().duration_since(started).as_secs_f64(),
+        ));
+    }
+    drop(inner);
+    Ok(Awaited::Ended)
 }
 
 /// The progress report a blocked wait sends for `sub`: `progress` is the
@@ -190,11 +250,26 @@ const fn check_expect(cx: &ToolContext, expect_secs: u64) -> Result<()> {
 
 /// A `wait`-style result for one subagent. `overrun` marks that the turn
 /// outlived `expect_secs`: the result reports `overrun`, the turn's own
-/// elapsed time, and its latest tool call.
-fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
-    let (status, reply, tool_calls, pending, turn_n, queued, elapsed, latest) = {
+/// elapsed time, and its latest tool call. `awaited` is the turn the call
+/// bound to (see [`awaited_turn`]); `None` reports the latest turn, the
+/// shape a wait on a non-running subagent has always had.
+fn wait_view(sub: &Subagent, started: Instant, overrun: bool, awaited: Option<u64>) -> Value {
+    let (status, reply, tool_calls, pending, turn_n, queued, elapsed, latest, ended_reason) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
-        let turn = inner.current.as_ref().or_else(|| inner.turns.last());
+        // The awaited turn's own record — the same lookup `result` uses
+        // for an explicit turn number: `turns` once settled, `current`
+        // while it is still in flight. A queued turn that already chained
+        // into `current` must not shadow it.
+        let turn = awaited.map_or_else(
+            || inner.current.as_ref().or_else(|| inner.turns.last()),
+            |n| {
+                inner
+                    .turns
+                    .iter()
+                    .find(|turn| turn.n == n)
+                    .or_else(|| inner.current.as_ref().filter(|turn| turn.n == n))
+            },
+        );
         let pending = inner.pending.first().map(|perm| {
             json!({
                 "request_id": perm.request_id,
@@ -218,7 +293,7 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
                 turn.tool_calls.values().cloned().collect::<Vec<_>>()
             }),
             pending,
-            turn.map(|turn| turn.n),
+            turn.map(|turn| turn.n).or(awaited),
             inner.queue.len(),
             turn.and_then(|turn| turn.started_at)
                 .map(|started| jiff::Timestamp::now().duration_since(started).as_secs_f64()),
@@ -228,6 +303,8 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
                     .and_then(|id| turn.tool_calls.get(id))
                     .cloned()
             }),
+            turn.and_then(|turn| turn.stop_reason)
+                .filter(|_| awaited.is_some()),
         )
     };
     let mut view = json!({
@@ -248,18 +325,29 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
             view["latest_tool_call"] = serde_json::to_value(latest)
                 .expect("ToolCallSummary holds only owned primitives; serialization cannot fail");
         }
-    }
-    match &status {
-        Status::Done(reason) => {
-            view["stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
+    } else if let Some(reason) = ended_reason {
+        // The awaited turn's own end: its stop reason wins over the
+        // session status, which may already show the turn that chained
+        // after it.
+        view["state"] = json!(if matches!(reason, StopReason::Cancelled) {
+            "cancelled"
+        } else {
+            "done"
+        });
+        view["stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
+    } else {
+        match &status {
+            Status::Done(reason) => {
+                view["stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
+            }
+            Status::Cancelled => {
+                view["stop_reason"] = json!("cancelled");
+            }
+            Status::Failed(reason) => {
+                view["error"] = json!(reason);
+            }
+            _ => {}
         }
-        Status::Cancelled => {
-            view["stop_reason"] = json!("cancelled");
-        }
-        Status::Failed(reason) => {
-            view["error"] = json!(reason);
-        }
-        _ => {}
     }
     if let Some(pending) = pending {
         view["pending_permission"] = pending;
@@ -652,8 +740,10 @@ impl Tool for SendTool {
 // wait / wait_any
 // ---------------------------------------------------------------------------
 
-/// Block until a subagent's turn ends, a permission request needs an
-/// answer, or the turn has run past `expect_secs`.
+/// Block until the turn that was running when the call began ends, a
+/// permission request needs an answer, or the turn has run past
+/// `expect_secs`. The wait binds to that turn's number: a queued or
+/// steered turn that starts afterwards does not extend it.
 ///
 /// Returns the subagent state (`done`/`cancelled`/`failed`/
 /// `needs_permission`), the turn's `reply` (concatenated agent message
@@ -690,15 +780,18 @@ impl Tool for WaitTool {
         check_expect(&cx, args.expect_secs)?;
         let sub = self.state.get(&args.session_id)?;
         let started = Instant::now();
+        let Some(awaited) = awaited_turn(&sub)? else {
+            return Ok(wait_view(&sub, started, false, None));
+        };
         #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
         let expect = args.expect_secs as f64;
         let interval = self.interval;
         let mut next_report = started;
         let overrun = loop {
-            match turn_elapsed(&sub)? {
-                None => break false,
-                Some(elapsed) if elapsed >= expect => break true,
-                Some(elapsed) => {
+            match awaited_elapsed(&sub, awaited)? {
+                Awaited::Ended => break false,
+                Awaited::Running(elapsed) if elapsed >= expect => break true,
+                Awaited::Running(elapsed) => {
                     let now = Instant::now();
                     if now >= next_report {
                         cx.report_progress(wait_progress(&sub, elapsed, args.expect_secs))
@@ -715,14 +808,15 @@ impl Tool for WaitTool {
                 }
             }
         };
-        Ok(wait_view(&sub, started, overrun))
+        Ok(wait_view(&sub, started, overrun, Some(awaited)))
     }
 }
 
-/// Block until the first of several subagents leaves `running` — a turn
-/// end, a permission request, or an `overrun` once its turn has run past
-/// `expect_secs` — then return that one's wait-style result. An overrun is
-/// to be investigated, not re-waited with a larger number.
+/// Block until the first of several subagents' awaited turn ends — each
+/// session binds to the turn running when the call began — a permission
+/// request needs an answer, or an `overrun` once a turn has run past
+/// `expect_secs` — then return that one's wait-style result. An overrun
+/// is to be investigated, not re-waited with a larger number.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitAnyArgs {
     /// Session ids to watch.
@@ -753,6 +847,12 @@ impl Tool for WaitAnyTool {
             .map(|session_id| self.state.get(session_id))
             .collect::<Result<Vec<_>>>()?;
         let started = Instant::now();
+        // Each watched session binds to the turn in flight at call time,
+        // the same rule `wait` applies to one.
+        let awaited = subs
+            .iter()
+            .map(|sub| awaited_turn(sub))
+            .collect::<Result<Vec<_>>>()?;
         #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
         let expect = args.expect_secs as f64;
         let interval = self.interval;
@@ -762,13 +862,16 @@ impl Tool for WaitAnyTool {
             // Report the longest-running watched turn: it is the one a
             // host-side idle timer would be most anxious about.
             let mut longest: Option<(f64, &Arc<Subagent>)> = None;
-            for sub in &subs {
-                match turn_elapsed(sub)? {
-                    None => return Ok(wait_view(sub, started, false)),
-                    Some(elapsed) if elapsed >= expect => {
-                        return Ok(wait_view(sub, started, true));
+            for (sub, awaited) in subs.iter().zip(&awaited) {
+                let Some(n) = awaited else {
+                    return Ok(wait_view(sub, started, false, None));
+                };
+                match awaited_elapsed(sub, *n)? {
+                    Awaited::Ended => return Ok(wait_view(sub, started, false, Some(*n))),
+                    Awaited::Running(elapsed) if elapsed >= expect => {
+                        return Ok(wait_view(sub, started, true, Some(*n)));
                     }
-                    Some(elapsed) => {
+                    Awaited::Running(elapsed) => {
                         poll = poll.min(Duration::from_secs_f64(expect - elapsed));
                         if longest.is_none_or(|(max, _)| elapsed > max) {
                             longest = Some((elapsed, sub));
