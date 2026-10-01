@@ -367,10 +367,12 @@ pub struct Subagent {
     pub permission: PermissionPolicy,
     /// Whether agent fs/* requests may leave `cwd`.
     pub allow_outside_cwd: bool,
-    /// The model the agent accepted (`session/set_config_option` `model`).
-    pub model: serde_json::Value,
-    /// The mode the agent accepted (`session/set_mode`).
-    pub mode: String,
+    /// The model the agent accepted (`session/set_config_option` `model`),
+    /// `None` when the agent advertises no `model` option.
+    pub model: Option<serde_json::Value>,
+    /// The mode the agent accepted (`session/set_mode`), `None` when the
+    /// agent advertises no session modes.
+    pub mode: Option<String>,
     /// The transcript file path.
     pub transcript_path: PathBuf,
     /// The ACP client handle.
@@ -413,12 +415,14 @@ pub struct Launch {
     /// First turn's prompt, if the launch should start one. `adopt` may bind
     /// the session without prompting.
     pub prompt: Option<String>,
-    /// Session mode to activate with `session/set_mode`. Required — no
-    /// default exists.
-    pub mode: String,
+    /// Session mode to activate with `session/set_mode`. Required when the
+    /// agent advertises a mode list; must be `None` when it advertises
+    /// none — no `set_mode` call is made then.
+    pub mode: Option<String>,
     /// Session model to set with `session/set_config_option` on the `model`
-    /// option. Required — no default exists.
-    pub model: String,
+    /// option. Required when the agent advertises a `model` option; must be
+    /// `None` when it advertises none.
+    pub model: Option<String>,
     /// Extra `session/set_config_option` values applied after `model`.
     pub config: BTreeMap<String, ConfigValue>,
     /// Permission policy override.
@@ -660,16 +664,17 @@ fn connect(
 /// What the agent accepted during the handshake: the session id and the
 /// effective model and mode, read back from the `session/set_mode` /
 /// `session/set_config_option` answers — the agent's own report, not the
-/// requested strings echoed back.
+/// requested strings echoed back. `model`/`mode` are `None` for an agent
+/// that advertises neither a `model` option nor session modes.
 struct Accepted {
     /// ACP session id (agent-assigned for `session/new`, the adopted id for
     /// `session/load`).
     session_id: String,
     /// The `model` option's current value after `set_config_option`.
-    model: serde_json::Value,
+    model: Option<serde_json::Value>,
     /// The session's current mode after `set_mode`, from the agent's
     /// `current_mode_update` or its acceptance of the request.
-    mode: String,
+    mode: Option<String>,
 }
 
 /// `session/new` or `session/load` — the latter only when the agent
@@ -699,9 +704,9 @@ async fn open_session(
     }
 }
 
-/// `initialize`, `session/new` or `session/load`, `set_mode`, and the
-/// `set_config_option` calls; upserts the registry entry. Returns the
-/// session id and the model/mode the agent accepted.
+/// `initialize`, `session/new` or `session/load`, `set_mode` when a mode
+/// was given, and the `set_config_option` calls; upserts the registry
+/// entry. Returns the session id and the model/mode the agent accepted.
 async fn handshake(
     state: &Arc<AppState>,
     client: &AcpClient<SubagentHandler>,
@@ -721,7 +726,7 @@ async fn handshake(
     // session is registered.
     let config_options = config_options.unwrap_or_default();
     let (modes, options) = check_advertised(&args.agent, args, modes, &config_options)?;
-    let current_mode = modes.current_mode_id.clone();
+    let current_mode = modes.as_ref().map(|modes| modes.current_mode_id.clone());
     let turn_offset = state
         .registry
         .lock()
@@ -732,23 +737,30 @@ async fn handshake(
         let mut inner = rt.inner.lock().expect("inner poisoned");
         inner.session_id.clone_from(&session_id);
         inner.agent_info = init.agent_info;
-        inner.modes = Some(modes);
+        inner.modes = modes;
         inner.config_options = config_options;
         inner.turn_offset = turn_offset;
     }
-    client
-        .set_mode(SessionSetModeParams::new(
-            session_id.clone(),
-            args.mode.clone(),
-        ))
-        .await
-        .map_err(agent_error)?;
-    note_set_mode(
-        &mut rt.inner.lock().expect("inner poisoned"),
-        &current_mode,
-        &args.mode,
-    );
-    let mut accepted_model = serde_json::Value::from(args.model.clone());
+    // `set_mode` runs only for a requested mode — `check_advertised`
+    // already paired it with an advertised mode list.
+    if let Some(mode) = args.mode.as_deref() {
+        client
+            .set_mode(SessionSetModeParams::new(
+                session_id.clone(),
+                mode.to_string(),
+            ))
+            .await
+            .map_err(agent_error)?;
+        note_set_mode(
+            &mut rt.inner.lock().expect("inner poisoned"),
+            current_mode.as_deref(),
+            mode,
+        );
+    }
+    let mut accepted_model = options.get("model").map(|value| match value {
+        ConfigValue::Select(value) => serde_json::Value::from(value.clone()),
+        ConfigValue::Toggle(flag) => serde_json::Value::from(*flag),
+    });
     for (id, value) in options {
         let value = match value {
             ConfigValue::Select(value) => aither_acp::SessionConfigValue::from(value),
@@ -771,7 +783,7 @@ async fn handshake(
                 .and_then(|option| option.current_value.as_ref())
             && let Ok(value) = serde_json::to_value(current)
         {
-            accepted_model = value;
+            accepted_model = Some(value);
         }
         rt.inner.lock().expect("inner poisoned").config_options = updated;
     }
@@ -808,36 +820,75 @@ async fn handshake(
 }
 
 /// Check `args`' mode, model and config values against what the agent
-/// advertised in `session/new`/`session/load`, before anything is applied:
-/// a mode the agent does not list, a config id it does not advertise, or a
-/// select value outside the advertised set fails the launch.
+/// advertised in `session/new`/`session/load`, before anything is applied.
+/// Each of `mode`/`model` pairs with its advertisement: required when the
+/// agent advertises the surface (a mode list / a `model` config option),
+/// rejected when passed to an agent that advertises none, and otherwise
+/// checked the same as before — a mode the agent does not list, a config
+/// id it does not advertise, or a select value outside the advertised set
+/// fails the launch.
 ///
-/// Returns the advertised mode state and the merged `model` + `config`
-/// option map to apply.
+/// Returns the advertised mode state (when there is one) and the merged
+/// `model` + `config` option map to apply.
 fn check_advertised(
     agent: &str,
     args: &Launch,
     modes: Option<SessionModeState>,
     config_options: &[ConfigOption],
-) -> Result<(SessionModeState, BTreeMap<String, ConfigValue>)> {
-    let modes = modes.ok_or_else(|| Error::ModesNotAdvertised {
-        agent: agent.to_string(),
-        value: args.mode.clone(),
-    })?;
-    let valid: Vec<String> = modes
-        .available_modes
-        .iter()
-        .map(|mode| mode.id.clone())
-        .collect();
-    if !valid.contains(&args.mode) {
-        return Err(Error::UnknownMode {
+) -> Result<(Option<SessionModeState>, BTreeMap<String, ConfigValue>)> {
+    let modes = match (modes, args.mode.as_deref()) {
+        (Some(modes), Some(mode)) => {
+            let valid: Vec<String> = modes
+                .available_modes
+                .iter()
+                .map(|mode| mode.id.clone())
+                .collect();
+            if !valid.iter().any(|id| id == mode) {
+                return Err(Error::UnknownMode {
+                    agent: agent.to_string(),
+                    value: mode.to_string(),
+                    valid,
+                });
+            }
+            Some(modes)
+        }
+        (Some(modes), None) => {
+            return Err(Error::ModeRequired {
+                agent: agent.to_string(),
+                valid: modes
+                    .available_modes
+                    .iter()
+                    .map(|mode| mode.id.clone())
+                    .collect(),
+            });
+        }
+        (None, Some(mode)) => {
+            return Err(Error::ModesNotAdvertised {
+                agent: agent.to_string(),
+                value: mode.to_string(),
+            });
+        }
+        (None, None) => None,
+    };
+    // `model` pairs with the `model` config option the same way: required
+    // when the agent advertises one, rejected when given to an agent that
+    // advertises none. A `config`-supplied `model` key counts as given.
+    let mut options = args.config.clone();
+    if let Some(model) = args.model.as_deref() {
+        options.insert("model".to_string(), ConfigValue::Select(model.to_string()));
+    }
+    if config_options.iter().any(|option| option.id == "model") {
+        if !options.contains_key("model") {
+            return Err(Error::ModelRequired {
+                agent: agent.to_string(),
+            });
+        }
+    } else if let Some(model) = args.model.as_deref() {
+        return Err(Error::ModelNotAdvertised {
             agent: agent.to_string(),
-            value: args.mode.clone(),
-            valid,
+            value: model.to_string(),
         });
     }
-    let mut options = args.config.clone();
-    options.insert("model".to_string(), ConfigValue::Select(args.model.clone()));
     for (id, value) in &options {
         check_config_option(agent, config_options, id, value)?;
     }
@@ -847,9 +898,9 @@ fn check_advertised(
 /// Record the mode `set_mode` left in effect: a `current_mode_update`
 /// received while the call was in flight already reported it; with none,
 /// the agent's acceptance of the request stands.
-fn note_set_mode(inner: &mut Inner, prior: &str, requested: &str) {
+fn note_set_mode(inner: &mut Inner, prior: Option<&str>, requested: &str) {
     let modes = inner.modes.as_mut().expect("modes recorded");
-    if modes.current_mode_id == prior {
+    if Some(modes.current_mode_id.as_str()) == prior {
         requested.clone_into(&mut modes.current_mode_id);
     }
 }
@@ -860,7 +911,7 @@ fn note_set_mode(inner: &mut Inner, prior: &str, requested: &str) {
 /// another mode. Without such an option the modes state's current id —
 /// a `current_mode_update` when one arrived, else the accepted request —
 /// is the report.
-fn confirmed_mode(inner: &mut Inner) -> String {
+fn confirmed_mode(inner: &mut Inner) -> Option<String> {
     let confirmed = inner
         .config_options
         .iter()
@@ -870,11 +921,17 @@ fn confirmed_mode(inner: &mut Inner) -> String {
             ConfigOptionValue::Selected(id) => Some(id.clone()),
             ConfigOptionValue::Toggle(_) => None,
         });
-    let modes = inner.modes.as_mut().expect("modes recorded");
-    if let Some(confirmed) = confirmed {
-        modes.current_mode_id = confirmed;
+    match inner.modes.as_mut() {
+        Some(modes) => {
+            if let Some(confirmed) = confirmed {
+                modes.current_mode_id = confirmed;
+            }
+            Some(modes.current_mode_id.clone())
+        }
+        // An agent with no mode list can still report a `mode` config
+        // option's current value; otherwise there is no mode to report.
+        None => confirmed,
     }
-    modes.current_mode_id.clone()
 }
 
 /// Check a `model`/`config` value against the options the agent advertised

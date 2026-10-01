@@ -39,7 +39,10 @@ of its own.
 session/cancel answers the pending prompt (and every steer) with
 stopReason cancelled.
 FAKE_NO_LOAD=1 in the environment makes the agent not advertise loadSession.
-FAKE_NO_MODES=1 makes session/new and session/load return no mode list.
+FAKE_NO_MODES=1 makes the agent advertise no session modes at all:
+session/new and session/load return no mode list and no `mode` config
+option.
+FAKE_NO_MODEL=1 drops the `model` config option from the advertised list.
 FAKE_NO_OPTIONS=1 makes the advertised `model` config option carry no
 selectable values.
 FAKE_MODE_IGNORED=1 makes session/set_mode a no-op: the call succeeds but
@@ -274,31 +277,38 @@ def session_modes():
 def session_config_options():
     """Config options advertised in session/new and session/load, with the
     values currently in effect; FAKE_NO_OPTIONS=1 gives `model` no
-    selectable values."""
-    model = {
-        "id": "model",
-        "name": "Model",
-        "type": "select",
-        "category": "model",
-        "currentValue": current_model,
-    }
-    if os.environ.get("FAKE_NO_OPTIONS") != "1":
-        model["options"] = [
-            {"value": "a", "name": "A"},
-            {"value": "b", "name": "B"},
-        ]
-    mode = {
-        "id": "mode",
-        "name": "Mode",
-        "type": "select",
-        "category": "mode",
-        "currentValue": current_mode,
-        "options": [
-            {"value": "default", "name": "Default"},
-            {"value": "bypass", "name": "Bypass"},
-        ],
-    }
-    return [model, mode]
+    selectable values, FAKE_NO_MODEL=1 drops `model` and FAKE_NO_MODES=1
+    drops `mode` from the list entirely."""
+    options = []
+    if os.environ.get("FAKE_NO_MODEL") != "1":
+        model = {
+            "id": "model",
+            "name": "Model",
+            "type": "select",
+            "category": "model",
+            "currentValue": current_model,
+        }
+        if os.environ.get("FAKE_NO_OPTIONS") != "1":
+            model["options"] = [
+                {"value": "a", "name": "A"},
+                {"value": "b", "name": "B"},
+            ]
+        options.append(model)
+    if os.environ.get("FAKE_NO_MODES") != "1":
+        options.append(
+            {
+                "id": "mode",
+                "name": "Mode",
+                "type": "select",
+                "category": "mode",
+                "currentValue": current_mode,
+                "options": [
+                    {"value": "default", "name": "Default"},
+                    {"value": "bypass", "name": "Bypass"},
+                ],
+            }
+        )
+    return options
 
 
 def session_result(request_id, result):
