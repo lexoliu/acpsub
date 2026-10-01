@@ -304,9 +304,10 @@ async fn close_sub(sub: &Subagent) {
 ///
 /// Returns immediately with `session_id` — the handle every other tool
 /// addresses (`wait` for the reply, `send` for follow-ups, `transcript` for
-/// the full log), plus the `model` and `mode` the agent accepted. The turn
-/// runs in the background. To take over an existing session instead of
-/// starting a new one, use `adopt`.
+/// the full log), plus the `model` and `mode` the agent accepted (`null`
+/// for an agent that advertises neither). The turn runs in the background.
+/// To take over an existing session instead of starting a new one, use
+/// `adopt`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SpawnArgs {
     /// Configured agent key (`[agents.<key>]` in the config file). Optional:
@@ -317,16 +318,20 @@ struct SpawnArgs {
     cwd: PathBuf,
     /// The first turn's prompt — the task for the subagent.
     prompt: String,
-    /// Required: the model to run, set via `session/set_config_option` on
-    /// the `model` option. There is no configured default. The value must
-    /// be one the agent advertises for `model`; the value it reports as
-    /// current comes back in the result.
-    model: String,
-    /// Required: the session mode to activate (`session/set_mode`). There
-    /// is no configured default. The value must be one of the modes the
+    /// The model to run, set via `session/set_config_option` on the
+    /// `model` option. Required when the agent advertises a `model`
+    /// config option; must be omitted when it advertises none — passing
+    /// one then is an error. When given, the value must be one the agent
+    /// advertises; the value it reports as current comes back in the
+    /// result.
+    model: Option<String>,
+    /// The session mode to activate (`session/set_mode`). Required when
+    /// the agent advertises session modes; must be omitted when it
+    /// advertises none — passing one then is an error and no `set_mode`
+    /// call is made. When given, the value must be one of the modes the
     /// agent advertises; the mode it reports as current comes back in the
     /// result.
-    mode: String,
+    mode: Option<String>,
     /// Extra session config options to set (`session/set_config_option`),
     /// applied after `model`: option id → string or boolean. Every id and
     /// value must be one the agent advertises.
@@ -393,10 +398,12 @@ struct AdoptArgs {
     /// or the agent's session database. Required only when neither knows the
     /// session.
     cwd: Option<PathBuf>,
-    /// Required: the model to run, as in `spawn`.
-    model: String,
-    /// Required: the session mode to activate, as in `spawn`.
-    mode: String,
+    /// The model to run, as in `spawn`: required when the agent advertises
+    /// a `model` config option, must be omitted when it advertises none.
+    model: Option<String>,
+    /// The session mode to activate, as in `spawn`: required when the agent
+    /// advertises session modes, must be omitted when it advertises none.
+    mode: Option<String>,
     /// Permission policy override, as in `spawn`.
     permission: Option<PermissionPolicy>,
 }

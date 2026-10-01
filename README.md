@@ -62,9 +62,12 @@ args = ["-y", "@zed-industries/claude-code-acp"]
 `~` expands in all paths. See `config.example.toml`.
 
 `[agents.<name>]` only describes how to launch the agent — session options
-are never configured there. `spawn`/`adopt` take `model` and `mode` as
-required arguments; a missing one is a tool error naming the field, and the
-result reports the model and mode the agent accepted.
+are never configured there. `spawn`/`adopt` take `model` and `mode`
+arguments that pair with what the agent advertises: each is required when
+the agent advertises a `model` config option / session modes, and an error
+when passed to an agent that advertises none (no `set_mode` or
+`set_config_option` call is made then). The result reports the model and
+mode the agent accepted — `null` for an agent without them.
 
 A missing config file is an error naming the path — create it first. `agents`
 with no `[agents.*]` entries serves no agents. The file is re-read on every
@@ -75,12 +78,12 @@ file that fails to parse is a tool error, never a stale fallback.
 
 | tool | arguments | behaviour |
 |---|---|---|
-| `spawn` | `cwd, prompt, model, mode, agent?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. |
-| `adopt` | `session_id, model, mode, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, or an external one such as a Devin session created elsewhere. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
+| `spawn` | `cwd, prompt, model?, mode?, agent?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. `model`/`mode` are required when the agent advertises a `model` option / session modes and must be omitted when it does not (the calls are skipped). Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. |
+| `adopt` | `session_id, model?, mode?, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, or an external one such as a Devin session created elsewhere. Same `model`/`mode` rule as `spawn`. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
 | `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not surface an error), returning `{state: "steered", turn}`. On a promptable subagent all three just start the turn: `{state: "running"}`. |
 | `wait` | `session_id, expect_secs` | Block until the turn ends, a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?}`; a turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. |
 | `wait_any` | `session_ids, expect_secs` | First of them to leave `running` — a turn end, a permission request, or an `overrun`. |
-| `status` | `session_id` | State, cwd, agent, model, mode, turns, queued prompts, transcript path — instant check. |
+| `status` | `session_id` | State, cwd, agent, model, mode (`null` for agents without them), turns, queued prompts, transcript path — instant check. |
 | `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
 | `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
 | `permit` | `session_id, request_id, option_id` | Answer a queued `ask`-policy permission request. |

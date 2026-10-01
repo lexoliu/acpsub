@@ -14,8 +14,10 @@ registry = "~/.local/share/acpsub/registry.json"
                                        #  with several configured errors)
 
 # [agents.<name>] only describes how to launch the agent. Session options
-# are per-call `spawn`/`adopt` arguments: `model` and `mode` are required,
-# other `session/set_config_option` values can be passed via `config`.
+# are per-call `spawn`/`adopt` arguments: `model` and `mode` are required
+# when the agent advertises a `model` option / session modes and must be
+# omitted when it does not; other `session/set_config_option` values can
+# be passed via `config`.
 [agents.devin]
 command = "devin"
 args = ["acp"]

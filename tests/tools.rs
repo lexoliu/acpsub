@@ -1506,8 +1506,14 @@ async fn spawn_and_adopt_require_model_and_mode() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     for (tool, base) in [
-        ("spawn", json!({"cwd": dir.path(), "prompt": "hi"})),
-        ("adopt", json!({"session_id": "s-1", "cwd": dir.path()})),
+        (
+            "spawn",
+            json!({"agent": "fake", "cwd": dir.path(), "prompt": "hi"}),
+        ),
+        (
+            "adopt",
+            json!({"agent": "fake", "session_id": "s-1", "cwd": dir.path()}),
+        ),
     ] {
         let mut missing_model = base.clone();
         missing_model["mode"] = json!("bypass");
@@ -1643,7 +1649,7 @@ async fn spawn_rejects_unverifiable_mode_and_model() {
     let mut args = spawn_args(dir.path(), "hi");
     args["agent"] = json!("nomodes");
     let err = call_err(&tools, "spawn", args).await;
-    assert!(err.contains("cannot check mode 'bypass'"), "{err}");
+    assert!(err.contains("advertises no session modes"), "{err}");
 
     let mut args = spawn_args(dir.path(), "hi");
     args["agent"] = json!("noopts");
@@ -1687,6 +1693,95 @@ async fn adopt_rejects_unadvertised_mode() {
     assert_eq!(adopted["session_id"], sid);
     assert_eq!(adopted["mode"], "bypass", "{adopted}");
     assert_eq!(adopted["model"], "b", "{adopted}");
+}
+
+/// An agent that advertises neither session modes nor a `model` config
+/// option (e.g. `grok agent stdio`) takes neither argument: `spawn`/`adopt`
+/// with them omitted succeed and report `null` for both, while passing one
+/// is an error naming the missing advertisement.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_adopt_agent_without_modes_or_model() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake_agent_config();
+    let agents = BTreeMap::from([
+        (
+            "nomodelmode".to_string(),
+            AgentConfig {
+                env: BTreeMap::from([
+                    ("FAKE_NO_MODES".to_string(), "1".to_string()),
+                    ("FAKE_NO_MODEL".to_string(), "1".to_string()),
+                ]),
+                ..fake.clone()
+            },
+        ),
+        ("fake".to_string(), fake),
+    ]);
+    let (_state, tools) = test_state_with_agents(dir.path(), &agents);
+    let spawn_args = |extra: serde_json::Value| {
+        let mut args = json!({
+            "agent": "nomodelmode",
+            "cwd": dir.path(),
+            "prompt": "hi",
+        });
+        for (key, value) in extra.as_object().expect("object") {
+            args[key] = value.clone();
+        }
+        args
+    };
+
+    // Omitted mode/model spawn and report `null`.
+    let spawned = call_json(&tools, "spawn", spawn_args(json!({}))).await;
+    assert!(spawned["mode"].is_null(), "{spawned}");
+    assert!(spawned["model"].is_null(), "{spawned}");
+    let sid = spawned["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    let status = call_json(&tools, "status", json!({"session_id": sid})).await;
+    assert!(status["mode"].is_null(), "{status}");
+    assert!(status["model"].is_null(), "{status}");
+    wait(&tools, &sid, 60).await;
+    call_json(&tools, "close", json!({"session_id": sid})).await;
+
+    // Adopt likewise takes neither; passing one is an error that names the
+    // missing advertisement, and the session stays adoptable.
+    let err = call_err(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "mode": "bypass"}),
+    )
+    .await;
+    assert!(err.contains("advertises no session modes"), "{err}");
+    let adopted = call_json(&tools, "adopt", json!({"session_id": sid.as_str()})).await;
+    assert!(adopted["mode"].is_null(), "{adopted}");
+    assert!(adopted["model"].is_null(), "{adopted}");
+
+    // spawn errors the same way on each argument.
+    let err = call_err(&tools, "spawn", spawn_args(json!({"mode": "bypass"}))).await;
+    assert!(err.contains("advertises no session modes"), "{err}");
+    let err = call_err(&tools, "spawn", spawn_args(json!({"model": "b"}))).await;
+    assert!(err.contains("advertises no 'model' config option"), "{err}");
+
+    // The reverse still holds: omitting `mode` or `model` for an agent
+    // that advertises them is an error naming the required argument.
+    let err = call_err(
+        &tools,
+        "spawn",
+        json!({"agent": "fake", "cwd": dir.path(), "prompt": "hi", "model": "b"}),
+    )
+    .await;
+    assert!(err.contains("'mode' is required"), "{err}");
+    let err = call_err(
+        &tools,
+        "spawn",
+        json!({"agent": "fake", "cwd": dir.path(), "prompt": "hi", "mode": "bypass"}),
+    )
+    .await;
+    assert!(err.contains("'model' is required"), "{err}");
 }
 
 /// The config file is re-read per call: an agent removed from it is gone
