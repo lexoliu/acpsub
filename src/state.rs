@@ -1093,6 +1093,15 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
     Ok(())
 }
 
+/// The number the next turn takes when its slot is stamped: the settled
+/// count plus one, shifted by `turn_offset`. `begin_turn` assigns it when
+/// `current` is stamped; callers that predict the next turn during the
+/// reserved-slot gap must use this same function so the two numberings
+/// cannot drift apart.
+pub(crate) const fn next_turn_number(inner: &Inner) -> u64 {
+    inner.turn_offset + inner.turns.len() as u64 + 1
+}
+
 /// The shared tail of `start_turn`, `send`'s steer-fallback, and the
 /// queued-turn handoff: marks the turn running, writes the `prompt`
 /// transcript record, and enqueues `session/prompt`.
@@ -1143,7 +1152,7 @@ pub(crate) async fn begin_turn(
                 status,
             });
         }
-        let n = inner.turn_offset + inner.turns.len() as u64 + 1;
+        let n = next_turn_number(&inner);
         inner.current = Some(Turn {
             n,
             started_at: Some(started),
