@@ -697,7 +697,7 @@ async fn wait_overruns_on_chained_turn() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     // "gather" holds turn 1 open until a steered prompt arrives.
     let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
 
@@ -715,6 +715,28 @@ async fn wait_overruns_on_chained_turn() {
         json!({"session_id": sid.as_str(), "prompt": "go", "policy": "steer"}),
     )
     .await;
+
+    // `wait` binds to the turn in flight when it is called: hold it until
+    // turn 1 has settled — `rt.notify` fires at the settle — so the call
+    // awaits the chained turn 2 whether or not `begin_turn` has run yet.
+    let sub = state.get(&sid).expect("live subagent");
+    let turn_one_settled = async {
+        loop {
+            let notified = sub.rt.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = sub.rt.inner.lock().expect("inner poisoned");
+                if inner.turns.len() == 1 {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), turn_one_settled)
+        .await
+        .expect("turn 1 did not settle");
 
     let out = wait(&tools, &sid, 2).await;
     assert_eq!(out["state"], "overrun", "{out}");
@@ -734,7 +756,7 @@ async fn wait_overruns_on_materialized_steer_turn() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     // queueagent parks a concurrent prompt agent-side and runs it as its
     // own turn after "hold" ends.
     let mut args = spawn_args(dir.path(), "hold");
@@ -746,6 +768,28 @@ async fn wait_overruns_on_materialized_steer_turn() {
         json!({"session_id": sid.as_str(), "prompt": "wait", "policy": "steer"}),
     )
     .await;
+
+    // `wait` binds to the turn in flight when it is called: hold it until
+    // the steered prompt has materialized as turn 2 — `rt.notify` fires
+    // on materialization — so the call awaits it rather than turn 1.
+    let sub = state.get(&sid).expect("live subagent");
+    let steer_turn_open = async {
+        loop {
+            let notified = sub.rt.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = sub.rt.inner.lock().expect("inner poisoned");
+                if inner.current.as_ref().is_some_and(|turn| turn.n == 2) {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), steer_turn_open)
+        .await
+        .expect("steered prompt did not materialize as turn 2");
 
     let out = wait(&tools, &sid, 2).await;
     assert_eq!(out["state"], "overrun", "{out}");
