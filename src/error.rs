@@ -247,6 +247,19 @@ pub enum Error {
         detail: String,
     },
 
+    /// The daemon socket is already served by a live process.
+    #[error("a daemon is already serving {0}")]
+    DaemonRunning(PathBuf),
+
+    /// The daemon socket could not be reached.
+    #[error("cannot reach acpsub daemon at {path}: {source}")]
+    DaemonConnect {
+        /// Socket path the client tried.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
     /// A filesystem or registry I/O error.
     #[error("{context}: {source}")]
     Io {

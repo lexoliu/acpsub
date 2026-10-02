@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use aither_acp::{ConfigOption, ConfigOptionValue, ConfigSelectOptions, RequestPermissionOutcome};
@@ -16,13 +15,12 @@ use aither_core::llm::tool::{Progress, Tool, ToolContext, Tools};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::debug;
 
 use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Gate, Launch, Status, Subagent, begin_turn, launch, prompt_slot_free,
+    AppState, Gate, Launch, Status, Subagent, begin_turn, close_sub, launch, prompt_slot_free,
     record_queue_dropped, spawn_turn_task, start_turn, steer_resolved, steer_turn, steer_waiter,
 };
 use crate::transcript::{RenderOptions, render};
@@ -267,34 +265,6 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
     view
 }
 
-/// Close procedure shared by the `close` and `forget` tools.
-async fn close_sub(sub: &Subagent) {
-    sub.rt.closing.store(true, Ordering::Relaxed);
-    {
-        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-        for pending in inner.pending.drain(..) {
-            let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
-        }
-        inner.queue.clear();
-        inner.steer_pending.clear();
-        inner.steer_owner = None;
-        if matches!(inner.status, Status::Running | Status::NeedsPermission) {
-            inner.status = Status::Cancelled;
-        }
-    }
-    sub.client.clone().close();
-    let conn = sub.conn.lock().expect("conn poisoned").take();
-    if let Some(conn) = conn
-        && let Err(error) = conn.await
-    {
-        debug!(%error, "connection task join failed");
-    }
-    let pump = sub.stderr_pump.lock().expect("stderr pump poisoned").take();
-    if let Some(pump) = pump {
-        pump.abort();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // spawn / adopt
 // ---------------------------------------------------------------------------
@@ -334,6 +304,11 @@ struct SpawnArgs {
     /// Permission policy for this subagent: `allow` auto-approves, `deny`
     /// auto-rejects, `ask` queues requests for the `permit` tool.
     permission: Option<PermissionPolicy>,
+    /// Pid of the coordinator process this subagent belongs to. When the
+    /// server runs as a daemon it reaps the subagent once that pid dies,
+    /// so a session cannot outlive its coordinator as an orphan. Omit to
+    /// leave the subagent unowned.
+    owner: Option<u32>,
 }
 
 struct SpawnTool(Arc<AppState>);
@@ -360,6 +335,7 @@ impl Tool for SpawnTool {
                 config: args.config.unwrap_or_default(),
                 permission: args.permission,
                 load: None,
+                owner: args.owner,
             },
         )
         .await?;
@@ -399,6 +375,8 @@ struct AdoptArgs {
     mode: String,
     /// Permission policy override, as in `spawn`.
     permission: Option<PermissionPolicy>,
+    /// Owning coordinator pid, as in `spawn`.
+    owner: Option<u32>,
 }
 
 struct AdoptTool(Arc<AppState>);
@@ -469,6 +447,7 @@ impl Tool for AdoptTool {
                 config: BTreeMap::new(),
                 permission: args.permission,
                 load: Some(args.session_id),
+                owner: args.owner,
             },
         )
         .await?;

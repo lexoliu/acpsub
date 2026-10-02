@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(cli)* `acpsub daemon` serves the tool set over a Unix socket
+  (`~/.local/share/acpsub/daemon.sock`), holding sessions independently of
+  any MCP host; every tool is also a client subcommand
+  (`acpsub spawn|adopt|send|wait|wait-any|status|result|cancel|permit|list|close|forget|agents-live`),
+  and a client auto-starts the daemon when the socket is silent. `wait`
+  blocking in a background process replaces a blocking MCP `tools/call`
+- *(daemon)* orphan reaping: a subagent spawned with `--owner PID` is closed
+  once that pid is dead, so sessions cannot outlive their coordinator
+- *(tools)* `spawn`/`adopt` accept an optional `owner` pid
 - *(tools)* [**breaking**] `send` takes a required `policy` — `try` (the
   original behaviour), `queued` (park the prompt, fire it as the next turn),
   or `steer` (inject into the running turn) ([#34](https://github.com/lexoliu/acpsub/issues/34))

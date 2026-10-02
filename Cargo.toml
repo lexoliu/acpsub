@@ -26,6 +26,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive"] }
 futures-lite = "2"
 async-process = "2"
+async-net = "2"
+libc = "0.2"
 jiff = "0.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
