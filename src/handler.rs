@@ -82,9 +82,10 @@ impl ClientHandler for SubagentHandler {
         // steer's `session/prompt` resolves.
         let (turn_n, materialized) = {
             let mut inner = self.rt.inner.lock().expect("inner poisoned");
-            let materialized = inner.current.is_none()
-                && oldest_steer(&inner).is_some()
-                && !matches!(inner.status, Status::Failed(_));
+            // `failed` is not excluded: the agent is still live, so a steer
+            // that was already on the wire when the turn failed can still
+            // run — and be tracked — as a turn of its own.
+            let materialized = inner.current.is_none() && oldest_steer(&inner).is_some();
             if materialized {
                 let n = inner.turn_offset + inner.turns.len() as u64 + 1;
                 inner.current = Some(Turn {

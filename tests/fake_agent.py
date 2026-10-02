@@ -20,6 +20,8 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 - "gather" -> the prompt completes once a steered prompt arrives; the
   steered text is recorded into the reply.
 - "die" -> the process exits mid-turn with status 3.
+- "fail" -> the prompt's request returns a JSON-RPC error; the process
+  stays alive (a dropped model stream, a backend error).
 
 A session/prompt that arrives while a prompt is pending is a steer: its
 request resolves with the same result as the turn's own prompt, and its
@@ -325,6 +327,20 @@ def on_prompt(request_id, params):
     text = (params.get("prompt") or [{}])[0].get("text", "")
     if text == "die":
         sys.exit(3)
+    if text == "fail":
+        # The request errors but the process keeps running — a failed turn
+        # on a live agent.
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "stream disconnected before completion",
+                },
+            }
+        )
+        return
     if pending_prompt is not None:
         # A prompt arriving while a turn runs is a steer injection — unless
         # FAKE_NO_STEER=1 rejects it, FAKE_QUEUE_PROMPTS=1 parks it

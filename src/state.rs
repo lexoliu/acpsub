@@ -150,8 +150,12 @@ pub enum Status {
     Done(StopReason),
     /// The last turn was cancelled.
     Cancelled,
-    /// The agent errored or exited; carries the reason.
+    /// The last turn errored while the agent process stays alive; the same
+    /// session takes another prompt. Carries the reason.
     Failed(String),
+    /// The agent process exited; the session is a husk `adopt` reaps (or
+    /// `close`/`forget` removes). Carries the reason.
+    Exited(String),
 }
 
 impl Status {
@@ -165,13 +169,19 @@ impl Status {
             Self::Done(_) => "done",
             Self::Cancelled => "cancelled",
             Self::Failed(_) => "failed",
+            Self::Exited(_) => "exited",
         }
     }
 
-    /// Whether a `send`/`spawn` prompt may start a new turn.
+    /// Whether a `send`/`spawn` prompt may start a new turn: `failed`
+    /// qualifies because the agent process is still alive — the turn
+    /// errored, not the session.
     #[must_use]
     pub const fn accepts_prompt(&self) -> bool {
-        matches!(self, Self::Idle | Self::Done(_) | Self::Cancelled)
+        matches!(
+            self,
+            Self::Idle | Self::Done(_) | Self::Cancelled | Self::Failed(_)
+        )
     }
 }
 
@@ -377,7 +387,7 @@ pub struct Subagent {
     pub transcript_path: PathBuf,
     /// The ACP client handle.
     pub client: AcpClient<SubagentHandler>,
-    /// Connection driver task; also marks the subagent failed on disconnect.
+    /// Connection driver task; also marks the subagent `exited` on disconnect.
     /// Taken by `close`/`forget` to await shutdown.
     pub conn: Mutex<Option<JoinHandle<()>>>,
     /// stderr pump task; taken by `close`/`forget`.
@@ -454,12 +464,27 @@ pub async fn launch(state: &Arc<AppState>, config: &Config, args: Launch) -> Res
     // Claim the session id atomically across the live and in-flight maps:
     // the MCP server runs `tools/call`s concurrently, so two `adopt`s of one
     // session could interleave between this check and `live.insert` below.
+    // An `exited` live entry is a husk — its agent process is already gone —
+    // so `adopt` reaps it here rather than requiring a `close` first.
     if let Some(session_id) = &args.load {
         validate_session_id(session_id)?;
-        let live = state.live.lock().expect("live poisoned");
-        let mut reserved = state.reserved.lock().expect("reserved poisoned");
-        if live.contains_key(session_id) || !reserved.insert(session_id.clone()) {
-            return Err(Error::SessionLive(session_id.clone()));
+        let reap = {
+            let mut live = state.live.lock().expect("live poisoned");
+            let mut reserved = state.reserved.lock().expect("reserved poisoned");
+            let husk = live.get(session_id).is_some_and(|sub| {
+                matches!(
+                    sub.rt.inner.lock().expect("inner poisoned").status,
+                    Status::Exited(_)
+                )
+            });
+            if (live.contains_key(session_id) && !husk) || !reserved.insert(session_id.clone()) {
+                return Err(Error::SessionLive(session_id.clone()));
+            }
+            drop(reserved);
+            if husk { live.remove(session_id) } else { None }
+        };
+        if let Some(sub) = reap {
+            close_sub(&sub).await;
         }
     }
     let result = launch_inner(state, config, &args, agent_cfg, cwd).await;
@@ -1002,17 +1027,19 @@ fn check_config_option(
     }
 }
 
-/// Connection task epilogue: a dead agent marks the subagent failed unless
-/// `close`/`forget` set the closing flag first.
+/// Connection task epilogue: a dead agent marks the subagent `exited` unless
+/// `close`/`forget` set the closing flag first. A `failed` turn's reason is
+/// folded into the exit reason — the exit is the terminal fact.
 fn on_disconnect(rt: &SubRuntime) {
     if rt.closing.load(Ordering::Relaxed) {
         return;
     }
     let mut inner = rt.inner.lock().expect("inner poisoned");
-    if matches!(inner.status, Status::Failed(_)) {
-        return;
-    }
-    inner.status = Status::Failed("agent process exited".to_string());
+    let reason = match &inner.status {
+        Status::Failed(reason) => format!("agent process exited (earlier failure: {reason})"),
+        _ => "agent process exited".to_string(),
+    };
+    inner.status = Status::Exited(reason);
     inner.pending.clear();
     inner.queue.clear();
     inner.steer_pending.clear();
@@ -1021,6 +1048,37 @@ fn on_disconnect(rt: &SubRuntime) {
     inner.current = None;
     drop(inner);
     rt.notify.notify_waiters();
+}
+
+/// Close procedure shared by the `close` and `forget` tools and by `adopt`
+/// reaping an `exited` husk: drop pending requests and queues, close the
+/// client, and take the connection and stderr tasks down.
+pub(crate) async fn close_sub(sub: &Subagent) {
+    sub.rt.closing.store(true, Ordering::Relaxed);
+    {
+        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+        for pending in inner.pending.drain(..) {
+            let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
+        }
+        inner.queue.clear();
+        inner.steer_pending.clear();
+        inner.steer_folded.clear();
+        inner.steer_owner = None;
+        if matches!(inner.status, Status::Running | Status::NeedsPermission) {
+            inner.status = Status::Cancelled;
+        }
+    }
+    sub.client.clone().close();
+    let conn = sub.conn.lock().expect("conn poisoned").take();
+    if let Some(conn) = conn
+        && let Err(error) = conn.await
+    {
+        debug!(%error, "connection task join failed");
+    }
+    let pump = sub.stderr_pump.lock().expect("stderr pump poisoned").take();
+    if let Some(pump) = pump {
+        pump.abort();
+    }
 }
 
 /// Pump agent stderr into the tail buffer and tracing.
@@ -1169,7 +1227,13 @@ pub(crate) async fn begin_turn(
     if let Err(source) = sub.rt.transcript.lock().await.append(&record).await {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         inner.current = None;
-        inner.status = Status::Failed(format!("cannot write transcript: {source}"));
+        // `failed`, not `exited`: the agent process is still alive — the
+        // turn could not be logged, but the next `send` retries the write
+        // and either runs the turn or reports the I/O error again. A
+        // disconnect that landed in between keeps `exited`.
+        if !matches!(inner.status, Status::Exited(_)) {
+            inner.status = Status::Failed(format!("cannot write transcript: {source}"));
+        }
         drop(inner);
         sub.rt.notify.notify_waiters();
         return Err(Error::io("cannot write transcript", source));
@@ -1343,7 +1407,7 @@ pub(crate) async fn steer_resolved(
         let kick = !mine
             && inner.steer_pending.is_empty()
             && inner.current.is_none()
-            && matches!(inner.status, Status::Done(_))
+            && inner.status.accepts_prompt()
             && !inner.queue.is_empty();
         let prompt = if kick {
             inner.status = Status::Running;
@@ -1417,7 +1481,11 @@ fn settle_turn(
         inner.turns.push(turn);
     }
     let folded = fold_pending_steers(rt, &mut inner);
-    let (next, dropped) = if reason == StopReason::Cancelled {
+    let (next, dropped) = if matches!(inner.status, Status::Exited(_)) {
+        // The process died while the turn was in flight; `on_disconnect`
+        // already cleared the queue and steers and owns the status.
+        (None, VecDeque::new())
+    } else if reason == StopReason::Cancelled {
         inner.status = Status::Cancelled;
         (None, std::mem::take(&mut inner.queue))
     } else if inner.steer_pending.is_empty()
@@ -1453,14 +1521,18 @@ fn fold_pending_steers(rt: &SubRuntime, inner: &mut Inner) -> Vec<u64> {
 }
 
 /// Push the finished turn into `turns`, mark the subagent `failed`, and
-/// return the dropped queue and the ids of steers settled as folded.
+/// return the dropped queue and the ids of steers settled as folded. A turn
+/// error that lands after `on_disconnect` does not downgrade `exited` — the
+/// dead process cannot take the prompt `failed` would invite.
 fn fail_turn(rt: &SubRuntime, reason: String) -> (VecDeque<String>, Vec<u64>) {
     let mut inner = rt.inner.lock().expect("inner poisoned");
     if let Some(turn) = inner.current.take() {
         inner.turns.push(turn);
     }
     let folded = fold_pending_steers(rt, &mut inner);
-    inner.status = Status::Failed(reason);
+    if !matches!(inner.status, Status::Exited(_)) {
+        inner.status = Status::Failed(reason);
+    }
     (std::mem::take(&mut inner.queue), folded)
 }
 

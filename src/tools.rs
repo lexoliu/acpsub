@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use aither_acp::{
@@ -18,13 +17,12 @@ use aither_core::llm::tool::{Progress, Tool, ToolContext, Tools};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::debug;
 
 use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Gate, Launch, Status, Subagent, begin_turn, launch, next_turn_number,
+    AppState, Gate, Launch, Status, Subagent, begin_turn, close_sub, launch, next_turn_number,
     prompt_slot_free, record_queue_dropped, spawn_turn_task, start_turn, steer_resolved,
     steer_turn, steer_waiter,
 };
@@ -70,7 +68,7 @@ pub fn build_tools(state: Arc<AppState>) -> aither_core::Result<Tools> {
 
 /// [`build_tools`] with an explicit report interval: the seam tests
 /// inject a short interval through — production callers use
-/// [`build_tools`], which reports every [`PROGRESS_INTERVAL`].
+/// [`build_tools`], which reports every `PROGRESS_INTERVAL`.
 ///
 /// # Errors
 ///
@@ -343,7 +341,7 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool, awaited: Option<u6
             Status::Cancelled => {
                 view["stop_reason"] = json!("cancelled");
             }
-            Status::Failed(reason) => {
+            Status::Failed(reason) | Status::Exited(reason) => {
                 view["error"] = json!(reason);
             }
             _ => {}
@@ -353,35 +351,6 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool, awaited: Option<u6
         view["pending_permission"] = pending;
     }
     view
-}
-
-/// Close procedure shared by the `close` and `forget` tools.
-async fn close_sub(sub: &Subagent) {
-    sub.rt.closing.store(true, Ordering::Relaxed);
-    {
-        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-        for pending in inner.pending.drain(..) {
-            let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
-        }
-        inner.queue.clear();
-        inner.steer_pending.clear();
-        inner.steer_folded.clear();
-        inner.steer_owner = None;
-        if matches!(inner.status, Status::Running | Status::NeedsPermission) {
-            inner.status = Status::Cancelled;
-        }
-    }
-    sub.client.clone().close();
-    let conn = sub.conn.lock().expect("conn poisoned").take();
-    if let Some(conn) = conn
-        && let Err(error) = conn.await
-    {
-        debug!(%error, "connection task join failed");
-    }
-    let pump = sub.stderr_pump.lock().expect("stderr pump poisoned").take();
-    if let Some(pump) = pump {
-        pump.abort();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +437,9 @@ impl Tool for SpawnTool {
 /// The session becomes a live subagent addressed by `session_id` — `send`,
 /// `wait`, `transcript`, and the rest work as usual. When `prompt` is given
 /// its turn starts immediately; otherwise the session idles until `send`.
+///
+/// A live session whose agent process exited (`exited` state) is reaped by
+/// `adopt` — no `close` needed first.
 ///
 /// `cwd` is optional: it is taken from the registry for sessions acpsub
 /// knows, or discovered from the agent's session database (e.g. devin's
@@ -578,7 +550,9 @@ impl Tool for AdoptTool {
 
 /// Send a prompt to a live subagent. `policy` decides what a `running` (or
 /// `needs_permission`) subagent does with it; nothing is queued or injected
-/// unless you ask.
+/// unless you ask. A `failed` subagent — the last turn errored but the
+/// agent is still live — takes the prompt as a fresh turn, like `done`;
+/// an `exited` one (the agent process is gone) errors — `adopt` it instead.
 ///
 /// Returns immediately; use `wait` for the reply.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -590,9 +564,10 @@ struct SendArgs {
     /// Required: how to deliver while a turn is running.
     ///
     /// `try` — the original behavior: error unless the subagent is `idle`,
-    /// `done`, or `cancelled`. `queued` — park the prompt on a FIFO queue;
-    /// it fires as the next turn when the current one ends, and is dropped
-    /// if that turn is cancelled or fails, or on `cancel`/`close`/`forget`.
+    /// `done`, `cancelled`, or `failed`. `queued` — park the prompt on a
+    /// FIFO queue; it fires as the next turn when the current one ends, and
+    /// is dropped if that turn is cancelled or fails, or on
+    /// `cancel`/`close`/`forget`.
     /// `steer` — inject the prompt into the running turn (a second
     /// `session/prompt` while it is in flight); agents that support
     /// mid-turn injection fold it into the active task, agents that do not
@@ -610,7 +585,8 @@ struct SendArgs {
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum SendPolicy {
-    /// Error when the subagent is not `idle`, `done`, or `cancelled`.
+    /// Error when the subagent is not `idle`, `done`, `cancelled`, or
+    /// `failed`.
     Try,
     /// Park the prompt on the subagent's queue; it fires as the next turn
     /// when the current one ends.
@@ -647,7 +623,7 @@ impl Tool for SendTool {
                         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
                         if prompt_slot_free(&inner) && inner.queue.is_empty() {
                             Action::Fresh
-                        } else if matches!(inner.status, Status::Failed(_)) {
+                        } else if matches!(inner.status, Status::Exited(_)) {
                             return Err(Error::NotPromptable {
                                 session_id: args.session_id.clone(),
                                 status: inner.status.name().to_string(),
@@ -684,7 +660,7 @@ impl Tool for SendTool {
                     inner.status.clone()
                 };
                 match status {
-                    Status::Idle | Status::Done(_) | Status::Cancelled => {
+                    Status::Idle | Status::Done(_) | Status::Cancelled | Status::Failed(_) => {
                         let (turn_n, fut) =
                             begin_turn(&self.0, &sub, args.prompt, Gate::Check, false).await?;
                         spawn_turn_task(self.0.clone(), &sub, fut, turn_n);
@@ -721,7 +697,7 @@ impl Tool for SendTool {
                             "turn": turn_n,
                         }));
                     }
-                    Status::Failed(_) => {
+                    Status::Exited(_) => {
                         drop(wire);
                         return Err(Error::NotPromptable {
                             session_id: args.session_id.clone(),
@@ -745,7 +721,7 @@ impl Tool for SendTool {
 /// `expect_secs`. The wait binds to that turn's number: a queued or
 /// steered turn that starts afterwards does not extend it.
 ///
-/// Returns the subagent state (`done`/`cancelled`/`failed`/
+/// Returns the subagent state (`done`/`cancelled`/`failed`/`exited`/
 /// `needs_permission`), the turn's `reply` (concatenated agent message
 /// text), its tool calls, and — when `needs_permission` — the
 /// `pending_permission` request to answer with `permit`. When the turn has
@@ -964,7 +940,7 @@ impl StatusTool {
             if let Some(reason) = last_stop {
                 view["last_stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
             }
-            if let Status::Failed(reason) = &status {
+            if let Status::Failed(reason) | Status::Exited(reason) = &status {
                 view["error"] = json!(reason);
             }
             return Ok(view);

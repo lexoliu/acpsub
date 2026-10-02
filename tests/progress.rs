@@ -36,8 +36,11 @@ impl ProgressSink for Collect {
 }
 
 /// Run a blocked `wait`/`wait_any` call against `session_id`, collecting
-/// the reports its context delivers; returns after three arrive and
-/// `cancel` ends the turn and the call.
+/// the reports its context delivers. Returns once at least three arrive
+/// and one names the turn's latest tool call — the agent's `tool_call`
+/// update can still be in flight when the first reports fire, and once it
+/// lands every later report carries the title. `cancel` then ends the turn
+/// and the call.
 async fn reports_while_blocked(
     tools: &Arc<Tools>,
     name: &str,
@@ -52,15 +55,29 @@ async fn reports_while_blocked(
             call_with(&tools, &name, args, ToolContext::with_progress(Collect(tx))).await
         })
     };
-    let mut seen = Vec::new();
-    while seen.len() < 3 {
-        seen.push(
-            tokio::time::timeout(Duration::from_secs(5), reports.recv())
+    let collect = async {
+        let mut seen = Vec::new();
+        loop {
+            let report = tokio::time::timeout(Duration::from_secs(5), reports.recv())
                 .await
                 .expect("a progress report within 5 s")
-                .expect("sink alive while the call waits"),
-        );
-    }
+                .expect("sink alive while the call waits");
+            // A report names the latest tool call as
+            // "<session_id>: <title>" once the update has landed.
+            let titled = report
+                .0
+                .message()
+                .is_some_and(|m| m.starts_with(&format!("{session_id}: ")));
+            seen.push(report);
+            if seen.len() >= 3 && titled {
+                return seen;
+            }
+        }
+    };
+    // The timeout only turns a hang into a failure.
+    let seen = tokio::time::timeout(Duration::from_secs(60), collect)
+        .await
+        .expect("no report named the latest tool call");
     call(tools, "cancel", json!({"session_id": session_id}))
         .await
         .expect("cancel");
@@ -87,8 +104,7 @@ fn assert_reports(seen: &[(Progress, Instant)], session_id: &str) {
         let message = p.message().expect("progress message");
         assert!(message.contains(session_id), "{message}");
     }
-    // The first report can precede the agent's tool_call update; later ones
-    // carry its title.
+    // The reports collected run until one named the latest tool call.
     assert!(
         seen.iter()
             .any(|(p, _)| p.message().is_some_and(|m| m.contains("fake-tool"))),
