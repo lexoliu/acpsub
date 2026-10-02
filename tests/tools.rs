@@ -135,7 +135,7 @@ async fn send_queued_fires_after_turn() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
 
     let queued = call_json(
@@ -159,10 +159,14 @@ async fn send_queued_fires_after_turn() {
     assert_eq!(steered["state"], "steered", "{steered}");
     assert_eq!(steered["turn"], 1);
 
-    // The queued prompt runs as turn 2 with no done interlude; `wait`
-    // returns when it ends.
+    // The queued prompt runs as turn 2 with no done interlude: the state
+    // stays `running` through the handoff, so `done` can only mean turn 2
+    // ended. A bare `wait` could instead bind to turn 1 and return before
+    // the chain completed.
+    status_becomes(&state, &sid, "done").await;
     let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["turn"], 2, "{done}");
     let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(status["turns"], 2);
     assert_eq!(status["queued"], json!([]));
