@@ -260,3 +260,26 @@ pub async fn wait(tools: &Tools, session_id: &str, expect_secs: u64) -> Value {
     )
     .await
 }
+
+/// Block on `rt.notify` until the live subagent's status is `want`. For
+/// transitions that fire off the turn path — e.g. the `exited` mark a dead
+/// agent's connection task stamps, which a `wait` call may race — where a
+/// single `wait` result cannot be relied on. The timeout only turns a hang
+/// into a failure.
+pub async fn status_becomes(state: &AppState, session_id: &str, want: &str) {
+    let sub = state.get(session_id).expect("live subagent");
+    let reached = async {
+        loop {
+            let notified = sub.rt.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if sub.rt.inner.lock().expect("inner poisoned").status.name() == want {
+                return;
+            }
+            notified.await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), reached)
+        .await
+        .unwrap_or_else(|_| panic!("session {session_id} never reached '{want}'"));
+}

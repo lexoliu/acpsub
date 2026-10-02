@@ -234,8 +234,8 @@ async fn send_queued_dropped_on_cancel() {
     assert_eq!(done["state"], "done");
 }
 
-/// Queued prompts drop when the turn fails; the steer that kills the agent
-/// surfaces its error to the `send` caller.
+/// Queued prompts drop when the agent dies; the steer that kills it
+/// surfaces its error to the `send` caller and the session ends `exited`.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_queued_dropped_on_failure() {
     if !python3() {
@@ -243,7 +243,7 @@ async fn send_queued_dropped_on_failure() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
 
     let queued = call_json(
@@ -264,10 +264,48 @@ async fn send_queued_dropped_on_failure() {
     assert_ne!(err, "");
 
     let done = wait(&tools, &sid, 60).await;
-    assert_eq!(done["state"], "failed", "{done}");
+    // The turn error and the process exit race; `exited` always wins.
+    assert!(
+        matches!(done["state"].as_str(), Some("failed" | "exited")),
+        "{done}"
+    );
+    status_becomes(&state, &sid, "exited").await;
     let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
-    assert_eq!(status["state"], "failed", "{status}");
+    assert_eq!(status["state"], "exited", "{status}");
     assert_eq!(status["queued"], json!([]), "{status}");
+}
+
+/// A turn that fails while the agent process stays alive leaves the session
+/// `failed` — resumable: `send` starts the next turn on the same ACP
+/// session and its reply arrives (issue #51).
+#[tokio::test(flavor = "multi_thread")]
+async fn send_resumes_after_failed_turn() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    // "fail" makes the agent answer session/prompt with a JSON-RPC error
+    // while staying alive — a dropped model stream, not a dead process.
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "fail")).await;
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "failed", "{done}");
+
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "hi", "policy": "try"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["reply"], "Hello abworld", "{done}");
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["turns"], 2, "{status}");
+    assert_eq!(status["state"], "done", "{status}");
 }
 
 /// A `steer` on a promptable subagent just starts the turn.
@@ -1435,8 +1473,8 @@ async fn agents_tool_reports_initialized() {
 }
 
 /// The `die` prompt makes the agent exit mid-turn: the turn fails, the
-/// subagent reports `failed`, and the registry entry survives so the session
-/// can be adopted after `close`.
+/// subagent settles `exited`, and the registry entry survives so the session
+/// stays adoptable after `close`.
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_death_mid_turn_marks_failed() {
     if !python3() {
@@ -1444,18 +1482,23 @@ async fn agent_death_mid_turn_marks_failed() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     let sid = spawn_id(&tools, spawn_args(dir.path(), "die")).await;
     let done = wait(&tools, &sid, 60).await;
-    assert_eq!(done["state"], "failed", "{done}");
+    // The turn error and the process exit race; `exited` always wins.
     assert!(
-        done["error"].as_str().is_some_and(|e| !e.is_empty()),
+        matches!(done["state"].as_str(), Some("failed" | "exited")),
         "{done}"
     );
+    status_becomes(&state, &sid, "exited").await;
 
     let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
-    assert_eq!(status["state"], "failed");
+    assert_eq!(status["state"], "exited");
     assert_eq!(status["live"], true);
+    assert!(
+        status["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{status}"
+    );
 
     // The registry entry outlives the process: after `close` the session is
     // adoptable again via session/load.
@@ -1469,6 +1512,32 @@ async fn agent_death_mid_turn_marks_failed() {
     assert_eq!(adopted["session_id"], sid);
     let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done");
+}
+
+/// An `exited` subagent is no longer live: `adopt` reaps the dead runtime
+/// and loads the session on a fresh process — no `close` first (issue #51).
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_reaps_exited_subagent() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "die")).await;
+    wait(&tools, &sid, 60).await;
+    status_becomes(&state, &sid, "exited").await;
+
+    let adopted = call_json(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "prompt": "hi", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    assert_eq!(adopted["session_id"], sid, "{adopted}");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["reply"], "Hello abworld", "{done}");
 }
 
 /// `KILL <cmd>` has the agent create a terminal running `sleep 60`, call
