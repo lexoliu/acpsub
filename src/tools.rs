@@ -68,7 +68,7 @@ pub fn build_tools(state: Arc<AppState>) -> aither_core::Result<Tools> {
 
 /// [`build_tools`] with an explicit report interval: the seam tests
 /// inject a short interval through — production callers use
-/// [`build_tools`], which reports every [`PROGRESS_INTERVAL`].
+/// [`build_tools`], which reports every `PROGRESS_INTERVAL`.
 ///
 /// # Errors
 ///
