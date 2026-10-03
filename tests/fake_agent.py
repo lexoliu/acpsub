@@ -26,6 +26,16 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 - "fail" -> the prompt's request returns a JSON-RPC error; the process
   stays alive (a dropped model stream, a backend error).
 
+FAKE_RATE_LIMIT=<secs> makes the agent's provider rate-limit it: a
+prompt containing "ratelimit" starts a per-user window of that length,
+and every prompt while the window is open answers a -32010 error whose
+data carries `cognition.ai/errorKind: "unavailable"` and
+`cognition.ai/retryable: true` — the shape Devin reports its free-model
+limit with. The reset is named in the message's `(at HH:MM:SS UTC)`
+clause; FAKE_RATE_LIMIT_VAGUE=1 strips the clause, so no readable reset
+exists at all. FAKE_RATE_LIMIT_DELAY=<secs> answers the error after a
+beat, keeping the turn in flight for a bound `wait`.
+
 A session/prompt that arrives while a prompt is pending is a steer: its
 request resolves with the same result as the turn's own prompt, and its
 text joins the turn via "steer:<text>" in the reply. FAKE_NO_STEER=1 makes
@@ -50,6 +60,8 @@ option.
 FAKE_NO_MODEL=1 drops the `model` config option from the advertised list.
 FAKE_NO_OPTIONS=1 makes the advertised `model` config option carry no
 selectable values.
+FAKE_RATE_LIMIT=<secs> makes "ratelimit" prompts — then every prompt
+until the window lifts — answer the Devin rate-limit shape.
 FAKE_MODE_IGNORED=1 makes session/set_mode a no-op: the call succeeds but
 the session's mode — reported by the `mode` config option — never changes.
 Session ids are `sess-<pid>-<n>` so concurrently spawned agents never
@@ -57,6 +69,7 @@ collide.
 """
 
 import json
+import math
 import os
 import shlex
 import sys
@@ -85,6 +98,7 @@ def update(session_id, update_payload):
 
 pending_prompt = None
 pending_text = ""
+rate_limited_until = None  # epoch seconds the provider limit binds until
 steered = []        # request ids of prompts injected mid-turn
 queued = []         # (request_id, text) parked in FAKE_QUEUE_PROMPTS mode
 session_id = ""
@@ -384,8 +398,41 @@ def session_result(request_id, result):
     respond(request_id, result)
 
 
+def rate_limit_error(request_id):
+    """Answer the prompt with the provider rate-limit shape: -32010 with
+    structured `errorKind`/`retryable`, the reset in the message's
+    `(at HH:MM:SS UTC)` clause (unless FAKE_RATE_LIMIT_VAGUE)."""
+    remaining = max(0.1, rate_limited_until - time.time())
+    # Whole-second truncation must round up: a clause that names a time
+    # before the window lifts would resume the session early — into a
+    # still-active limit.
+    reset_utc = time.strftime("%H:%M:%S", time.gmtime(math.ceil(rate_limited_until)))
+    data = {
+        "cognition.ai/errorKind": "unavailable",
+        "cognition.ai/retryable": True,
+    }
+    if os.environ.get("FAKE_RATE_LIMIT_VAGUE") == "1":
+        message = (
+            "Reached free model rate limit. Please switch to a "
+            "different model. (trace ID: t-%d)" % os.getpid()
+        )
+    else:
+        message = (
+            "Reached free model rate limit. Please switch to a different model. "
+            "Your limit will reset in %d minutes (at %s UTC). (trace ID: t-%d)"
+            % (int(remaining // 60) + 1, reset_utc, os.getpid())
+        )
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32010, "message": message, "data": data},
+        }
+    )
+
+
 def on_prompt(request_id, params):
-    global session_id
+    global session_id, rate_limited_until
     session_id = params.get("sessionId", session_id)
     text = (params.get("prompt") or [{}])[0].get("text", "")
     if text == "die":
@@ -404,6 +451,18 @@ def on_prompt(request_id, params):
             }
         )
         return
+    # FAKE_RATE_LIMIT: a prompt containing "ratelimit" opens the window;
+    # every prompt — steers included — errors until it lifts.
+    limit_secs = float(os.environ.get("FAKE_RATE_LIMIT", "0") or 0)
+    if limit_secs and "ratelimit" in text and rate_limited_until is None:
+        rate_limited_until = time.time() + limit_secs
+    if rate_limited_until is not None:
+        if time.time() < rate_limited_until:
+            delay = float(os.environ.get("FAKE_RATE_LIMIT_DELAY", "0.35") or 0.35)
+            time.sleep(delay)
+            rate_limit_error(request_id)
+            return
+        rate_limited_until = None
     if pending_prompt is not None:
         # A prompt arriving while a turn runs is a steer injection — unless
         # FAKE_NO_STEER=1 rejects it, FAKE_QUEUE_PROMPTS=1 parks it

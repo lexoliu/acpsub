@@ -31,6 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   results carry the same digest. Every value is measured from tool calls'
   recorded `started_at`/`ended_at`, now reported in the `tool_calls`
   summaries ([#55](https://github.com/lexoliu/acpsub/issues/55))
+- *(tools)* turns that fail with a provider's structured rate-limit
+  error park in a new `rate_limited` state carrying `resume_at` — the
+  reset the message's `(at HH:MM UTC)` clause names, never a guess —
+  and resume on their own at that time in the same ACP session
+  (`session/load` when the process is gone), staggered on a fixed
+  continuation prompt. The quota binds the agent config key, so every
+  `send`/`spawn`/`adopt` prompt in the scope parks (`{state:
+  "rate_limited", resume_at, reason, position}`) and runs after the
+  continuation; `wait` freezes through the pause without counting it
+  against `expect_secs`, and `status` reports `resume_at`/`reason`. The
+  schedule — and the session's owner — persists in the registry, so
+  both survive a daemon restart
+  ([#56](https://github.com/lexoliu/acpsub/issues/56))
 
 ## [0.2.0](https://github.com/lexoliu/acpsub/compare/v0.1.0...v0.2.0) - 2026-09-16
 

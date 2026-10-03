@@ -55,6 +55,16 @@ pub struct AppState {
     pub registry_write: tokio::sync::Mutex<()>,
     /// Path of the registry file (`config.defaults.registry`).
     pub registry_path: PathBuf,
+    /// Provider rate limits in effect, by the quota scope they bind:
+    /// while a scope's `resume_at` is still ahead, new prompts to every
+    /// session in it park instead of burning a request that is bound to
+    /// fail.
+    pub limits: Mutex<BTreeMap<crate::ratelimit::QuotaScope, crate::ratelimit::Limit>>,
+    /// Wakes the resume scheduler when a limit is registered or a session
+    /// parks.
+    pub limits_notify: Notify,
+    /// Set once the resume scheduler is running.
+    pub scheduler_started: AtomicBool,
 }
 
 impl AppState {
@@ -69,15 +79,26 @@ impl AppState {
     /// Panics if the registry mutex is poisoned.
     pub fn new(config: Config, config_path: PathBuf) -> Result<Arc<Self>> {
         let registry_path = config.defaults.registry;
-        Ok(Arc::new(Self {
+        let registry = Registry::load(&registry_path)?;
+        // Quota gates survive a restart through the registry's parked
+        // flags: a prompt against a still-limited scope keeps parking.
+        let limits = crate::ratelimit::restored_limits(&registry);
+        let state = Arc::new(Self {
             config_path,
             transcript_dir: config.defaults.transcript_dir,
             live: Mutex::new(HashMap::new()),
             reserved: Mutex::new(HashSet::new()),
-            registry: Mutex::new(Registry::load(&registry_path)?),
+            registry: Mutex::new(registry),
             registry_write: tokio::sync::Mutex::new(()),
             registry_path,
-        }))
+            limits: Mutex::new(limits),
+            limits_notify: Notify::new(),
+            scheduler_started: AtomicBool::new(false),
+        });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            crate::ratelimit::ensure_scheduler(&state);
+        }
+        Ok(state)
     }
 
     /// Re-read and parse the config file.
@@ -153,6 +174,16 @@ pub enum Status {
     /// The last turn errored while the agent process stays alive; the same
     /// session takes another prompt. Carries the reason.
     Failed(String),
+    /// The agent's provider rate-limited the last turn; the session parks
+    /// until `resume_at` and the daemon resumes it on its own — queued
+    /// prompts run after the resume's continuation. Carries the resume
+    /// time and the provider's reason.
+    RateLimited {
+        /// When the provider says the quota resets.
+        resume_at: jiff::Timestamp,
+        /// The provider's own message.
+        reason: String,
+    },
     /// The agent process exited; the session is a husk `adopt` reaps (or
     /// `close`/`forget` removes). Carries the reason.
     Exited(String),
@@ -169,6 +200,7 @@ impl Status {
             Self::Done(_) => "done",
             Self::Cancelled => "cancelled",
             Self::Failed(_) => "failed",
+            Self::RateLimited { .. } => "rate_limited",
             Self::Exited(_) => "exited",
         }
     }
@@ -237,6 +269,14 @@ pub struct Turn {
     pub mode: Option<String>,
     /// Stop reason once the turn ended.
     pub stop_reason: Option<StopReason>,
+    /// When the turn left the wire — the end of its active span: a wait
+    /// that followed the turn through a park measures the pre-park part
+    /// from `started_at` to here.
+    pub ended_at: Option<jiff::Timestamp>,
+    /// The turn ended `rate_limited`: the session parks until its scope's
+    /// `resume_at`, and a wait bound to it follows the resume's turn —
+    /// the pause does not count against `expect_secs`.
+    pub rate_limited: bool,
 }
 
 /// A permission request queued by the `ask` policy.
@@ -549,24 +589,13 @@ pub async fn launch(state: &Arc<AppState>, config: &Config, args: Launch) -> Res
     result
 }
 
-/// Everything `launch` does once preflight passed: spawn the process, run
-/// the handshake, register and go live, start the first turn if prompted.
-async fn launch_inner(
-    state: &Arc<AppState>,
-    config: &Config,
-    args: &Launch,
-    agent_cfg: AgentConfig,
-    cwd: PathBuf,
-) -> Result<Arc<Subagent>> {
-    let permission = args
-        .permission
-        .or(agent_cfg.permission)
-        .unwrap_or(config.defaults.permission);
-    let rt = Arc::new(SubRuntime {
+/// The per-session runtime bundle for a just-connected agent: `adopt`
+/// knows its session id up front; `spawn` fills it in during the
+/// handshake.
+fn new_runtime(args: &Launch, steer: SteerSemantics) -> Arc<SubRuntime> {
+    Arc::new(SubRuntime {
         inner: Mutex::new(Inner {
             status: Status::Idle,
-            // `adopt` knows its session id up front; `spawn` fills it in
-            // during the handshake.
             session_id: args.load.clone().unwrap_or_default(),
             agent_info: None,
             modes: None,
@@ -583,7 +612,7 @@ async fn launch_inner(
         }),
         notify: Notify::new(),
         prompt_send: Arc::new(tokio::sync::Mutex::new(())),
-        steer: agent_cfg.steer,
+        steer,
         transcript: tokio::sync::Mutex::new(TranscriptWriter::deferred()),
         terminals: Terminals::new(HashMap::new()),
         stderr_tail: Mutex::new(VecDeque::new()),
@@ -592,7 +621,23 @@ async fn launch_inner(
         next_term: AtomicU64::new(1),
         closing: AtomicBool::new(false),
         owner: AtomicU32::new(args.owner.unwrap_or(0)),
-    });
+    })
+}
+
+/// Everything `launch` does once preflight passed: spawn the process, run
+/// the handshake, register and go live, start the first turn if prompted.
+async fn launch_inner(
+    state: &Arc<AppState>,
+    config: &Config,
+    args: &Launch,
+    agent_cfg: AgentConfig,
+    cwd: PathBuf,
+) -> Result<Arc<Subagent>> {
+    let permission = args
+        .permission
+        .or(agent_cfg.permission)
+        .unwrap_or(config.defaults.permission);
+    let rt = new_runtime(args, agent_cfg.steer);
 
     let handler = SubagentHandler::new(
         rt.clone(),
@@ -650,15 +695,21 @@ async fn launch_inner(
             .expect("reserved poisoned")
             .remove(session_id);
     }
-    if let Some(prompt) = &args.prompt
-        && let Err(error) = start_turn(state.clone(), &sub, prompt.clone()).await
-    {
-        state
-            .live
-            .lock()
-            .expect("live poisoned")
-            .remove(&session_id);
-        return Err(error);
+    if let Some(prompt) = &args.prompt {
+        // A quota gate for this agent parks the prompt instead of letting
+        // it burn a request that is bound to fail.
+        if crate::ratelimit::park_prompt(state, &sub, prompt)
+            .await
+            .is_none()
+            && let Err(error) = start_turn(state.clone(), &sub, prompt.clone()).await
+        {
+            state
+                .live
+                .lock()
+                .expect("live poisoned")
+                .remove(&session_id);
+            return Err(error);
+        }
     }
     Ok(sub)
 }
@@ -865,33 +916,52 @@ async fn handshake(
     let accepted_mode = confirmed_mode(&mut rt.inner.lock().expect("inner poisoned"));
     // A registered session keeps its `created` timestamp and turn count;
     // a new one gets a fresh entry.
-    let agent = args.agent.clone();
-    let cwd = args.cwd.clone();
-    state
-        .update_registry(|registry| match registry.get_mut(&session_id) {
-            Some(entry) => {
-                entry.agent.clone_from(&agent);
-                entry.cwd.clone_from(&cwd);
-            }
-            None => registry.insert(
-                session_id.clone(),
-                RegistryEntry {
-                    agent: agent.clone(),
-                    cwd: cwd.clone(),
-                    created: now(),
-                    last_turn: None,
-                    turn_started: None,
-                    turns: 0,
-                },
-            ),
-        })
-        .await?;
+    register_session(state, &session_id, args).await?;
     debug!(%session_id, agent = %args.agent, "subagent session established");
     Ok(Accepted {
         session_id,
         model: accepted_model,
         mode: accepted_mode,
     })
+}
+
+/// Upsert `args`' session in the registry after a handshake: an existing
+/// entry keeps its `created` timestamp and turn count; a new one gets a
+/// fresh entry. Model, mode and owner are recorded for a `session/load`
+/// resume; a parked schedule the entry carried is consumed — the session
+/// is live again.
+///
+/// # Errors
+///
+/// Returns an error when the registry cannot be persisted.
+async fn register_session(state: &Arc<AppState>, session_id: &str, args: &Launch) -> Result<()> {
+    state
+        .update_registry(|registry| match registry.get_mut(session_id) {
+            Some(entry) => {
+                entry.agent.clone_from(&args.agent);
+                entry.cwd.clone_from(&args.cwd);
+                entry.model.clone_from(&args.model);
+                entry.mode.clone_from(&args.mode);
+                entry.owner = args.owner;
+                entry.rate_limited = None;
+            }
+            None => registry.insert(
+                session_id.to_string(),
+                RegistryEntry {
+                    agent: args.agent.clone(),
+                    cwd: args.cwd.clone(),
+                    created: now(),
+                    last_turn: None,
+                    turn_started: None,
+                    turns: 0,
+                    model: args.model.clone(),
+                    mode: args.mode.clone(),
+                    owner: args.owner,
+                    rate_limited: None,
+                },
+            ),
+        })
+        .await
 }
 
 /// Check `args`' mode, model and config values against what the agent
@@ -1120,7 +1190,10 @@ pub async fn close_sub(sub: &Subagent) {
         inner.steer_pending.clear();
         inner.steer_folded.clear();
         inner.steer_owner = None;
-        if matches!(inner.status, Status::Running | Status::NeedsPermission) {
+        if matches!(
+            inner.status,
+            Status::Running | Status::NeedsPermission | Status::RateLimited { .. }
+        ) {
             inner.status = Status::Cancelled;
         }
     }
@@ -1319,13 +1392,7 @@ pub(crate) fn spawn_turn_task(
     prompt: PromptFut,
     turn_n: u64,
 ) {
-    tokio::spawn(turn_task(
-        state,
-        prompt,
-        turn_n,
-        sub.rt.clone(),
-        sub.session_id.clone(),
-    ));
+    tokio::spawn(turn_task(state, prompt, turn_n, sub.clone()));
 }
 
 /// Build a `session/prompt` call and drive it once so the request is on the
@@ -1443,6 +1510,14 @@ pub(crate) async fn steer_resolved(
     target_turn: u64,
     outcome: std::result::Result<PromptResult, ClientError>,
 ) -> std::result::Result<PromptResult, ClientError> {
+    // A steered prompt rejected by a rate limit tells the scope about the
+    // quota: later prompts park instead of burning a request. The steer
+    // itself resolves as the rejection it was.
+    if let Err(error) = &outcome
+        && let Some(hit) = crate::ratelimit::parse(error)
+    {
+        crate::ratelimit::note_limit(&state, &sub.agent, &hit).await;
+    }
     let (mine, kick, turn_n) = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         inner.steer_pending.retain(|&id| id != steer_id);
@@ -1478,14 +1553,7 @@ pub(crate) async fn steer_resolved(
     };
     if mine {
         let returned = outcome.clone();
-        finish_turn(
-            state,
-            sub.rt.clone(),
-            sub.session_id.clone(),
-            turn_n,
-            outcome,
-        )
-        .await;
+        finish_turn(state, sub, turn_n, outcome).await;
         let record = steer_end_record(turn_n, &returned);
         if let Err(error) = sub.rt.transcript.lock().await.append(&record).await {
             warn!(%error, "transcript write failed");
@@ -1534,6 +1602,7 @@ fn settle_turn(
     let mut inner = rt.inner.lock().expect("inner poisoned");
     if let Some(mut turn) = inner.current.take() {
         turn.stop_reason = Some(reason);
+        turn.ended_at = Some(jiff::Timestamp::now());
         inner.turns.push(turn);
     }
     let folded = fold_pending_steers(rt, &mut inner);
@@ -1582,7 +1651,8 @@ fn fold_pending_steers(rt: &SubRuntime, inner: &mut Inner) -> Vec<u64> {
 /// dead process cannot take the prompt `failed` would invite.
 fn fail_turn(rt: &SubRuntime, reason: String) -> (VecDeque<String>, Vec<u64>) {
     let mut inner = rt.inner.lock().expect("inner poisoned");
-    if let Some(turn) = inner.current.take() {
+    if let Some(mut turn) = inner.current.take() {
+        turn.ended_at = Some(jiff::Timestamp::now());
         inner.turns.push(turn);
     }
     let folded = fold_pending_steers(rt, &mut inner);
@@ -1590,6 +1660,28 @@ fn fail_turn(rt: &SubRuntime, reason: String) -> (VecDeque<String>, Vec<u64>) {
         inner.status = Status::Failed(reason);
     }
     (std::mem::take(&mut inner.queue), folded)
+}
+
+/// Push the finished turn into `turns` marked `rate_limited`, park the
+/// session until its scope's `resume_at`, and return the steers settled
+/// as folded. Unlike [`fail_turn`] the queue survives: prompts parked by
+/// the limit run after the resume's continuation.
+fn park_turn(rt: &SubRuntime, hit: &crate::ratelimit::RateLimit) -> Vec<u64> {
+    let mut inner = rt.inner.lock().expect("inner poisoned");
+    if let Some(mut turn) = inner.current.take() {
+        turn.ended_at = Some(jiff::Timestamp::now());
+        turn.rate_limited = true;
+        inner.turns.push(turn);
+    }
+    let folded = fold_pending_steers(rt, &mut inner);
+    inner.pending_turn_start = None;
+    if !matches!(inner.status, Status::Exited(_)) {
+        inner.status = Status::RateLimited {
+            resume_at: hit.resume_at,
+            reason: hit.reason.clone(),
+        };
+    }
+    folded
 }
 
 /// Append a `queue_dropped` transcript record, when any prompts dropped.
@@ -1626,15 +1718,9 @@ async fn record_steers_folded(rt: &SubRuntime, turn_n: u64, steers: Vec<u64>) {
 }
 
 /// Await `session/prompt`, then [`finish_turn`].
-async fn turn_task(
-    state: Arc<AppState>,
-    prompt: PromptFut,
-    turn_n: u64,
-    rt: Arc<SubRuntime>,
-    session_id: String,
-) {
+async fn turn_task(state: Arc<AppState>, prompt: PromptFut, turn_n: u64, sub: Arc<Subagent>) {
     let outcome = prompt.await;
-    finish_turn(state, rt, session_id, turn_n, outcome).await;
+    finish_turn(state, &sub, turn_n, outcome).await;
 }
 
 /// Spawn the queued-turn handoff: the wire guard moves into the task so the
@@ -1649,10 +1735,19 @@ fn spawn_chained(
     tokio::spawn(async move {
         let _wire = wire;
         match state.get(&session_id) {
-            Ok(sub) => match begin_turn(&state, &sub, prompt, Gate::Chained, true).await {
-                Ok((n, fut)) => spawn_turn_task(state, &sub, fut, n),
-                Err(error) => warn!(%error, "queued turn failed to start"),
-            },
+            Ok(sub) => {
+                // A limit learned since the prompt was queued: re-park it
+                // at the queue's front — the scheduler's continuation
+                // comes first, queued prompts run after it.
+                if let Some(limit) = crate::ratelimit::active_limit(&state, &sub.agent) {
+                    crate::ratelimit::repark_prompt(&state, &sub, &prompt, &limit).await;
+                    return;
+                }
+                match begin_turn(&state, &sub, prompt, Gate::Chained, true).await {
+                    Ok((n, fut)) => spawn_turn_task(state, &sub, fut, n),
+                    Err(error) => warn!(%error, "queued turn failed to start"),
+                }
+            }
             Err(error) => warn!(%error, "queued prompt dropped: subagent gone"),
         }
     });
@@ -1669,12 +1764,16 @@ fn spawn_chained(
 /// `cancelled` or failed turn drops the queue instead.
 async fn finish_turn(
     state: Arc<AppState>,
-    rt: Arc<SubRuntime>,
-    session_id: String,
+    sub: &Arc<Subagent>,
     turn_n: u64,
     outcome: std::result::Result<PromptResult, ClientError>,
 ) {
+    let rt = &sub.rt;
+    let session_id = &sub.session_id;
     let wire = rt.prompt_send.clone().lock_owned().await;
+    // A provider rate limit ends the turn parked, not failed — the
+    // session resumes on its own when the quota lifts.
+    let hit = outcome.as_ref().err().and_then(crate::ratelimit::parse);
     match outcome {
         Ok(result) => {
             let reason = result.stop_reason;
@@ -1686,14 +1785,14 @@ async fn finish_turn(
             if let Err(error) = rt.transcript.lock().await.append(&record).await {
                 warn!(%error, "transcript write failed");
             }
-            let (next, dropped, folded) = settle_turn(&rt, reason);
-            record_steers_folded(&rt, turn_n, folded).await;
+            let (next, dropped, folded) = settle_turn(rt, reason);
+            record_steers_folded(rt, turn_n, folded).await;
             if let Some(prompt) = next {
                 spawn_chained(state.clone(), session_id.clone(), prompt, wire);
             } else {
                 drop(wire);
             }
-            record_queue_dropped(&rt, Some(turn_n), dropped).await;
+            record_queue_dropped(rt, Some(turn_n), dropped).await;
         }
         Err(error) => {
             let mut reason = error.to_string();
@@ -1703,32 +1802,52 @@ async fn finish_turn(
                 reason.push_str("\nagent stderr (tail):\n");
                 reason.push_str(&tail[start..].join("\n"));
             }
-            let record = serde_json::json!({
+            let mut record = serde_json::json!({
                 "ts": now(),
                 "turn": turn_n,
                 "stop_reason": "error",
                 "error": reason,
             });
+            if let Some(hit) = &hit {
+                record["stop_reason"] = serde_json::json!("rate_limited");
+                record["resume_at"] = serde_json::json!(hit.resume_at.to_string());
+            }
             if let Err(error) = rt.transcript.lock().await.append(&record).await {
                 warn!(%error, "transcript write failed");
             }
-            let (dropped, folded) = fail_turn(&rt, reason);
-            record_steers_folded(&rt, turn_n, folded).await;
-            record_queue_dropped(&rt, Some(turn_n), dropped).await;
-            drop(wire);
+            if let Some(hit) = &hit {
+                let folded = park_turn(rt, hit);
+                record_steers_folded(rt, turn_n, folded).await;
+                drop(wire);
+                crate::ratelimit::note_limit(&state, &sub.agent, hit).await;
+            } else {
+                let (dropped, folded) = fail_turn(rt, reason);
+                record_steers_folded(rt, turn_n, folded).await;
+                record_queue_dropped(rt, Some(turn_n), dropped).await;
+                drop(wire);
+            }
         }
     }
-    // Update the registry: turn count and last_turn.
+    // Update the registry: turn count and last_turn — and the parked flag
+    // that keeps a rate-limited session's schedule across a daemon
+    // restart.
     let turns = {
         let inner = rt.inner.lock().expect("inner poisoned");
         inner.turn_offset + inner.turns.len() as u64
     };
+    let parked = hit.map(|hit| crate::registry::RateLimited {
+        resume_at: hit.resume_at.to_string(),
+        reason: hit.reason,
+    });
     let result = state
         .update_registry(|registry| {
-            if let Some(entry) = registry.get_mut(&session_id) {
+            if let Some(entry) = registry.get_mut(session_id) {
                 entry.turns = turns;
                 entry.last_turn = Some(now());
                 entry.turn_started = None;
+                if let Some(parked) = parked {
+                    entry.rate_limited = Some(parked);
+                }
             }
         })
         .await;

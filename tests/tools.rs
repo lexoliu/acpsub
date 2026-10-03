@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use acpsub::Status;
 use acpsub::config::AgentConfig;
+use aither_core::llm::tool::Tools;
 use common::*;
 use serde_json::json;
 
@@ -2179,4 +2180,291 @@ async fn broken_config_is_a_tool_error() {
     assert!(err.contains("cannot parse config"), "{err}");
     let err = call_err(&tools, "agents", json!({})).await;
     assert!(err.contains("cannot parse config"), "{err}");
+}
+
+// ---------------------------------------------------------------------
+// Rate-limited prompts park, then resume on their own (#56)
+// ---------------------------------------------------------------------
+
+/// A turn the provider rate-limits parks in `rate_limited` carrying the
+/// structured reset — never `failed` — and the session resumes on its
+/// own at `resume_at`, in the same ACP session, on the scheduler's
+/// continuation prompt.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_parks_turn_and_resumes() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let sid = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+
+    status_becomes(&state, sid.as_str(), "rate_limited").await;
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["state"], "rate_limited", "{status}");
+    let resume_at = status["resume_at"].as_str().expect("resume_at");
+    assert!(resume_at.parse::<jiff::Timestamp>().is_ok(), "{resume_at}");
+    assert!(
+        status["reason"].as_str().unwrap().contains("rate limit"),
+        "{status}"
+    );
+    // The registry carries the schedule — a restart picks it up from
+    // disk alone (the write races this check, so poll for it).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let registry = loop {
+        let text = std::fs::read_to_string(dir.path().join("registry.json")).unwrap();
+        if text.contains("\"rate_limited\"") {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parked schedule never persisted: {text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(registry.contains(resume_at), "{registry}");
+
+    // No coordinator call moves it: the scheduler fires the
+    // continuation at resume_at, in this session.
+    let text = transcript_eventually(&tools, sid.as_str(), "rate limit has lifted").await;
+    assert!(text.contains("END rate_limited"), "{text}");
+    assert!(text.contains("END end_turn"), "{text}");
+}
+
+/// Poll a session's rendered transcript until it contains `needle`,
+/// returning the text. For states nothing notifies — a queued prompt
+/// chained after a resume leaves the status `done` twice.
+async fn transcript_eventually(tools: &Tools, session_id: &str, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let text = call_text(tools, "transcript", json!({"session_id": session_id})).await;
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "transcript never showed {needle:?}: {text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Every prompt the scope's limit would hit parks instead: a `send`
+/// into a parked session and a different session's new prompt both join
+/// the parked queue — and both run after the continuation, in their own
+/// sessions.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_parks_send_and_spawn() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let sid_a = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    status_becomes(&state, sid_a.as_str(), "rate_limited").await;
+
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid_a.as_str(), "prompt": "queued one", "policy": "queued"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "rate_limited", "{sent}");
+    assert_eq!(sent["position"], 1, "{sent}");
+    assert!(
+        sent["resume_at"]
+            .as_str()
+            .unwrap()
+            .parse::<jiff::Timestamp>()
+            .is_ok(),
+        "{sent}"
+    );
+
+    // The quota binds the login, not the session: another session's
+    // prompt parks without ever reaching its agent.
+    let spawned = call_json(
+        &tools,
+        "spawn",
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "hi", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    assert_eq!(spawned["state"], "rate_limited", "{spawned}");
+    assert!(spawned["resume_at"].is_string(), "{spawned}");
+    let sid_b = spawned["session_id"].as_str().unwrap().to_string();
+
+    // Both sessions resume on their own and run the continuation
+    // first, then their parked prompts — under the session ids they
+    // started with.
+    let text = transcript_eventually(&tools, sid_a.as_str(), "USER (queued)\nqueued one").await;
+    let continuation = text.find("rate limit has lifted").expect("continuation");
+    let queued = text
+        .find("USER (queued)\nqueued one")
+        .expect("queued prompt");
+    assert!(continuation < queued, "continuation ran late: {text}");
+    assert!(text.contains("END end_turn"), "{text}");
+
+    let text = transcript_eventually(&tools, sid_b.as_str(), "USER (queued)\nhi").await;
+    let continuation = text.find("rate limit has lifted").expect("continuation");
+    let queued = text.find("USER (queued)\nhi").expect("queued prompt");
+    assert!(continuation < queued, "continuation ran late: {text}");
+    assert!(text.contains("END end_turn"), "{text}");
+    assert_eq!(state.get(sid_b.as_str()).expect("live").agent, "ratelimit");
+}
+
+/// A `wait` bound to a turn that ends rate-limited stays bound through
+/// the pause: it does not return early, and the parked seconds do not
+/// count against `expect_secs` — the resume's continuation ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_spans_rate_limit_pause() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+
+    // Bind while the turn is still in flight — the fake takes ~0.35 s
+    // to answer with the rate-limit error.
+    let started = std::time::Instant::now();
+    let out = call_json(
+        &tools,
+        "wait",
+        json!({"session_id": sid.as_str(), "expect_secs": 2, "max_wait_secs": 30}),
+    )
+    .await;
+    let wall = started.elapsed().as_secs_f64();
+    assert_eq!(out["state"], "done", "{out}");
+    assert_eq!(out["stop_reason"], "end_turn", "{out}");
+    assert!(out["turn"].as_u64().unwrap() >= 2, "{out}");
+    // The window lasts ~4 s: returning before it lifted would be early.
+    assert!(wall >= 3.0, "wait returned early: {wall}s");
+    // ~0.5 s of turn time ran against expect_secs=2 — had the ~4 s
+    // pause counted, the wait would have overrun.
+    assert!(out.get("overrun").is_none(), "{out}");
+}
+
+/// A parked session whose process is gone — here the whole state is
+/// dropped and rebuilt over the same registry, the daemon-restart case —
+/// resumes at `resume_at` through `session/load`, in the same session.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_resumes_after_restart() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let sid = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    status_becomes(&state, sid.as_str(), "rate_limited").await;
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+
+    // Down and back up: the registry file is all that survives.
+    drop(tools);
+    drop(state);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let (state, tools) = test_state(dir.path());
+
+    // The schedule survived: the session is back — resumed through
+    // session/load — once resume_at passes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while state.get(sid.as_str()).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parked session never resumed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let text = transcript_eventually(&tools, sid.as_str(), "rate limit has lifted").await;
+    // session/load replays history — proof the resume re-bound the same
+    // ACP session rather than spawning a new one.
+    assert!(text.contains("loaded user message"), "{text}");
+    status_becomes(&state, sid.as_str(), "done").await;
+}
+
+/// A rate-limit report whose reset is unreadable — no structured
+/// retry-after, no `(at HH:MM UTC)` clause — fails the turn with the
+/// original error rather than guessing a delay.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_without_reset_fails() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(
+        &tools,
+        json!({"agent": "vaguelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+
+    let out = wait(&tools, sid.as_str(), 60).await;
+    assert_eq!(out["state"], "failed", "{out}");
+    assert!(
+        out["error"].as_str().unwrap().contains("rate limit"),
+        "{out}"
+    );
+    // And no parking happened: the session reports a plain failure,
+    // not a `rate_limited` schedule.
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["state"], "failed", "{status}");
+    assert!(status.get("resume_at").is_none(), "{status}");
+}
+
+/// A session the scheduler resumes through `session/load` — the
+/// process was gone — keeps the coordinator pid that owned it, so the
+/// reaper still sees an owner.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_resume_keeps_owner() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let sid = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass", "owner": 424_242}),
+    )
+    .await;
+    status_becomes(&state, sid.as_str(), "rate_limited").await;
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+
+    drop(tools);
+    drop(state);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let (state, _tools) = test_state(dir.path());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let owner = loop {
+        if let Ok(sub) = state.get(sid.as_str()) {
+            break sub.rt.owner.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parked session never resumed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(owner, 424_242);
+    status_becomes(&state, sid.as_str(), "done").await;
 }

@@ -20,7 +20,8 @@ const CLIP: usize = 400;
 /// Each line is one record: `{"ts", "turn", "prompt"}` for prompts (with
 /// `"queued": true` when the prompt fired off the send queue), `{"ts",
 /// "turn", "steer"}`/`{"steer_end"}` for steered prompts, `{"queue_dropped"}`
-/// for prompts the queue dropped, `{"ts", "turn", "update"}` for
+/// for prompts the queue dropped, `{"ts", "park", "resume_at"}` for
+/// prompts parked by a rate limit, `{"ts", "turn", "update"}` for
 /// `session/update` notifications, and `{"ts", "turn", "stop_reason"}` for
 /// turn ends.
 ///
@@ -209,6 +210,18 @@ fn render_record(
 ) {
     if let Some(prompt) = record.get("prompt").and_then(Value::as_str) {
         render_user(record, prompt, out, options.full);
+        return;
+    }
+    if let Some(parked) = record.get("park").and_then(Value::as_str) {
+        let resume_at = record
+            .get("resume_at")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let _ = writeln!(
+            out,
+            "--- PARKED until {resume_at}\n    {}",
+            clip(parked, options.full)
+        );
         return;
     }
     if let Some(steer) = record.get("steer").and_then(Value::as_str) {

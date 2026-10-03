@@ -36,6 +36,32 @@ pub struct RegistryEntry {
     /// Number of completed turns.
     #[serde(default)]
     pub turns: u64,
+    /// The `model` the session was launched with — a `session/load`
+    /// resume passes it back so the restored session looks the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The `mode` the session was launched with, for a `session/load`
+    /// resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The coordinator pid that owns the session — a `session/load`
+    /// resume passes it back so the reaper still sees an owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<u32>,
+    /// The session is parked by its provider's rate limit until
+    /// `resume_at`: persisted so a daemon restart keeps the resume
+    /// schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limited: Option<RateLimited>,
+}
+
+/// A session parked by its provider's rate limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimited {
+    /// RFC 3339 timestamp the provider named for the reset.
+    pub resume_at: String,
+    /// The provider's own message — the parked reason.
+    pub reason: String,
 }
 
 /// The session id → entry map backed by `registry.json`.
@@ -108,6 +134,11 @@ impl Registry {
         self.entries.iter()
     }
 
+    /// Iterate over entries mutably, by session id.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut RegistryEntry)> {
+        self.entries.iter_mut()
+    }
+
     /// Serialize the registry for persistence.
     ///
     /// # Errors
@@ -168,6 +199,10 @@ mod tests {
                 last_turn: None,
                 turn_started: None,
                 turns: 2,
+                model: None,
+                mode: None,
+                owner: None,
+                rate_limited: None,
             },
         );
         let snapshot = registry.snapshot().expect("snapshot");
@@ -214,6 +249,10 @@ mod tests {
                 last_turn: Some("t2".to_string()),
                 turn_started: None,
                 turns: 1,
+                model: None,
+                mode: None,
+                owner: None,
+                rate_limited: None,
             },
         );
         persist(&path, registry.snapshot().expect("snapshot"))

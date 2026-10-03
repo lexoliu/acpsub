@@ -108,12 +108,33 @@ pub fn write_config(
 /// concurrent prompt), a `queueagent` (`FAKE_QUEUE_PROMPTS=1`, parks a
 /// concurrent prompt and runs it as its own turn), a `foldagent`
 /// (`FAKE_FOLD_STEER=1` and `steer = "folded"`, folds a concurrent prompt
-/// into the running turn and never answers it), and a `wideopen` agent
-/// allowed outside its cwd.
+/// into the running turn and never answers it), two rate-limit agents
+/// (`ratelimit` answers "ratelimit" prompts — then every prompt until a
+/// ~4 s window lifts — with the structured -32010 shape whose message
+/// clause names the reset; `vaguelimit` omits the clause, leaving no
+/// readable reset at all), and a `wideopen` agent allowed outside its
+/// cwd.
 pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
     let mut agents = BTreeMap::new();
     let fake = fake_agent_config();
     agents.insert("fake".to_string(), fake.clone());
+    agents.insert(
+        "ratelimit".to_string(),
+        AgentConfig {
+            env: BTreeMap::from([("FAKE_RATE_LIMIT".to_string(), "4".to_string())]),
+            ..fake.clone()
+        },
+    );
+    agents.insert(
+        "vaguelimit".to_string(),
+        AgentConfig {
+            env: BTreeMap::from([
+                ("FAKE_RATE_LIMIT".to_string(), "4".to_string()),
+                ("FAKE_RATE_LIMIT_VAGUE".to_string(), "1".to_string()),
+            ]),
+            ..fake.clone()
+        },
+    );
     agents.insert(
         "noload".to_string(),
         AgentConfig {
