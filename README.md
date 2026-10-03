@@ -108,6 +108,8 @@ file that fails to parse is a tool error, never a stale fallback.
 | `close` | `session_id` | End the process; keep the registry entry (still adoptable). |
 | `forget` | `session_id` | Remove the registry entry (and the process if live). |
 | `agents` | — | Configured agents; for initialised ones their `agentInfo`, modes, config options. |
+| `daemon/drain` | — | Daemon only: begin a graceful restart — refuse new turns with a `restarting` error, let in-flight turns and accepted queued prompts finish, mark every live session for resume, close it, and exit. |
+| `daemon/resumed` | — | Daemon only: the startup resume pass's report — which marked sessions came back via `session/load` and which failed, with the agent's error. |
 
 `agent` may be omitted anywhere it appears: the `[defaults].agent` setting
 wins, then a single configured agent is used implicitly; with several agents
@@ -179,13 +181,26 @@ text:
   frozen: the parked seconds do not count against `expect_secs`.
 - **Registry** (`registry.json`): `session_id → {agent, cwd, created,
   last_turn, turn_started?, turns, model?, mode?, owner?,
-  rate_limited?}`, written
+  rate_limited?, resume?}`, written
   atomically. `turn_started` is
   set while a turn is in flight — it is the base `expect_secs` measures
   from; `rate_limited` keeps a parked session's `{resume_at, reason}`
-  across a daemon restart. `adopt` on a registered (or
+  across a daemon restart; `resume` is the mark a draining daemon leaves
+  — with the accepted queued prompts it could not run — for the next
+  daemon to `session/load`. `adopt` on a registered (or
   externally created) session id whose agent advertised `loadSession` runs
   `session/load` to resume it.
+- **Graceful daemon restart** (`acpsub restart`, or the `daemon/drain`
+  RPC): the daemon stops starting work — `spawn`/`send`/`adopt` are
+  refused with a `restarting` error the client waits out and retries once
+  against the next daemon — lets in-flight turns and accepted queued
+  prompts finish, marks every live session for resume, and exits. The
+  next daemon re-adopts every marked session via `session/load` before
+  accepting clients: same ids, agent, model, mode, cwd and owner; a
+  failed load is reported in the resume report and stays registered for a
+  later `adopt`. Read-only calls and steers into running turns keep
+  working through the drain; a `wait` dropped by the exit reconnects and
+  keeps waiting against the same deadline.
 - **Transcript**: every `session/update`, prompt, and turn end is appended to
   `<transcript_dir>/<session_id>.jsonl` as a verbatim JSON record. A turn's
   `reply` is that turn's concatenated `agent_message_chunk` text.
@@ -244,6 +259,10 @@ acpsub list
 acpsub close   <session_id>
 acpsub forget  <session_id>
 acpsub agents-live                              # the daemon's `agents` tool
+acpsub restart                                  # drain, then resume every
+                                                #   live session on the
+                                                #   next daemon; prints the
+                                                #   resume report
 ```
 
 Client output is the tool's JSON result on stdout; a tool error exits 1 with

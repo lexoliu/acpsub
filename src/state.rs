@@ -13,8 +13,8 @@ use aither_acp::{
     AcpClient, ClientError, ConfigOption, ConfigOptionValue, ConfigSelectOptions, ContentBlock,
     Implementation, InitializeResult, PlanEntry, PromptParams, PromptResult,
     RequestPermissionOutcome, SessionLoadParams, SessionModeState, SessionNewParams,
-    SessionSetConfigOptionParams, SessionSetModeParams, StopReason, TextContent, ToolCall,
-    ToolCallLocation, ToolCallStatus, ToolKind,
+    SessionSetConfigOptionParams, SessionSetModeParams, SessionUpdate, StopReason, TextContent,
+    ToolCall, ToolCallLocation, ToolCallStatus, ToolKind,
 };
 use aither_mcp::transport::ChildProcessTransport;
 use serde::Serialize;
@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 use crate::config::{AgentConfig, Config, ConfigValue, PermissionPolicy, SteerSemantics};
 use crate::error::{Error, Result};
-use crate::handler::SubagentHandler;
+use crate::handler::{SubagentHandler, note_tool_call, note_tool_call_update};
 use crate::registry::{Registry, RegistryEntry, persist};
 use crate::terminal::Terminals;
 use crate::transcript::TranscriptWriter;
@@ -65,6 +65,12 @@ pub struct AppState {
     pub limits_notify: Notify,
     /// Set once the resume scheduler is running.
     pub scheduler_started: AtomicBool,
+    /// Daemon drain/restart coordination.
+    pub drain: Drain,
+    /// What this daemon's startup resume pass did — filled by
+    /// [`crate::daemon::run`] before it accepts clients; empty everywhere
+    /// else.
+    pub resume_report: Mutex<ResumeReport>,
 }
 
 impl AppState {
@@ -94,6 +100,8 @@ impl AppState {
             limits: Mutex::new(limits),
             limits_notify: Notify::new(),
             scheduler_started: AtomicBool::new(false),
+            drain: Drain::default(),
+            resume_report: Mutex::new(ResumeReport::default()),
         });
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::ratelimit::ensure_scheduler(&state);
@@ -134,6 +142,12 @@ impl AppState {
             .ok_or_else(|| Error::UnknownSession(session_id.to_string()))
     }
 
+    /// Whether the daemon is draining for a restart — calls that would
+    /// start new work get [`Error::Restarting`].
+    pub fn draining(&self) -> bool {
+        self.drain.requested.load(Ordering::Relaxed)
+    }
+
     /// Mutate the registry, then persist the result.
     ///
     /// `registry_write` is held across both steps, so concurrent tool calls
@@ -156,6 +170,45 @@ impl AppState {
         }?;
         persist(&self.registry_path, snapshot).await
     }
+}
+
+/// Daemon drain/restart coordination.
+///
+/// `requested` is set by the `daemon/drain` tool; the drain task it
+/// spawns waits for quiescence, sets `quiesced`, and wakes the accept
+/// loop to hand off and exit. `progressed` wakes the drain task on every
+/// turn end; a short poll inside the task backstops live-map changes
+/// that carry no notification (a session closed out from under it).
+#[derive(Debug, Default)]
+pub struct Drain {
+    /// A `daemon/drain` call began a drain: turn-starting calls are
+    /// refused with [`Error::Restarting`].
+    pub requested: AtomicBool,
+    /// Wakes the drain waiter when a turn ends.
+    pub progressed: Notify,
+    /// The drain reached quiescence — no turn is running anywhere.
+    pub quiesced: AtomicBool,
+    /// Wakes the daemon's accept loop to hand off and exit.
+    pub wake: Notify,
+}
+
+/// What the daemon's startup resume pass did, reported by
+/// `daemon/resumed`.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct ResumeReport {
+    /// Session ids re-adopted via `session/load`.
+    pub resumed: Vec<String>,
+    /// Sessions whose resume failed, with the agent's error.
+    pub failed: Vec<ResumeFailure>,
+}
+
+/// One session's failed resume in a [`ResumeReport`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ResumeFailure {
+    /// Session id.
+    pub session_id: String,
+    /// The launch error — the agent's own message when it produced one.
+    pub error: String,
 }
 
 /// Subagent lifecycle status.
@@ -488,6 +541,72 @@ pub fn now() -> String {
     jiff::Timestamp::now().to_string()
 }
 
+/// Rebuild the settled turns of a session's earlier life from its JSONL
+/// transcript: every record carries its turn number, so replaying the
+/// `update` payloads through the same summarizers the handler applies
+/// restores each turn's reply, tool calls, plan and stop reason.
+fn replay_transcript(text: &str) -> Vec<Turn> {
+    let mut turns: BTreeMap<u64, Turn> = BTreeMap::new();
+    for line in text.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(n) = record
+            .get("turn")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|n| *n > 0)
+        else {
+            continue;
+        };
+        let ts = record
+            .get("ts")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|ts| ts.parse::<jiff::Timestamp>().ok());
+        let turn = turns.entry(n).or_insert_with(|| Turn {
+            n,
+            started_at: ts,
+            ..Turn::default()
+        });
+        // The `prompt` record opens a turn; steer-materialized turns keep
+        // their first record's timestamp.
+        if record.get("prompt").is_some() {
+            turn.started_at = ts;
+        }
+        if let Some(update) = record.get("update")
+            && let Ok(update) = serde_json::from_value::<SessionUpdate>(update.clone())
+        {
+            match update {
+                SessionUpdate::AgentMessageChunk(chunk) => {
+                    if let ContentBlock::Text(text) = chunk.content {
+                        turn.reply.push_str(&text.text);
+                    }
+                }
+                SessionUpdate::ToolCall(call) => note_tool_call(turn, call),
+                SessionUpdate::ToolCallUpdate(update) => note_tool_call_update(turn, update),
+                SessionUpdate::Plan(plan) => turn.plan = plan.entries,
+                SessionUpdate::CurrentModeUpdate(mode) => {
+                    turn.mode = Some(mode.current_mode_id);
+                }
+                _ => {}
+            }
+        }
+        if let Some(reason) = record.get("stop_reason") {
+            turn.ended_at = ts.or(turn.ended_at);
+            match reason {
+                serde_json::Value::String(reason) if reason == "rate_limited" => {
+                    turn.rate_limited = true;
+                }
+                other => {
+                    if let Ok(reason) = serde_json::from_value::<StopReason>(other.clone()) {
+                        turn.stop_reason = Some(reason);
+                    }
+                }
+            }
+        }
+    }
+    turns.into_values().collect()
+}
+
 /// Reject an empty session id.
 ///
 /// # Errors
@@ -671,6 +790,28 @@ async fn launch_inner(
             format!("cannot open {}", transcript_path.display()),
             source,
         ));
+    }
+    // A resumed session's earlier turns replay from the transcript: the
+    // file carries every turn's prompts, updates and stop reason, so
+    // `result`, `status` and `wait` answer for the turns that ran before
+    // the restart or adopt — not only the ones this process sees. The
+    // registry's turn count stays the numbering authority, so the next
+    // turn still takes `turns + 1` even if the file is short.
+    if args.load.is_some() {
+        let restored = match tokio::fs::read_to_string(&transcript_path).await {
+            Ok(text) => replay_transcript(&text),
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(%error, "cannot read transcript for turn replay");
+                }
+                Vec::new()
+            }
+        };
+        if !restored.is_empty() {
+            let mut inner = rt.inner.lock().expect("inner poisoned");
+            inner.turn_offset = inner.turn_offset.saturating_sub(restored.len() as u64);
+            inner.turns = restored;
+        }
     }
 
     let sub = Arc::new(Subagent {
@@ -944,6 +1085,7 @@ async fn register_session(state: &Arc<AppState>, session_id: &str, args: &Launch
                 entry.mode.clone_from(&args.mode);
                 entry.owner = args.owner;
                 entry.rate_limited = None;
+                entry.resume = None;
             }
             None => registry.insert(
                 session_id.to_string(),
@@ -958,6 +1100,7 @@ async fn register_session(state: &Arc<AppState>, session_id: &str, args: &Launch
                     mode: args.mode.clone(),
                     owner: args.owner,
                     rate_limited: None,
+                    resume: None,
                 },
             ),
         })
@@ -1325,10 +1468,19 @@ pub(crate) async fn begin_turn(
     let turn_n = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         let ready = match gate {
-            Gate::Check => prompt_slot_free(&inner),
+            Gate::Check => prompt_slot_free(&inner) && !state.draining(),
             Gate::Chained => matches!(inner.status, Status::Running) && inner.current.is_none(),
         };
         if !ready {
+            // A draining daemon refuses to start new turns — the
+            // `restarting` marker is what the CLI client matches to wait
+            // for the next daemon and retry.
+            if state.draining() && matches!(gate, Gate::Check) {
+                return Err(Error::Restarting {
+                    detail: "the daemon is draining for a restart; new turns are refused"
+                        .to_string(),
+                });
+            }
             let status = if inner.status.accepts_prompt() {
                 "steer in flight".to_string()
             } else {
@@ -1855,6 +2007,7 @@ async fn finish_turn(
         warn!(%error, "registry persist failed");
     }
     rt.notify.notify_waiters();
+    state.drain.progressed.notify_waiters();
 }
 
 /// Best-effort `cwd` discovery for `adopt`.

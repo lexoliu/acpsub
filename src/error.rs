@@ -88,6 +88,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// The daemon is draining for a restart: the call would start new
+    /// work, which a draining daemon refuses. The `restarting` marker in
+    /// the message is what the CLI client matches to wait for the next
+    /// daemon and retry.
+    #[error("restarting: {detail}")]
+    Restarting {
+        /// What was refused and why.
+        detail: String,
+    },
+
     /// The subagent is not in a state that accepts a prompt.
     #[error("session '{session_id}' is {status}; cannot accept a prompt now")]
     NotPromptable {
@@ -286,6 +296,16 @@ pub enum Error {
         /// Socket path the client tried.
         path: PathBuf,
         /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// The daemon closed the connection mid-call — an exiting daemon (a
+    /// drain restart, a crash), not a refused call.
+    #[error("daemon at {path} closed the connection: {source}")]
+    DaemonDisconnected {
+        /// Socket path the client was connected to.
+        path: PathBuf,
+        /// Underlying transport error.
         source: std::io::Error,
     },
 
