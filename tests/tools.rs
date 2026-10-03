@@ -135,7 +135,7 @@ async fn send_queued_fires_after_turn() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
 
     let queued = call_json(
@@ -159,10 +159,14 @@ async fn send_queued_fires_after_turn() {
     assert_eq!(steered["state"], "steered", "{steered}");
     assert_eq!(steered["turn"], 1);
 
-    // The queued prompt runs as turn 2 with no done interlude; `wait`
-    // returns when it ends.
+    // The queued prompt runs as turn 2 with no done interlude: the state
+    // stays `running` through the handoff, so `done` can only mean turn 2
+    // ended. A bare `wait` could instead bind to turn 1 and return before
+    // the chain completed.
+    status_becomes(&state, &sid, "done").await;
     let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["turn"], 2, "{done}");
     let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(status["turns"], 2);
     assert_eq!(status["queued"], json!([]));
@@ -234,8 +238,8 @@ async fn send_queued_dropped_on_cancel() {
     assert_eq!(done["state"], "done");
 }
 
-/// Queued prompts drop when the turn fails; the steer that kills the agent
-/// surfaces its error to the `send` caller.
+/// Queued prompts drop when the agent dies; the steer that kills it
+/// surfaces its error to the `send` caller and the session ends `exited`.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_queued_dropped_on_failure() {
     if !python3() {
@@ -243,7 +247,7 @@ async fn send_queued_dropped_on_failure() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
 
     let queued = call_json(
@@ -264,10 +268,48 @@ async fn send_queued_dropped_on_failure() {
     assert_ne!(err, "");
 
     let done = wait(&tools, &sid, 60).await;
-    assert_eq!(done["state"], "failed", "{done}");
+    // The turn error and the process exit race; `exited` always wins.
+    assert!(
+        matches!(done["state"].as_str(), Some("failed" | "exited")),
+        "{done}"
+    );
+    status_becomes(&state, &sid, "exited").await;
     let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
-    assert_eq!(status["state"], "failed", "{status}");
+    assert_eq!(status["state"], "exited", "{status}");
     assert_eq!(status["queued"], json!([]), "{status}");
+}
+
+/// A turn that fails while the agent process stays alive leaves the session
+/// `failed` — resumable: `send` starts the next turn on the same ACP
+/// session and its reply arrives (issue #51).
+#[tokio::test(flavor = "multi_thread")]
+async fn send_resumes_after_failed_turn() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    // "fail" makes the agent answer session/prompt with a JSON-RPC error
+    // while staying alive — a dropped model stream, not a dead process.
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "fail")).await;
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "failed", "{done}");
+
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "hi", "policy": "try"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["reply"], "Hello abworld", "{done}");
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["turns"], 2, "{status}");
+    assert_eq!(status["state"], "done", "{status}");
 }
 
 /// A `steer` on a promptable subagent just starts the turn.
@@ -404,6 +446,148 @@ async fn send_steer_becomes_turn_on_serializing_agent() {
             .contains("term:queue-fired"),
         "{third}"
     );
+}
+
+/// On an agent declared `steer = "folded"`, a steer the agent folds into
+/// the running turn is never answered: when the target turn ends the steer
+/// settles as folded (`steer_end: folded`), the prompt slot frees, and a
+/// later `send` runs — the deadlock of issue #47.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_steer_folded_settles_at_turn_end() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let mut args = spawn_args(dir.path(), "gather");
+    args["agent"] = json!("foldagent");
+    let sid = spawn_id(&tools, args).await;
+
+    // "gather" holds turn 1 open until the steer arrives; the agent folds
+    // it in, ends the turn, and never answers the steer's session/prompt.
+    let steered = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "kick", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["turn"], 1, "{steered}");
+
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(
+        done["reply"].as_str().unwrap().contains("steer:kick"),
+        "{done}"
+    );
+
+    // The folded steer no longer blocks the slot: a `try` prompt runs.
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "hi", "policy": "try"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done");
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["turns"], 2, "{status}");
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
+    assert!(text.contains("=== [turn 1] STEER\nkick"), "{text}");
+    assert!(text.contains("=== [turn 1] STEER END folded"), "{text}");
+    assert!(text.contains("=== [turn 2] USER\nhi"), "{text}");
+}
+
+/// On a `folded` agent, a steer that landed behind its target turn's end
+/// still runs as a turn of its own: its untracked `session/update` traffic
+/// materializes a `current` owned by the settled-folded steer, and the
+/// steer's own `session/prompt` response settles that turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_steer_folded_late_becomes_own_turn() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let mut args = spawn_args(dir.path(), "wait");
+    args["agent"] = json!("foldagent");
+    let sid = spawn_id(&tools, args).await;
+
+    // "LATE" marks the steer that reaches the agent after turn 1 ended:
+    // the fake ends turn 1, then runs the steer as its own turn whose
+    // response resolves normally. The PERMISSION marker stalls that turn
+    // on a permission round-trip, so acpsub settles turn 1 — and the
+    // settled-folded steer owns the materialized turn — before the
+    // steer's updates finish arriving.
+    let steered = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "LATE PERMISSION go", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(steered["state"], "steered", "{steered}");
+
+    // Turn 1 ends, the settled-folded steer's own turn materializes from
+    // its updates, and the steer's response settles it — wait on the
+    // notify signal until both turns are recorded. The timeout only turns
+    // a hang into a failure.
+    let sub = state.get(&sid).expect("live subagent");
+    let two_turns = async {
+        loop {
+            let notified = sub.rt.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = sub.rt.inner.lock().expect("inner poisoned");
+                if inner.turns.len() == 2 && matches!(inner.status, Status::Done(_)) {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), two_turns)
+        .await
+        .expect("subagent did not record two turns");
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["state"], "done", "{status}");
+    assert_eq!(status["turns"], 2, "{status}");
+
+    let second = call_json(
+        &tools,
+        "result",
+        json!({"session_id": sid.as_str(), "turn": 2}),
+    )
+    .await;
+    assert!(
+        second["reply"].as_str().unwrap().contains("perm:allow-1"),
+        "{second}"
+    );
+
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
+    assert!(
+        text.contains("=== [turn 1] STEER\nLATE PERMISSION go"),
+        "{text}"
+    );
+    assert!(text.contains("=== [turn 1] STEER END folded"), "{text}");
+    assert!(text.contains("=== [turn 2] END end_turn"), "{text}");
+    assert!(text.contains("=== [turn 2] STEER END end_turn"), "{text}");
+
+    // The slot is free afterwards: a `try` prompt runs turn 3.
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "again", "policy": "try"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -555,7 +739,7 @@ async fn wait_overruns_on_chained_turn() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     // "gather" holds turn 1 open until a steered prompt arrives.
     let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
 
@@ -573,6 +757,28 @@ async fn wait_overruns_on_chained_turn() {
         json!({"session_id": sid.as_str(), "prompt": "go", "policy": "steer"}),
     )
     .await;
+
+    // `wait` binds to the turn in flight when it is called: hold it until
+    // turn 1 has settled — `rt.notify` fires at the settle — so the call
+    // awaits the chained turn 2 whether or not `begin_turn` has run yet.
+    let sub = state.get(&sid).expect("live subagent");
+    let turn_one_settled = async {
+        loop {
+            let notified = sub.rt.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = sub.rt.inner.lock().expect("inner poisoned");
+                if inner.turns.len() == 1 {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), turn_one_settled)
+        .await
+        .expect("turn 1 did not settle");
 
     let out = wait(&tools, &sid, 2).await;
     assert_eq!(out["state"], "overrun", "{out}");
@@ -592,7 +798,7 @@ async fn wait_overruns_on_materialized_steer_turn() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     // queueagent parks a concurrent prompt agent-side and runs it as its
     // own turn after "hold" ends.
     let mut args = spawn_args(dir.path(), "hold");
@@ -604,6 +810,28 @@ async fn wait_overruns_on_materialized_steer_turn() {
         json!({"session_id": sid.as_str(), "prompt": "wait", "policy": "steer"}),
     )
     .await;
+
+    // `wait` binds to the turn in flight when it is called: hold it until
+    // the steered prompt has materialized as turn 2 — `rt.notify` fires
+    // on materialization — so the call awaits it rather than turn 1.
+    let sub = state.get(&sid).expect("live subagent");
+    let steer_turn_open = async {
+        loop {
+            let notified = sub.rt.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = sub.rt.inner.lock().expect("inner poisoned");
+                if inner.current.as_ref().is_some_and(|turn| turn.n == 2) {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), steer_turn_open)
+        .await
+        .expect("steered prompt did not materialize as turn 2");
 
     let out = wait(&tools, &sid, 2).await;
     assert_eq!(out["state"], "overrun", "{out}");
@@ -1249,8 +1477,8 @@ async fn agents_tool_reports_initialized() {
 }
 
 /// The `die` prompt makes the agent exit mid-turn: the turn fails, the
-/// subagent reports `failed`, and the registry entry survives so the session
-/// can be adopted after `close`.
+/// subagent settles `exited`, and the registry entry survives so the session
+/// stays adoptable after `close`.
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_death_mid_turn_marks_failed() {
     if !python3() {
@@ -1258,18 +1486,23 @@ async fn agent_death_mid_turn_marks_failed() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (_state, tools) = test_state(dir.path());
+    let (state, tools) = test_state(dir.path());
     let sid = spawn_id(&tools, spawn_args(dir.path(), "die")).await;
     let done = wait(&tools, &sid, 60).await;
-    assert_eq!(done["state"], "failed", "{done}");
+    // The turn error and the process exit race; `exited` always wins.
     assert!(
-        done["error"].as_str().is_some_and(|e| !e.is_empty()),
+        matches!(done["state"].as_str(), Some("failed" | "exited")),
         "{done}"
     );
+    status_becomes(&state, &sid, "exited").await;
 
     let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
-    assert_eq!(status["state"], "failed");
+    assert_eq!(status["state"], "exited");
     assert_eq!(status["live"], true);
+    assert!(
+        status["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{status}"
+    );
 
     // The registry entry outlives the process: after `close` the session is
     // adoptable again via session/load.
@@ -1283,6 +1516,32 @@ async fn agent_death_mid_turn_marks_failed() {
     assert_eq!(adopted["session_id"], sid);
     let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done");
+}
+
+/// An `exited` subagent is no longer live: `adopt` reaps the dead runtime
+/// and loads the session on a fresh process — no `close` first (issue #51).
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_reaps_exited_subagent() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "die")).await;
+    wait(&tools, &sid, 60).await;
+    status_becomes(&state, &sid, "exited").await;
+
+    let adopted = call_json(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "prompt": "hi", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    assert_eq!(adopted["session_id"], sid, "{adopted}");
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["reply"], "Hello abworld", "{done}");
 }
 
 /// `KILL <cmd>` has the agent create a terminal running `sleep 60`, call
@@ -1506,8 +1765,14 @@ async fn spawn_and_adopt_require_model_and_mode() {
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
     for (tool, base) in [
-        ("spawn", json!({"cwd": dir.path(), "prompt": "hi"})),
-        ("adopt", json!({"session_id": "s-1", "cwd": dir.path()})),
+        (
+            "spawn",
+            json!({"agent": "fake", "cwd": dir.path(), "prompt": "hi"}),
+        ),
+        (
+            "adopt",
+            json!({"agent": "fake", "session_id": "s-1", "cwd": dir.path()}),
+        ),
     ] {
         let mut missing_model = base.clone();
         missing_model["mode"] = json!("bypass");
@@ -1643,7 +1908,7 @@ async fn spawn_rejects_unverifiable_mode_and_model() {
     let mut args = spawn_args(dir.path(), "hi");
     args["agent"] = json!("nomodes");
     let err = call_err(&tools, "spawn", args).await;
-    assert!(err.contains("cannot check mode 'bypass'"), "{err}");
+    assert!(err.contains("advertises no session modes"), "{err}");
 
     let mut args = spawn_args(dir.path(), "hi");
     args["agent"] = json!("noopts");
@@ -1687,6 +1952,95 @@ async fn adopt_rejects_unadvertised_mode() {
     assert_eq!(adopted["session_id"], sid);
     assert_eq!(adopted["mode"], "bypass", "{adopted}");
     assert_eq!(adopted["model"], "b", "{adopted}");
+}
+
+/// An agent that advertises neither session modes nor a `model` config
+/// option (e.g. `grok agent stdio`) takes neither argument: `spawn`/`adopt`
+/// with them omitted succeed and report `null` for both, while passing one
+/// is an error naming the missing advertisement.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_adopt_agent_without_modes_or_model() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake_agent_config();
+    let agents = BTreeMap::from([
+        (
+            "nomodelmode".to_string(),
+            AgentConfig {
+                env: BTreeMap::from([
+                    ("FAKE_NO_MODES".to_string(), "1".to_string()),
+                    ("FAKE_NO_MODEL".to_string(), "1".to_string()),
+                ]),
+                ..fake.clone()
+            },
+        ),
+        ("fake".to_string(), fake),
+    ]);
+    let (_state, tools) = test_state_with_agents(dir.path(), &agents);
+    let spawn_args = |extra: serde_json::Value| {
+        let mut args = json!({
+            "agent": "nomodelmode",
+            "cwd": dir.path(),
+            "prompt": "hi",
+        });
+        for (key, value) in extra.as_object().expect("object") {
+            args[key] = value.clone();
+        }
+        args
+    };
+
+    // Omitted mode/model spawn and report `null`.
+    let spawned = call_json(&tools, "spawn", spawn_args(json!({}))).await;
+    assert!(spawned["mode"].is_null(), "{spawned}");
+    assert!(spawned["model"].is_null(), "{spawned}");
+    let sid = spawned["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    let status = call_json(&tools, "status", json!({"session_id": sid})).await;
+    assert!(status["mode"].is_null(), "{status}");
+    assert!(status["model"].is_null(), "{status}");
+    wait(&tools, &sid, 60).await;
+    call_json(&tools, "close", json!({"session_id": sid})).await;
+
+    // Adopt likewise takes neither; passing one is an error that names the
+    // missing advertisement, and the session stays adoptable.
+    let err = call_err(
+        &tools,
+        "adopt",
+        json!({"session_id": sid.as_str(), "mode": "bypass"}),
+    )
+    .await;
+    assert!(err.contains("advertises no session modes"), "{err}");
+    let adopted = call_json(&tools, "adopt", json!({"session_id": sid.as_str()})).await;
+    assert!(adopted["mode"].is_null(), "{adopted}");
+    assert!(adopted["model"].is_null(), "{adopted}");
+
+    // spawn errors the same way on each argument.
+    let err = call_err(&tools, "spawn", spawn_args(json!({"mode": "bypass"}))).await;
+    assert!(err.contains("advertises no session modes"), "{err}");
+    let err = call_err(&tools, "spawn", spawn_args(json!({"model": "b"}))).await;
+    assert!(err.contains("advertises no 'model' config option"), "{err}");
+
+    // The reverse still holds: omitting `mode` or `model` for an agent
+    // that advertises them is an error naming the required argument.
+    let err = call_err(
+        &tools,
+        "spawn",
+        json!({"agent": "fake", "cwd": dir.path(), "prompt": "hi", "model": "b"}),
+    )
+    .await;
+    assert!(err.contains("'mode' is required"), "{err}");
+    let err = call_err(
+        &tools,
+        "spawn",
+        json!({"agent": "fake", "cwd": dir.path(), "prompt": "hi", "mode": "bypass"}),
+    )
+    .await;
+    assert!(err.contains("'model' is required"), "{err}");
 }
 
 /// The config file is re-read per call: an agent removed from it is gone

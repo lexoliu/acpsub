@@ -22,7 +22,7 @@ use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::config::{AgentConfig, Config, ConfigValue, PermissionPolicy};
+use crate::config::{AgentConfig, Config, ConfigValue, PermissionPolicy, SteerSemantics};
 use crate::error::{Error, Result};
 use crate::handler::SubagentHandler;
 use crate::registry::{Registry, RegistryEntry, persist};
@@ -150,8 +150,12 @@ pub enum Status {
     Done(StopReason),
     /// The last turn was cancelled.
     Cancelled,
-    /// The agent errored or exited; carries the reason.
+    /// The last turn errored while the agent process stays alive; the same
+    /// session takes another prompt. Carries the reason.
     Failed(String),
+    /// The agent process exited; the session is a husk `adopt` reaps (or
+    /// `close`/`forget` removes). Carries the reason.
+    Exited(String),
 }
 
 impl Status {
@@ -165,13 +169,19 @@ impl Status {
             Self::Done(_) => "done",
             Self::Cancelled => "cancelled",
             Self::Failed(_) => "failed",
+            Self::Exited(_) => "exited",
         }
     }
 
-    /// Whether a `send`/`spawn` prompt may start a new turn.
+    /// Whether a `send`/`spawn` prompt may start a new turn: `failed`
+    /// qualifies because the agent process is still alive — the turn
+    /// errored, not the session.
     #[must_use]
     pub const fn accepts_prompt(&self) -> bool {
-        matches!(self, Self::Idle | Self::Done(_) | Self::Cancelled)
+        matches!(
+            self,
+            Self::Idle | Self::Done(_) | Self::Cancelled | Self::Failed(_)
+        )
     }
 }
 
@@ -260,11 +270,21 @@ pub struct Inner {
     /// or fails, and on `cancel`/`close`/`forget`/agent disconnect.
     pub queue: VecDeque<String>,
     /// Ids of steered prompts whose `session/prompt` result is still in
-    /// flight, oldest first — the wire order their turns would run in. A
-    /// steer that lands after its target turn ended runs as a turn of its
-    /// own; the first untracked `session/update` materializes a `current`
-    /// for it (see `steer_owner`), and the queue holds until they resolve.
+    /// flight and still holds the prompt slot, oldest first — the wire
+    /// order their turns would run in. A steer that lands after its target
+    /// turn ended runs as a turn of its own; the first untracked
+    /// `session/update` materializes a `current` for it (see
+    /// `steer_owner`), and the queue holds until they resolve.
     pub steer_pending: VecDeque<u64>,
+    /// Steers settled as folded at their target turn's end whose
+    /// `session/prompt` response is still outstanding, oldest first —
+    /// always older than every `steer_pending` id. Only a
+    /// [`SteerSemantics::Folded`] agent produces these; the contract says
+    /// they never resolve — but when one was actually a late arrival that
+    /// runs as a turn of its own, the first untracked `session/update`
+    /// still materializes a `current` owned by it and its response
+    /// settles that turn.
+    pub steer_folded: VecDeque<u64>,
     /// The pending steer that owns the materialized `current` turn — set
     /// when `current` was not opened by a `send`/`spawn`/`adopt` prompt but
     /// synthesized for untracked `session/update` traffic.
@@ -285,6 +305,9 @@ pub struct SubRuntime {
     /// `Arc` so a queued-turn handoff can move the owned guard into the
     /// chained task.
     pub prompt_send: Arc<tokio::sync::Mutex<()>>,
+    /// The agent's declared steer contract (config `steer`): what a
+    /// `session/prompt` sent mid-turn becomes.
+    pub steer: SteerSemantics,
     /// The JSONL transcript file.
     pub transcript: tokio::sync::Mutex<TranscriptWriter>,
     /// Live terminals by id.
@@ -359,15 +382,17 @@ pub struct Subagent {
     pub permission: PermissionPolicy,
     /// Whether agent fs/* requests may leave `cwd`.
     pub allow_outside_cwd: bool,
-    /// The model the agent accepted (`session/set_config_option` `model`).
-    pub model: serde_json::Value,
-    /// The mode the agent accepted (`session/set_mode`).
-    pub mode: String,
+    /// The model the agent accepted (`session/set_config_option` `model`),
+    /// `None` when the agent advertises no `model` option.
+    pub model: Option<serde_json::Value>,
+    /// The mode the agent accepted (`session/set_mode`), `None` when the
+    /// agent advertises no session modes.
+    pub mode: Option<String>,
     /// The transcript file path.
     pub transcript_path: PathBuf,
     /// The ACP client handle.
     pub client: AcpClient<SubagentHandler>,
-    /// Connection driver task; also marks the subagent failed on disconnect.
+    /// Connection driver task; also marks the subagent `exited` on disconnect.
     /// Taken by `close`/`forget` to await shutdown.
     pub conn: Mutex<Option<JoinHandle<()>>>,
     /// stderr pump task; taken by `close`/`forget`.
@@ -403,39 +428,6 @@ pub fn pid_alive(pid: u32) -> bool {
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Close a subagent's connection and kill its agent process. Shared by the
-/// `close`/`forget` tools and the daemon's orphan reaper.
-///
-/// # Panics
-///
-/// Panics if a state mutex is poisoned.
-pub async fn close_sub(sub: &Subagent) {
-    sub.rt.closing.store(true, Ordering::Relaxed);
-    {
-        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-        for pending in inner.pending.drain(..) {
-            let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
-        }
-        inner.queue.clear();
-        inner.steer_pending.clear();
-        inner.steer_owner = None;
-        if matches!(inner.status, Status::Running | Status::NeedsPermission) {
-            inner.status = Status::Cancelled;
-        }
-    }
-    sub.client.clone().close();
-    let conn = sub.conn.lock().expect("conn poisoned").take();
-    if let Some(conn) = conn
-        && let Err(error) = conn.await
-    {
-        debug!(%error, "connection task join failed");
-    }
-    let pump = sub.stderr_pump.lock().expect("stderr pump poisoned").take();
-    if let Some(pump) = pump {
-        pump.abort();
-    }
-}
-
 /// Current RFC 3339 timestamp.
 #[must_use]
 pub fn now() -> String {
@@ -465,12 +457,14 @@ pub struct Launch {
     /// First turn's prompt, if the launch should start one. `adopt` may bind
     /// the session without prompting.
     pub prompt: Option<String>,
-    /// Session mode to activate with `session/set_mode`. Required — no
-    /// default exists.
-    pub mode: String,
+    /// Session mode to activate with `session/set_mode`. Required when the
+    /// agent advertises a mode list; must be `None` when it advertises
+    /// none — no `set_mode` call is made then.
+    pub mode: Option<String>,
     /// Session model to set with `session/set_config_option` on the `model`
-    /// option. Required — no default exists.
-    pub model: String,
+    /// option. Required when the agent advertises a `model` option; must be
+    /// `None` when it advertises none.
+    pub model: Option<String>,
     /// Extra `session/set_config_option` values applied after `model`.
     pub config: BTreeMap<String, ConfigValue>,
     /// Permission policy override.
@@ -505,12 +499,27 @@ pub async fn launch(state: &Arc<AppState>, config: &Config, args: Launch) -> Res
     // Claim the session id atomically across the live and in-flight maps:
     // the MCP server runs `tools/call`s concurrently, so two `adopt`s of one
     // session could interleave between this check and `live.insert` below.
+    // An `exited` live entry is a husk — its agent process is already gone —
+    // so `adopt` reaps it here rather than requiring a `close` first.
     if let Some(session_id) = &args.load {
         validate_session_id(session_id)?;
-        let live = state.live.lock().expect("live poisoned");
-        let mut reserved = state.reserved.lock().expect("reserved poisoned");
-        if live.contains_key(session_id) || !reserved.insert(session_id.clone()) {
-            return Err(Error::SessionLive(session_id.clone()));
+        let reap = {
+            let mut live = state.live.lock().expect("live poisoned");
+            let mut reserved = state.reserved.lock().expect("reserved poisoned");
+            let husk = live.get(session_id).is_some_and(|sub| {
+                matches!(
+                    sub.rt.inner.lock().expect("inner poisoned").status,
+                    Status::Exited(_)
+                )
+            });
+            if (live.contains_key(session_id) && !husk) || !reserved.insert(session_id.clone()) {
+                return Err(Error::SessionLive(session_id.clone()));
+            }
+            drop(reserved);
+            if husk { live.remove(session_id) } else { None }
+        };
+        if let Some(sub) = reap {
+            close_sub(&sub).await;
         }
     }
     let result = launch_inner(state, config, &args, agent_cfg, cwd).await;
@@ -555,10 +564,12 @@ async fn launch_inner(
             pending: Vec::new(),
             queue: VecDeque::new(),
             steer_pending: VecDeque::new(),
+            steer_folded: VecDeque::new(),
             steer_owner: None,
         }),
         notify: Notify::new(),
         prompt_send: Arc::new(tokio::sync::Mutex::new(())),
+        steer: agent_cfg.steer,
         transcript: tokio::sync::Mutex::new(TranscriptWriter::deferred()),
         terminals: Terminals::new(HashMap::new()),
         stderr_tail: Mutex::new(VecDeque::new()),
@@ -714,16 +725,17 @@ fn connect(
 /// What the agent accepted during the handshake: the session id and the
 /// effective model and mode, read back from the `session/set_mode` /
 /// `session/set_config_option` answers — the agent's own report, not the
-/// requested strings echoed back.
+/// requested strings echoed back. `model`/`mode` are `None` for an agent
+/// that advertises neither a `model` option nor session modes.
 struct Accepted {
     /// ACP session id (agent-assigned for `session/new`, the adopted id for
     /// `session/load`).
     session_id: String,
     /// The `model` option's current value after `set_config_option`.
-    model: serde_json::Value,
+    model: Option<serde_json::Value>,
     /// The session's current mode after `set_mode`, from the agent's
     /// `current_mode_update` or its acceptance of the request.
-    mode: String,
+    mode: Option<String>,
 }
 
 /// `session/new` or `session/load` — the latter only when the agent
@@ -753,9 +765,9 @@ async fn open_session(
     }
 }
 
-/// `initialize`, `session/new` or `session/load`, `set_mode`, and the
-/// `set_config_option` calls; upserts the registry entry. Returns the
-/// session id and the model/mode the agent accepted.
+/// `initialize`, `session/new` or `session/load`, `set_mode` when a mode
+/// was given, and the `set_config_option` calls; upserts the registry
+/// entry. Returns the session id and the model/mode the agent accepted.
 async fn handshake(
     state: &Arc<AppState>,
     client: &AcpClient<SubagentHandler>,
@@ -775,7 +787,7 @@ async fn handshake(
     // session is registered.
     let config_options = config_options.unwrap_or_default();
     let (modes, options) = check_advertised(&args.agent, args, modes, &config_options)?;
-    let current_mode = modes.current_mode_id.clone();
+    let current_mode = modes.as_ref().map(|modes| modes.current_mode_id.clone());
     let turn_offset = state
         .registry
         .lock()
@@ -786,23 +798,30 @@ async fn handshake(
         let mut inner = rt.inner.lock().expect("inner poisoned");
         inner.session_id.clone_from(&session_id);
         inner.agent_info = init.agent_info;
-        inner.modes = Some(modes);
+        inner.modes = modes;
         inner.config_options = config_options;
         inner.turn_offset = turn_offset;
     }
-    client
-        .set_mode(SessionSetModeParams::new(
-            session_id.clone(),
-            args.mode.clone(),
-        ))
-        .await
-        .map_err(agent_error)?;
-    note_set_mode(
-        &mut rt.inner.lock().expect("inner poisoned"),
-        &current_mode,
-        &args.mode,
-    );
-    let mut accepted_model = serde_json::Value::from(args.model.clone());
+    // `set_mode` runs only for a requested mode — `check_advertised`
+    // already paired it with an advertised mode list.
+    if let Some(mode) = args.mode.as_deref() {
+        client
+            .set_mode(SessionSetModeParams::new(
+                session_id.clone(),
+                mode.to_string(),
+            ))
+            .await
+            .map_err(agent_error)?;
+        note_set_mode(
+            &mut rt.inner.lock().expect("inner poisoned"),
+            current_mode.as_deref(),
+            mode,
+        );
+    }
+    let mut accepted_model = options.get("model").map(|value| match value {
+        ConfigValue::Select(value) => serde_json::Value::from(value.clone()),
+        ConfigValue::Toggle(flag) => serde_json::Value::from(*flag),
+    });
     for (id, value) in options {
         let value = match value {
             ConfigValue::Select(value) => aither_acp::SessionConfigValue::from(value),
@@ -825,7 +844,7 @@ async fn handshake(
                 .and_then(|option| option.current_value.as_ref())
             && let Ok(value) = serde_json::to_value(current)
         {
-            accepted_model = value;
+            accepted_model = Some(value);
         }
         rt.inner.lock().expect("inner poisoned").config_options = updated;
     }
@@ -862,36 +881,75 @@ async fn handshake(
 }
 
 /// Check `args`' mode, model and config values against what the agent
-/// advertised in `session/new`/`session/load`, before anything is applied:
-/// a mode the agent does not list, a config id it does not advertise, or a
-/// select value outside the advertised set fails the launch.
+/// advertised in `session/new`/`session/load`, before anything is applied.
+/// Each of `mode`/`model` pairs with its advertisement: required when the
+/// agent advertises the surface (a mode list / a `model` config option),
+/// rejected when passed to an agent that advertises none, and otherwise
+/// checked the same as before — a mode the agent does not list, a config
+/// id it does not advertise, or a select value outside the advertised set
+/// fails the launch.
 ///
-/// Returns the advertised mode state and the merged `model` + `config`
-/// option map to apply.
+/// Returns the advertised mode state (when there is one) and the merged
+/// `model` + `config` option map to apply.
 fn check_advertised(
     agent: &str,
     args: &Launch,
     modes: Option<SessionModeState>,
     config_options: &[ConfigOption],
-) -> Result<(SessionModeState, BTreeMap<String, ConfigValue>)> {
-    let modes = modes.ok_or_else(|| Error::ModesNotAdvertised {
-        agent: agent.to_string(),
-        value: args.mode.clone(),
-    })?;
-    let valid: Vec<String> = modes
-        .available_modes
-        .iter()
-        .map(|mode| mode.id.clone())
-        .collect();
-    if !valid.contains(&args.mode) {
-        return Err(Error::UnknownMode {
+) -> Result<(Option<SessionModeState>, BTreeMap<String, ConfigValue>)> {
+    let modes = match (modes, args.mode.as_deref()) {
+        (Some(modes), Some(mode)) => {
+            let valid: Vec<String> = modes
+                .available_modes
+                .iter()
+                .map(|mode| mode.id.clone())
+                .collect();
+            if !valid.iter().any(|id| id == mode) {
+                return Err(Error::UnknownMode {
+                    agent: agent.to_string(),
+                    value: mode.to_string(),
+                    valid,
+                });
+            }
+            Some(modes)
+        }
+        (Some(modes), None) => {
+            return Err(Error::ModeRequired {
+                agent: agent.to_string(),
+                valid: modes
+                    .available_modes
+                    .iter()
+                    .map(|mode| mode.id.clone())
+                    .collect(),
+            });
+        }
+        (None, Some(mode)) => {
+            return Err(Error::ModesNotAdvertised {
+                agent: agent.to_string(),
+                value: mode.to_string(),
+            });
+        }
+        (None, None) => None,
+    };
+    // `model` pairs with the `model` config option the same way: required
+    // when the agent advertises one, rejected when given to an agent that
+    // advertises none. A `config`-supplied `model` key counts as given.
+    let mut options = args.config.clone();
+    if let Some(model) = args.model.as_deref() {
+        options.insert("model".to_string(), ConfigValue::Select(model.to_string()));
+    }
+    if config_options.iter().any(|option| option.id == "model") {
+        if !options.contains_key("model") {
+            return Err(Error::ModelRequired {
+                agent: agent.to_string(),
+            });
+        }
+    } else if let Some(model) = args.model.as_deref() {
+        return Err(Error::ModelNotAdvertised {
             agent: agent.to_string(),
-            value: args.mode.clone(),
-            valid,
+            value: model.to_string(),
         });
     }
-    let mut options = args.config.clone();
-    options.insert("model".to_string(), ConfigValue::Select(args.model.clone()));
     for (id, value) in &options {
         check_config_option(agent, config_options, id, value)?;
     }
@@ -901,9 +959,9 @@ fn check_advertised(
 /// Record the mode `set_mode` left in effect: a `current_mode_update`
 /// received while the call was in flight already reported it; with none,
 /// the agent's acceptance of the request stands.
-fn note_set_mode(inner: &mut Inner, prior: &str, requested: &str) {
+fn note_set_mode(inner: &mut Inner, prior: Option<&str>, requested: &str) {
     let modes = inner.modes.as_mut().expect("modes recorded");
-    if modes.current_mode_id == prior {
+    if Some(modes.current_mode_id.as_str()) == prior {
         requested.clone_into(&mut modes.current_mode_id);
     }
 }
@@ -914,7 +972,7 @@ fn note_set_mode(inner: &mut Inner, prior: &str, requested: &str) {
 /// another mode. Without such an option the modes state's current id —
 /// a `current_mode_update` when one arrived, else the accepted request —
 /// is the report.
-fn confirmed_mode(inner: &mut Inner) -> String {
+fn confirmed_mode(inner: &mut Inner) -> Option<String> {
     let confirmed = inner
         .config_options
         .iter()
@@ -924,11 +982,17 @@ fn confirmed_mode(inner: &mut Inner) -> String {
             ConfigOptionValue::Selected(id) => Some(id.clone()),
             ConfigOptionValue::Toggle(_) => None,
         });
-    let modes = inner.modes.as_mut().expect("modes recorded");
-    if let Some(confirmed) = confirmed {
-        modes.current_mode_id = confirmed;
+    match inner.modes.as_mut() {
+        Some(modes) => {
+            if let Some(confirmed) = confirmed {
+                modes.current_mode_id = confirmed;
+            }
+            Some(modes.current_mode_id.clone())
+        }
+        // An agent with no mode list can still report a `mode` config
+        // option's current value; otherwise there is no mode to report.
+        None => confirmed,
     }
-    modes.current_mode_id.clone()
 }
 
 /// Check a `model`/`config` value against the options the agent advertised
@@ -999,24 +1063,64 @@ fn check_config_option(
     }
 }
 
-/// Connection task epilogue: a dead agent marks the subagent failed unless
-/// `close`/`forget` set the closing flag first.
+/// Connection task epilogue: a dead agent marks the subagent `exited` unless
+/// `close`/`forget` set the closing flag first. A `failed` turn's reason is
+/// folded into the exit reason — the exit is the terminal fact.
 fn on_disconnect(rt: &SubRuntime) {
     if rt.closing.load(Ordering::Relaxed) {
         return;
     }
     let mut inner = rt.inner.lock().expect("inner poisoned");
-    if matches!(inner.status, Status::Failed(_)) {
-        return;
-    }
-    inner.status = Status::Failed("agent process exited".to_string());
+    let reason = match &inner.status {
+        Status::Failed(reason) => format!("agent process exited (earlier failure: {reason})"),
+        _ => "agent process exited".to_string(),
+    };
+    inner.status = Status::Exited(reason);
     inner.pending.clear();
     inner.queue.clear();
     inner.steer_pending.clear();
+    inner.steer_folded.clear();
     inner.steer_owner = None;
     inner.current = None;
     drop(inner);
     rt.notify.notify_waiters();
+}
+
+/// Close a subagent: drop pending requests and queues, close the client, and
+/// take the connection and stderr tasks down.
+///
+/// Shared by the `close` and `forget` tools, by `adopt` reaping an `exited`
+/// husk, and by the daemon's orphan reaper.
+///
+/// # Panics
+///
+/// Panics if a state mutex is poisoned.
+pub async fn close_sub(sub: &Subagent) {
+    sub.rt.closing.store(true, Ordering::Relaxed);
+    {
+        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+        for pending in inner.pending.drain(..) {
+            let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
+        }
+        inner.queue.clear();
+        inner.steer_pending.clear();
+        inner.steer_folded.clear();
+        inner.steer_owner = None;
+        if matches!(inner.status, Status::Running | Status::NeedsPermission) {
+            inner.status = Status::Cancelled;
+        }
+    }
+    sub.client.clone().close();
+    let conn = sub.conn.lock().expect("conn poisoned").take();
+    if let Some(conn) = conn
+        && let Err(error) = conn.await
+    {
+        debug!(%error, "connection task join failed");
+    }
+    let pump = sub.stderr_pump.lock().expect("stderr pump poisoned").take();
+    if let Some(pump) = pump {
+        pump.abort();
+    }
 }
 
 /// Pump agent stderr into the tail buffer and tracing.
@@ -1057,6 +1161,18 @@ pub(crate) fn prompt_slot_free(inner: &Inner) -> bool {
     inner.status.accepts_prompt() && inner.steer_pending.is_empty()
 }
 
+/// The oldest steer that could still produce turn traffic. Settled-folded
+/// steers precede every pending one — a steer moves to `steer_folded` only
+/// at a turn's end, before any newer steer exists — so the folded queue's
+/// front wins.
+pub(crate) fn oldest_steer(inner: &Inner) -> Option<u64> {
+    inner
+        .steer_folded
+        .front()
+        .copied()
+        .or_else(|| inner.steer_pending.front().copied())
+}
+
 /// Begin a prompt turn on an established session.
 ///
 /// Serializes through `rt.prompt_send`, requires a promptable status, and
@@ -1075,6 +1191,15 @@ pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: Strin
     let (turn_n, fut) = begin_turn(&state, sub, prompt, Gate::Check, false).await?;
     spawn_turn_task(state, sub, fut, turn_n);
     Ok(())
+}
+
+/// The number the next turn takes when its slot is stamped: the settled
+/// count plus one, shifted by `turn_offset`. `begin_turn` assigns it when
+/// `current` is stamped; callers that predict the next turn during the
+/// reserved-slot gap must use this same function so the two numberings
+/// cannot drift apart.
+pub(crate) const fn next_turn_number(inner: &Inner) -> u64 {
+    inner.turn_offset + inner.turns.len() as u64 + 1
 }
 
 /// The shared tail of `start_turn`, `send`'s steer-fallback, and the
@@ -1127,7 +1252,7 @@ pub(crate) async fn begin_turn(
                 status,
             });
         }
-        let n = inner.turn_offset + inner.turns.len() as u64 + 1;
+        let n = next_turn_number(&inner);
         inner.current = Some(Turn {
             n,
             started_at: Some(started),
@@ -1144,7 +1269,13 @@ pub(crate) async fn begin_turn(
     if let Err(source) = sub.rt.transcript.lock().await.append(&record).await {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         inner.current = None;
-        inner.status = Status::Failed(format!("cannot write transcript: {source}"));
+        // `failed`, not `exited`: the agent process is still alive — the
+        // turn could not be logged, but the next `send` retries the write
+        // and either runs the turn or reports the I/O error again. A
+        // disconnect that landed in between keeps `exited`.
+        if !matches!(inner.status, Status::Exited(_)) {
+            inner.status = Status::Failed(format!("cannot write transcript: {source}"));
+        }
         drop(inner);
         sub.rt.notify.notify_waiters();
         return Err(Error::io("cannot write transcript", source));
@@ -1224,8 +1355,10 @@ async fn enqueue_prompt(
 /// (devin treats it as an injected user message steering the active task)
 /// fold the text into the turn; the returned future resolves with that
 /// turn's own result — or with a rejection from agents that do not accept a
-/// concurrent prompt. A steer that lands after the target turn ended runs
-/// as a turn of its own: [`steer_resolved`] reconciles which it became.
+/// concurrent prompt, or not at all on a [`SteerSemantics::Folded`] agent,
+/// where [`settle_turn`] settles it at the turn's end. A steer that lands
+/// after the target turn ended runs as a turn of its own:
+/// [`steer_resolved`] reconciles which it became.
 ///
 /// Returns the steer id, the target turn's number, and the prompt call's
 /// future, which the caller either awaits briefly for a synchronous
@@ -1281,8 +1414,11 @@ pub(crate) fn steer_end_record(
 /// so its resolution IS that turn's end and [`finish_turn`] settles it;
 /// or it errored — a rejection transfers ownership of a materialized turn
 /// to the next pending steer, since the traffic cannot be the rejected
-/// one's. When the last in-flight steer resolves without owning a turn and
-/// the queue was held for it, the first queued prompt chains here.
+/// one's. A steer already settled `folded` resolves through the same
+/// paths: it left `steer_pending` at its target turn's end, but a late
+/// arrival's own turn still closes here. When the last in-flight steer
+/// resolves without owning a turn and the queue was held for it, the
+/// first queued prompt chains here.
 ///
 /// Returns the outcome back to the caller (a synchronous `send(steer)` path
 /// reports rejections from it).
@@ -1296,10 +1432,11 @@ pub(crate) async fn steer_resolved(
     let (mine, kick, turn_n) = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         inner.steer_pending.retain(|&id| id != steer_id);
+        inner.steer_folded.retain(|&id| id != steer_id);
         let mine = if inner.steer_owner == Some(steer_id) {
             inner.steer_owner = None;
             if outcome.is_err()
-                && let Some(&owner) = inner.steer_pending.front()
+                && let Some(owner) = oldest_steer(&inner)
             {
                 inner.steer_owner = Some(owner);
                 false
@@ -1312,7 +1449,7 @@ pub(crate) async fn steer_resolved(
         let kick = !mine
             && inner.steer_pending.is_empty()
             && inner.current.is_none()
-            && matches!(inner.status, Status::Done(_))
+            && inner.status.accepts_prompt()
             && !inner.queue.is_empty();
         let prompt = if kick {
             inner.status = Status::Running;
@@ -1374,14 +1511,23 @@ pub(crate) type PromptFut =
 /// (the status stays `running` — no `done` interlude), anything else settles
 /// `done`. A steered prompt still in flight may materialize as a turn ahead
 /// of the queue on the wire, so the queue pops only once they all resolve.
-/// Returns the prompt to chain and the prompts the queue dropped.
-fn settle_turn(rt: &SubRuntime, reason: StopReason) -> (Option<String>, VecDeque<String>) {
+/// Returns the prompt to chain, the prompts the queue dropped, and the ids
+/// of steers settled as folded.
+fn settle_turn(
+    rt: &SubRuntime,
+    reason: StopReason,
+) -> (Option<String>, VecDeque<String>, Vec<u64>) {
     let mut inner = rt.inner.lock().expect("inner poisoned");
     if let Some(mut turn) = inner.current.take() {
         turn.stop_reason = Some(reason);
         inner.turns.push(turn);
     }
-    let outcome = if reason == StopReason::Cancelled {
+    let folded = fold_pending_steers(rt, &mut inner);
+    let (next, dropped) = if matches!(inner.status, Status::Exited(_)) {
+        // The process died while the turn was in flight; `on_disconnect`
+        // already cleared the queue and steers and owns the status.
+        (None, VecDeque::new())
+    } else if reason == StopReason::Cancelled {
         inner.status = Status::Cancelled;
         (None, std::mem::take(&mut inner.queue))
     } else if inner.steer_pending.is_empty()
@@ -1397,18 +1543,39 @@ fn settle_turn(rt: &SubRuntime, reason: StopReason) -> (Option<String>, VecDeque
         (None, VecDeque::new())
     };
     drop(inner);
-    outcome
+    (next, dropped, folded)
+}
+
+/// A `folded`-semantics agent never answers a steered prompt it folded
+/// into the turn that just ended: settle every still-pending steer as
+/// folded so the prompt slot frees and the queue can chain. The ids move
+/// to `steer_folded`, not oblivion — a steer that actually landed late
+/// runs as a turn of its own and still needs to own it.
+///
+/// Returns the settled steer ids for their `steer_end: folded` records.
+fn fold_pending_steers(rt: &SubRuntime, inner: &mut Inner) -> Vec<u64> {
+    if rt.steer != SteerSemantics::Folded {
+        return Vec::new();
+    }
+    let folded: Vec<u64> = inner.steer_pending.drain(..).collect();
+    inner.steer_folded.extend(folded.iter().copied());
+    folded
 }
 
 /// Push the finished turn into `turns`, mark the subagent `failed`, and
-/// return the dropped queue.
-fn fail_turn(rt: &SubRuntime, reason: String) -> VecDeque<String> {
+/// return the dropped queue and the ids of steers settled as folded. A turn
+/// error that lands after `on_disconnect` does not downgrade `exited` — the
+/// dead process cannot take the prompt `failed` would invite.
+fn fail_turn(rt: &SubRuntime, reason: String) -> (VecDeque<String>, Vec<u64>) {
     let mut inner = rt.inner.lock().expect("inner poisoned");
     if let Some(turn) = inner.current.take() {
         inner.turns.push(turn);
     }
-    inner.status = Status::Failed(reason);
-    std::mem::take(&mut inner.queue)
+    let folded = fold_pending_steers(rt, &mut inner);
+    if !matches!(inner.status, Status::Exited(_)) {
+        inner.status = Status::Failed(reason);
+    }
+    (std::mem::take(&mut inner.queue), folded)
 }
 
 /// Append a `queue_dropped` transcript record, when any prompts dropped.
@@ -1426,6 +1593,21 @@ pub(crate) async fn record_queue_dropped(
     }
     if let Err(error) = rt.transcript.lock().await.append(&record).await {
         warn!(%error, "transcript write failed");
+    }
+}
+
+/// Append a `steer_end: folded` record for each steer settled as folded
+/// at a turn's end.
+async fn record_steers_folded(rt: &SubRuntime, turn_n: u64, steers: Vec<u64>) {
+    for _ in steers {
+        let record = serde_json::json!({
+            "ts": now(),
+            "turn": turn_n,
+            "steer_end": "folded",
+        });
+        if let Err(error) = rt.transcript.lock().await.append(&record).await {
+            warn!(%error, "transcript write failed");
+        }
     }
 }
 
@@ -1490,7 +1672,8 @@ async fn finish_turn(
             if let Err(error) = rt.transcript.lock().await.append(&record).await {
                 warn!(%error, "transcript write failed");
             }
-            let (next, dropped) = settle_turn(&rt, reason);
+            let (next, dropped, folded) = settle_turn(&rt, reason);
+            record_steers_folded(&rt, turn_n, folded).await;
             if let Some(prompt) = next {
                 spawn_chained(state.clone(), session_id.clone(), prompt, wire);
             } else {
@@ -1515,7 +1698,9 @@ async fn finish_turn(
             if let Err(error) = rt.transcript.lock().await.append(&record).await {
                 warn!(%error, "transcript write failed");
             }
-            record_queue_dropped(&rt, Some(turn_n), fail_turn(&rt, reason)).await;
+            let (dropped, folded) = fail_turn(&rt, reason);
+            record_steers_folded(&rt, turn_n, folded).await;
+            record_queue_dropped(&rt, Some(turn_n), dropped).await;
             drop(wire);
         }
     }

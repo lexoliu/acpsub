@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aither_acp::{ConfigOption, ConfigOptionValue, ConfigSelectOptions, RequestPermissionOutcome};
+use aither_acp::{
+    ConfigOption, ConfigOptionValue, ConfigSelectOptions, RequestPermissionOutcome, StopReason,
+};
 use aither_core::llm::tool::{Progress, Tool, ToolContext, Tools};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -20,8 +22,9 @@ use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Gate, Launch, Status, Subagent, begin_turn, close_sub, launch, prompt_slot_free,
-    record_queue_dropped, spawn_turn_task, start_turn, steer_resolved, steer_turn, steer_waiter,
+    AppState, Gate, Launch, Status, Subagent, begin_turn, close_sub, launch, next_turn_number,
+    prompt_slot_free, record_queue_dropped, spawn_turn_task, start_turn, steer_resolved,
+    steer_turn, steer_waiter,
 };
 use crate::transcript::{RenderOptions, render};
 
@@ -65,7 +68,7 @@ pub fn build_tools(state: Arc<AppState>) -> aither_core::Result<Tools> {
 
 /// [`build_tools`] with an explicit report interval: the seam tests
 /// inject a short interval through — production callers use
-/// [`build_tools`], which reports every [`PROGRESS_INTERVAL`].
+/// [`build_tools`], which reports every `PROGRESS_INTERVAL`.
 ///
 /// # Errors
 ///
@@ -113,35 +116,92 @@ fn spawned_view(sub: &Subagent) -> Value {
     })
 }
 
-/// Seconds the running turn has been going; `None` when the subagent is
-/// not running. A `running` subagent always has a recorded start — the
-/// current turn's `started_at`, or a just-chained turn's
-/// `pending_turn_start` — so a missing one is a broken invariant, never a
-/// case to wait through unbounded.
+/// The turn `wait`/`wait_any` binds to at call time: the number of the
+/// turn in flight, or — during the chained-turn gap, when the queue pop
+/// already reserved the slot but `begin_turn` has not stamped `current`
+/// yet — of the turn that is about to start. `None` when the subagent is
+/// not `running`: the call returns at once, unchanged. A queued turn that
+/// starts afterwards does not extend the wait.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Internal`] when the invariant is violated.
-fn turn_elapsed(sub: &Subagent) -> Result<Option<f64>> {
+/// Returns [`Error::Internal`] when the status is `running` but no turn
+/// start is recorded — a broken invariant, never a case to wait through
+/// unbounded.
+fn awaited_turn(sub: &Subagent) -> Result<Option<u64>> {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
     if !matches!(inner.status, Status::Running) {
         return Ok(None);
     }
-    let Some(started) = inner
-        .current
-        .as_ref()
-        .and_then(|turn| turn.started_at)
-        .or(inner.pending_turn_start)
-    else {
-        return Err(Error::Internal {
-            session_id: sub.session_id.clone(),
-            detail: "status is running but no turn start is recorded".to_string(),
-        });
-    };
+    if let Some(turn) = &inner.current {
+        return Ok(Some(turn.n));
+    }
+    if inner.pending_turn_start.is_some() {
+        return Ok(Some(next_turn_number(&inner)));
+    }
     drop(inner);
-    Ok(Some(
-        jiff::Timestamp::now().duration_since(started).as_secs_f64(),
-    ))
+    Err(Error::Internal {
+        session_id: sub.session_id.clone(),
+        detail: "status is running but no turn start is recorded".to_string(),
+    })
+}
+
+/// What the turn a wait is bound to is doing.
+enum Awaited {
+    /// Still in flight: its elapsed seconds, measured from its own
+    /// recorded start.
+    Running(f64),
+    /// No longer the in-flight turn — settled into `turns`, superseded by
+    /// a chained or materialized turn, parked on a permission request
+    /// (the wait returns to report it), or gone with the session.
+    Ended,
+}
+
+/// Poll the turn `n` a wait is bound to: its elapsed seconds while it is
+/// still in flight, [`Awaited::Ended`] once it is not. Tracking the turn
+/// number — not "whatever is running now" — is what keeps a queued turn
+/// chaining after the awaited one from extending the wait or resetting
+/// its progress.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] when the awaited turn is in flight but has
+/// no recorded start.
+fn awaited_elapsed(sub: &Subagent, n: u64) -> Result<Awaited> {
+    let inner = sub.rt.inner.lock().expect("inner poisoned");
+    let missing_start = || Error::Internal {
+        session_id: sub.session_id.clone(),
+        detail: "status is running but no turn start is recorded".to_string(),
+    };
+    if let Some(turn) = inner.current.as_ref().filter(|turn| turn.n == n) {
+        // Only `running` means still in flight: `needs_permission` parks
+        // the turn on a request the wait returns to report, and `close`
+        // cancels the session without clearing `current`.
+        if !matches!(inner.status, Status::Running) {
+            return Ok(Awaited::Ended);
+        }
+        let Some(started) = turn.started_at.or(inner.pending_turn_start) else {
+            return Err(missing_start());
+        };
+        return Ok(Awaited::Running(
+            jiff::Timestamp::now().duration_since(started).as_secs_f64(),
+        ));
+    }
+    // The gap the awaited turn was predicted in: the slot is still
+    // reserved (`Running`, no `current` yet) until `begin_turn` runs.
+    if matches!(inner.status, Status::Running)
+        && inner.current.is_none()
+        && next_turn_number(&inner) == n
+    {
+        let Some(started) = inner.pending_turn_start else {
+            return Err(missing_start());
+        };
+        return Ok(Awaited::Running(
+            jiff::Timestamp::now().duration_since(started).as_secs_f64(),
+        ));
+    }
+    drop(inner);
+    Ok(Awaited::Ended)
 }
 
 /// The progress report a blocked wait sends for `sub`: `progress` is the
@@ -188,11 +248,26 @@ const fn check_expect(cx: &ToolContext, expect_secs: u64) -> Result<()> {
 
 /// A `wait`-style result for one subagent. `overrun` marks that the turn
 /// outlived `expect_secs`: the result reports `overrun`, the turn's own
-/// elapsed time, and its latest tool call.
-fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
-    let (status, reply, tool_calls, pending, turn_n, queued, elapsed, latest) = {
+/// elapsed time, and its latest tool call. `awaited` is the turn the call
+/// bound to (see [`awaited_turn`]); `None` reports the latest turn, the
+/// shape a wait on a non-running subagent has always had.
+fn wait_view(sub: &Subagent, started: Instant, overrun: bool, awaited: Option<u64>) -> Value {
+    let (status, reply, tool_calls, pending, turn_n, queued, elapsed, latest, ended_reason) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
-        let turn = inner.current.as_ref().or_else(|| inner.turns.last());
+        // The awaited turn's own record — the same lookup `result` uses
+        // for an explicit turn number: `turns` once settled, `current`
+        // while it is still in flight. A queued turn that already chained
+        // into `current` must not shadow it.
+        let turn = awaited.map_or_else(
+            || inner.current.as_ref().or_else(|| inner.turns.last()),
+            |n| {
+                inner
+                    .turns
+                    .iter()
+                    .find(|turn| turn.n == n)
+                    .or_else(|| inner.current.as_ref().filter(|turn| turn.n == n))
+            },
+        );
         let pending = inner.pending.first().map(|perm| {
             json!({
                 "request_id": perm.request_id,
@@ -216,7 +291,7 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
                 turn.tool_calls.values().cloned().collect::<Vec<_>>()
             }),
             pending,
-            turn.map(|turn| turn.n),
+            turn.map(|turn| turn.n).or(awaited),
             inner.queue.len(),
             turn.and_then(|turn| turn.started_at)
                 .map(|started| jiff::Timestamp::now().duration_since(started).as_secs_f64()),
@@ -226,6 +301,8 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
                     .and_then(|id| turn.tool_calls.get(id))
                     .cloned()
             }),
+            turn.and_then(|turn| turn.stop_reason)
+                .filter(|_| awaited.is_some()),
         )
     };
     let mut view = json!({
@@ -246,18 +323,29 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
             view["latest_tool_call"] = serde_json::to_value(latest)
                 .expect("ToolCallSummary holds only owned primitives; serialization cannot fail");
         }
-    }
-    match &status {
-        Status::Done(reason) => {
-            view["stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
+    } else if let Some(reason) = ended_reason {
+        // The awaited turn's own end: its stop reason wins over the
+        // session status, which may already show the turn that chained
+        // after it.
+        view["state"] = json!(if matches!(reason, StopReason::Cancelled) {
+            "cancelled"
+        } else {
+            "done"
+        });
+        view["stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
+    } else {
+        match &status {
+            Status::Done(reason) => {
+                view["stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
+            }
+            Status::Cancelled => {
+                view["stop_reason"] = json!("cancelled");
+            }
+            Status::Failed(reason) | Status::Exited(reason) => {
+                view["error"] = json!(reason);
+            }
+            _ => {}
         }
-        Status::Cancelled => {
-            view["stop_reason"] = json!("cancelled");
-        }
-        Status::Failed(reason) => {
-            view["error"] = json!(reason);
-        }
-        _ => {}
     }
     if let Some(pending) = pending {
         view["pending_permission"] = pending;
@@ -274,9 +362,10 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool) -> Value {
 ///
 /// Returns immediately with `session_id` — the handle every other tool
 /// addresses (`wait` for the reply, `send` for follow-ups, `transcript` for
-/// the full log), plus the `model` and `mode` the agent accepted. The turn
-/// runs in the background. To take over an existing session instead of
-/// starting a new one, use `adopt`.
+/// the full log), plus the `model` and `mode` the agent accepted (`null`
+/// for an agent that advertises neither). The turn runs in the background.
+/// To take over an existing session instead of starting a new one, use
+/// `adopt`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SpawnArgs {
     /// Configured agent key (`[agents.<key>]` in the config file). Optional:
@@ -287,16 +376,20 @@ struct SpawnArgs {
     cwd: PathBuf,
     /// The first turn's prompt — the task for the subagent.
     prompt: String,
-    /// Required: the model to run, set via `session/set_config_option` on
-    /// the `model` option. There is no configured default. The value must
-    /// be one the agent advertises for `model`; the value it reports as
-    /// current comes back in the result.
-    model: String,
-    /// Required: the session mode to activate (`session/set_mode`). There
-    /// is no configured default. The value must be one of the modes the
+    /// The model to run, set via `session/set_config_option` on the
+    /// `model` option. Required when the agent advertises a `model`
+    /// config option; must be omitted when it advertises none — passing
+    /// one then is an error. When given, the value must be one the agent
+    /// advertises; the value it reports as current comes back in the
+    /// result.
+    model: Option<String>,
+    /// The session mode to activate (`session/set_mode`). Required when
+    /// the agent advertises session modes; must be omitted when it
+    /// advertises none — passing one then is an error and no `set_mode`
+    /// call is made. When given, the value must be one of the modes the
     /// agent advertises; the mode it reports as current comes back in the
     /// result.
-    mode: String,
+    mode: Option<String>,
     /// Extra session config options to set (`session/set_config_option`),
     /// applied after `model`: option id → string or boolean. Every id and
     /// value must be one the agent advertises.
@@ -351,6 +444,9 @@ impl Tool for SpawnTool {
 /// `wait`, `transcript`, and the rest work as usual. When `prompt` is given
 /// its turn starts immediately; otherwise the session idles until `send`.
 ///
+/// A live session whose agent process exited (`exited` state) is reaped by
+/// `adopt` — no `close` needed first.
+///
 /// `cwd` is optional: it is taken from the registry for sessions acpsub
 /// knows, or discovered from the agent's session database (e.g. devin's
 /// local store). Only pass it when discovery cannot find the session.
@@ -369,10 +465,12 @@ struct AdoptArgs {
     /// or the agent's session database. Required only when neither knows the
     /// session.
     cwd: Option<PathBuf>,
-    /// Required: the model to run, as in `spawn`.
-    model: String,
-    /// Required: the session mode to activate, as in `spawn`.
-    mode: String,
+    /// The model to run, as in `spawn`: required when the agent advertises
+    /// a `model` config option, must be omitted when it advertises none.
+    model: Option<String>,
+    /// The session mode to activate, as in `spawn`: required when the agent
+    /// advertises session modes, must be omitted when it advertises none.
+    mode: Option<String>,
     /// Permission policy override, as in `spawn`.
     permission: Option<PermissionPolicy>,
     /// Owning coordinator pid, as in `spawn`.
@@ -461,7 +559,9 @@ impl Tool for AdoptTool {
 
 /// Send a prompt to a live subagent. `policy` decides what a `running` (or
 /// `needs_permission`) subagent does with it; nothing is queued or injected
-/// unless you ask.
+/// unless you ask. A `failed` subagent — the last turn errored but the
+/// agent is still live — takes the prompt as a fresh turn, like `done`;
+/// an `exited` one (the agent process is gone) errors — `adopt` it instead.
 ///
 /// Returns immediately; use `wait` for the reply.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -473,13 +573,19 @@ struct SendArgs {
     /// Required: how to deliver while a turn is running.
     ///
     /// `try` — the original behavior: error unless the subagent is `idle`,
-    /// `done`, or `cancelled`. `queued` — park the prompt on a FIFO queue;
-    /// it fires as the next turn when the current one ends, and is dropped
-    /// if that turn is cancelled or fails, or on `cancel`/`close`/`forget`.
+    /// `done`, `cancelled`, or `failed`. `queued` — park the prompt on a
+    /// FIFO queue; it fires as the next turn when the current one ends, and
+    /// is dropped if that turn is cancelled or fails, or on
+    /// `cancel`/`close`/`forget`.
     /// `steer` — inject the prompt into the running turn (a second
     /// `session/prompt` while it is in flight); agents that support
     /// mid-turn injection fold it into the active task, agents that do not
-    /// surface an error.
+    /// surface an error. How the request resolves depends on the agent's
+    /// configured `steer` semantics: an `answered` agent (the default)
+    /// answers every steered prompt, while a `folded` agent (codex-acp)
+    /// never answers one it folded into a turn — acpsub settles such a
+    /// steer when its target turn ends. On either, a steer that landed
+    /// behind the turn's end still runs and resolves as a turn of its own.
     policy: SendPolicy,
 }
 
@@ -488,7 +594,8 @@ struct SendArgs {
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum SendPolicy {
-    /// Error when the subagent is not `idle`, `done`, or `cancelled`.
+    /// Error when the subagent is not `idle`, `done`, `cancelled`, or
+    /// `failed`.
     Try,
     /// Park the prompt on the subagent's queue; it fires as the next turn
     /// when the current one ends.
@@ -525,7 +632,7 @@ impl Tool for SendTool {
                         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
                         if prompt_slot_free(&inner) && inner.queue.is_empty() {
                             Action::Fresh
-                        } else if matches!(inner.status, Status::Failed(_)) {
+                        } else if matches!(inner.status, Status::Exited(_)) {
                             return Err(Error::NotPromptable {
                                 session_id: args.session_id.clone(),
                                 status: inner.status.name().to_string(),
@@ -562,7 +669,7 @@ impl Tool for SendTool {
                     inner.status.clone()
                 };
                 match status {
-                    Status::Idle | Status::Done(_) | Status::Cancelled => {
+                    Status::Idle | Status::Done(_) | Status::Cancelled | Status::Failed(_) => {
                         let (turn_n, fut) =
                             begin_turn(&self.0, &sub, args.prompt, Gate::Check, false).await?;
                         spawn_turn_task(self.0.clone(), &sub, fut, turn_n);
@@ -599,7 +706,7 @@ impl Tool for SendTool {
                             "turn": turn_n,
                         }));
                     }
-                    Status::Failed(_) => {
+                    Status::Exited(_) => {
                         drop(wire);
                         return Err(Error::NotPromptable {
                             session_id: args.session_id.clone(),
@@ -618,10 +725,12 @@ impl Tool for SendTool {
 // wait / wait_any
 // ---------------------------------------------------------------------------
 
-/// Block until a subagent's turn ends, a permission request needs an
-/// answer, or the turn has run past `expect_secs`.
+/// Block until the turn that was running when the call began ends, a
+/// permission request needs an answer, or the turn has run past
+/// `expect_secs`. The wait binds to that turn's number: a queued or
+/// steered turn that starts afterwards does not extend it.
 ///
-/// Returns the subagent state (`done`/`cancelled`/`failed`/
+/// Returns the subagent state (`done`/`cancelled`/`failed`/`exited`/
 /// `needs_permission`), the turn's `reply` (concatenated agent message
 /// text), its tool calls, and — when `needs_permission` — the
 /// `pending_permission` request to answer with `permit`. When the turn has
@@ -656,15 +765,18 @@ impl Tool for WaitTool {
         check_expect(&cx, args.expect_secs)?;
         let sub = self.state.get(&args.session_id)?;
         let started = Instant::now();
+        let Some(awaited) = awaited_turn(&sub)? else {
+            return Ok(wait_view(&sub, started, false, None));
+        };
         #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
         let expect = args.expect_secs as f64;
         let interval = self.interval;
         let mut next_report = started;
         let overrun = loop {
-            match turn_elapsed(&sub)? {
-                None => break false,
-                Some(elapsed) if elapsed >= expect => break true,
-                Some(elapsed) => {
+            match awaited_elapsed(&sub, awaited)? {
+                Awaited::Ended => break false,
+                Awaited::Running(elapsed) if elapsed >= expect => break true,
+                Awaited::Running(elapsed) => {
                     let now = Instant::now();
                     if now >= next_report {
                         cx.report_progress(wait_progress(&sub, elapsed, args.expect_secs))
@@ -681,14 +793,15 @@ impl Tool for WaitTool {
                 }
             }
         };
-        Ok(wait_view(&sub, started, overrun))
+        Ok(wait_view(&sub, started, overrun, Some(awaited)))
     }
 }
 
-/// Block until the first of several subagents leaves `running` — a turn
-/// end, a permission request, or an `overrun` once its turn has run past
-/// `expect_secs` — then return that one's wait-style result. An overrun is
-/// to be investigated, not re-waited with a larger number.
+/// Block until the first of several subagents' awaited turn ends — each
+/// session binds to the turn running when the call began — a permission
+/// request needs an answer, or an `overrun` once a turn has run past
+/// `expect_secs` — then return that one's wait-style result. An overrun
+/// is to be investigated, not re-waited with a larger number.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitAnyArgs {
     /// Session ids to watch.
@@ -719,6 +832,12 @@ impl Tool for WaitAnyTool {
             .map(|session_id| self.state.get(session_id))
             .collect::<Result<Vec<_>>>()?;
         let started = Instant::now();
+        // Each watched session binds to the turn in flight at call time,
+        // the same rule `wait` applies to one.
+        let awaited = subs
+            .iter()
+            .map(|sub| awaited_turn(sub))
+            .collect::<Result<Vec<_>>>()?;
         #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
         let expect = args.expect_secs as f64;
         let interval = self.interval;
@@ -728,13 +847,16 @@ impl Tool for WaitAnyTool {
             // Report the longest-running watched turn: it is the one a
             // host-side idle timer would be most anxious about.
             let mut longest: Option<(f64, &Arc<Subagent>)> = None;
-            for sub in &subs {
-                match turn_elapsed(sub)? {
-                    None => return Ok(wait_view(sub, started, false)),
-                    Some(elapsed) if elapsed >= expect => {
-                        return Ok(wait_view(sub, started, true));
+            for (sub, awaited) in subs.iter().zip(&awaited) {
+                let Some(n) = awaited else {
+                    return Ok(wait_view(sub, started, false, None));
+                };
+                match awaited_elapsed(sub, *n)? {
+                    Awaited::Ended => return Ok(wait_view(sub, started, false, Some(*n))),
+                    Awaited::Running(elapsed) if elapsed >= expect => {
+                        return Ok(wait_view(sub, started, true, Some(*n)));
                     }
-                    Some(elapsed) => {
+                    Awaited::Running(elapsed) => {
                         poll = poll.min(Duration::from_secs_f64(expect - elapsed));
                         if longest.is_none_or(|(max, _)| elapsed > max) {
                             longest = Some((elapsed, sub));
@@ -827,7 +949,7 @@ impl StatusTool {
             if let Some(reason) = last_stop {
                 view["last_stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
             }
-            if let Status::Failed(reason) = &status {
+            if let Status::Failed(reason) | Status::Exited(reason) = &status {
                 view["error"] = json!(reason);
             }
             return Ok(view);

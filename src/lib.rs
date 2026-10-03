@@ -25,7 +25,9 @@ pub mod terminal;
 pub mod tools;
 pub mod transcript;
 
-pub use config::{AgentConfig, Config, Defaults, PermissionPolicy, default_config_path};
+pub use config::{
+    AgentConfig, Config, Defaults, PermissionPolicy, SteerSemantics, default_config_path,
+};
 pub use error::{Error, Result};
 pub use registry::{Registry, RegistryEntry};
 pub use state::{AppState, Status, Subagent};

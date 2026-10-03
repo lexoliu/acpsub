@@ -20,6 +20,8 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 - "gather" -> the prompt completes once a steered prompt arrives; the
   steered text is recorded into the reply.
 - "die" -> the process exits mid-turn with status 3.
+- "fail" -> the prompt's request returns a JSON-RPC error; the process
+  stays alive (a dropped model stream, a backend error).
 
 A session/prompt that arrives while a prompt is pending is a steer: its
 request resolves with the same result as the turn's own prompt, and its
@@ -27,6 +29,11 @@ text joins the turn via "steer:<text>" in the reply. FAKE_NO_STEER=1 makes
 the agent reject a concurrent prompt instead. FAKE_QUEUE_PROMPTS=1 makes
 the agent park a concurrent prompt and run it as its own turn after the
 current one ends (agents that serialize prompts instead of injecting).
+FAKE_FOLD_STEER=1 makes the agent fold a concurrent prompt into the
+running turn and never answer its request (codex-acp) — unless its text
+starts with "LATE ", which plays a steer that landed behind the turn's
+end: the running turn finishes and the steer runs, and answers, as a turn
+of its own.
 
 - "hold" -> the turn stays open until a queued prompt arrives
   (FAKE_QUEUE_PROMPTS mode only).
@@ -34,7 +41,10 @@ current one ends (agents that serialize prompts instead of injecting).
 session/cancel answers the pending prompt (and every steer) with
 stopReason cancelled.
 FAKE_NO_LOAD=1 in the environment makes the agent not advertise loadSession.
-FAKE_NO_MODES=1 makes session/new and session/load return no mode list.
+FAKE_NO_MODES=1 makes the agent advertise no session modes at all:
+session/new and session/load return no mode list and no `mode` config
+option.
+FAKE_NO_MODEL=1 drops the `model` config option from the advertised list.
 FAKE_NO_OPTIONS=1 makes the advertised `model` config option carry no
 selectable values.
 FAKE_MODE_IGNORED=1 makes session/set_mode a no-op: the call succeeds but
@@ -269,31 +279,38 @@ def session_modes():
 def session_config_options():
     """Config options advertised in session/new and session/load, with the
     values currently in effect; FAKE_NO_OPTIONS=1 gives `model` no
-    selectable values."""
-    model = {
-        "id": "model",
-        "name": "Model",
-        "type": "select",
-        "category": "model",
-        "currentValue": current_model,
-    }
-    if os.environ.get("FAKE_NO_OPTIONS") != "1":
-        model["options"] = [
-            {"value": "a", "name": "A"},
-            {"value": "b", "name": "B"},
-        ]
-    mode = {
-        "id": "mode",
-        "name": "Mode",
-        "type": "select",
-        "category": "mode",
-        "currentValue": current_mode,
-        "options": [
-            {"value": "default", "name": "Default"},
-            {"value": "bypass", "name": "Bypass"},
-        ],
-    }
-    return [model, mode]
+    selectable values, FAKE_NO_MODEL=1 drops `model` and FAKE_NO_MODES=1
+    drops `mode` from the list entirely."""
+    options = []
+    if os.environ.get("FAKE_NO_MODEL") != "1":
+        model = {
+            "id": "model",
+            "name": "Model",
+            "type": "select",
+            "category": "model",
+            "currentValue": current_model,
+        }
+        if os.environ.get("FAKE_NO_OPTIONS") != "1":
+            model["options"] = [
+                {"value": "a", "name": "A"},
+                {"value": "b", "name": "B"},
+            ]
+        options.append(model)
+    if os.environ.get("FAKE_NO_MODES") != "1":
+        options.append(
+            {
+                "id": "mode",
+                "name": "Mode",
+                "type": "select",
+                "category": "mode",
+                "currentValue": current_mode,
+                "options": [
+                    {"value": "default", "name": "Default"},
+                    {"value": "bypass", "name": "Bypass"},
+                ],
+            }
+        )
+    return options
 
 
 def session_result(request_id, result):
@@ -310,10 +327,25 @@ def on_prompt(request_id, params):
     text = (params.get("prompt") or [{}])[0].get("text", "")
     if text == "die":
         sys.exit(3)
+    if text == "fail":
+        # The request errors but the process keeps running — a failed turn
+        # on a live agent.
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "stream disconnected before completion",
+                },
+            }
+        )
+        return
     if pending_prompt is not None:
         # A prompt arriving while a turn runs is a steer injection — unless
-        # FAKE_NO_STEER=1 rejects it, or FAKE_QUEUE_PROMPTS=1 parks it
-        # agent-side to run as its own turn after this one ends.
+        # FAKE_NO_STEER=1 rejects it, FAKE_QUEUE_PROMPTS=1 parks it
+        # agent-side to run as its own turn after this one ends, or
+        # FAKE_FOLD_STEER=1 folds it in and leaves its request unanswered.
         if os.environ.get("FAKE_NO_STEER") == "1":
             send(
                 {
@@ -322,6 +354,25 @@ def on_prompt(request_id, params):
                     "error": {"code": -32600, "message": "prompt in flight"},
                 }
             )
+            return
+        if os.environ.get("FAKE_FOLD_STEER") == "1":
+            if text.startswith("LATE "):
+                # The steer landed behind the turn's end: the running turn
+                # finishes, then the steer runs — and answers — as a turn
+                # of its own.
+                queued.append((request_id, text[5:]))
+                finish_prompt()
+            else:
+                collected.append("steer:" + text)
+                update(
+                    session_id,
+                    {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": text},
+                    },
+                )
+                if pending_text == "gather":
+                    finish_prompt()
             return
         if os.environ.get("FAKE_QUEUE_PROMPTS") == "1":
             queued.append((request_id, text))

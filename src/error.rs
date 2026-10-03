@@ -172,13 +172,42 @@ pub enum Error {
     #[error("config option '{0}' must be a string or boolean")]
     BadConfigValue(String),
 
-    /// The agent advertised no mode list, so `mode` cannot be checked.
-    #[error("agent '{agent}' advertises no session modes; cannot check mode '{value}'")]
+    /// The agent advertises no session modes, so `mode` cannot be given.
+    #[error("agent '{agent}' advertises no session modes; 'mode' must be omitted (got '{value}')")]
     ModesNotAdvertised {
         /// Agent config key.
         agent: String,
-        /// The requested mode.
+        /// The mode that was passed anyway.
         value: String,
+    },
+
+    /// The agent advertises session modes, so `mode` is required.
+    #[error("agent '{agent}' advertises session modes; 'mode' is required{}", if valid.is_empty() { String::new() } else { format!(" (valid: {})", valid.join(", ")) })]
+    ModeRequired {
+        /// Agent config key.
+        agent: String,
+        /// Mode ids the agent advertised.
+        valid: Vec<String>,
+    },
+
+    /// The agent advertises no `model` config option, so `model` cannot be
+    /// given.
+    #[error(
+        "agent '{agent}' advertises no 'model' config option; 'model' must be omitted (got '{value}')"
+    )]
+    ModelNotAdvertised {
+        /// Agent config key.
+        agent: String,
+        /// The model that was passed anyway.
+        value: String,
+    },
+
+    /// The agent advertises a `model` config option, so `model` is
+    /// required.
+    #[error("agent '{agent}' advertises a 'model' config option; 'model' is required")]
+    ModelRequired {
+        /// Agent config key.
+        agent: String,
     },
 
     /// The requested mode is not among the agent's advertised modes.
