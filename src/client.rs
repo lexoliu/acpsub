@@ -25,7 +25,7 @@ use aither_mcp::protocol::{
     McpError, ProgressToken, RequestMeta,
 };
 use aither_mcp::transport::{StreamTransport, Transport};
-use futures_lite::io::BufReader;
+use futures_lite::io::{AsyncReadExt, BufReader};
 use serde_json::Value;
 use tracing::debug;
 
@@ -39,8 +39,6 @@ const DAEMON_STARTUP_POLL: Duration = Duration::from_millis(50);
 /// How long a restart-following call waits for the next daemon. A drain
 /// blocks on the longest running turn, so the bound is generous.
 const RESTART_FOLLOW: Duration = Duration::from_secs(3600);
-/// The marker a draining daemon's `restarting` refusals carry.
-const RESTARTING: &str = "restarting";
 
 /// Tools that only read daemon state: a call dropped mid-flight by an
 /// exiting daemon is safe to re-issue against the next one.
@@ -95,34 +93,38 @@ pub async fn call(
                 }
                 return Ok(result);
             }
-            Err(error) => {
-                // A read-only call dropped by an exiting daemon is a
-                // restart, not a failure: re-issue it against the next
-                // daemon, auto-starting one when none answers.
-                if IDEMPOTENT.contains(&tool)
-                    && matches!(
-                        error,
-                        Error::DaemonDisconnected { .. } | Error::DaemonConnect { .. }
-                    )
-                    && std::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(DAEMON_STARTUP_POLL).await;
-                    continue;
-                }
-                return Err(error);
-            }
+            // A read-only call dropped by an exiting daemon is a restart,
+            // not a failure: re-issue it at once — the next connect lands
+            // in the old listener's backlog while it exits, or reaches —
+            // or auto-starts — the replacement. A call that never reached
+            // the daemon stays an error.
+            Err(Error::DaemonDisconnected { .. })
+                if IDEMPOTENT.contains(&tool) && std::time::Instant::now() < deadline => {}
+            Err(error) => return Err(error),
         }
     }
 }
 
-/// Whether the tool result is a `restarting` refusal — the marker that
-/// tells a turn-starting call to wait for the next daemon and retry.
+/// Whether the tool result is the draining daemon's `restarting`
+/// refusal. The wire carries tool errors as text only, so the refusal is
+/// a JSON object whose `error` discriminant is checked exactly — a
+/// coincidental "restarting" in an agent's message does not count.
 fn is_restarting(result: &CallToolResult) -> bool {
     result.is_error
         && result
             .content
             .iter()
-            .any(|content| matches!(content, Content::Text(text) if text.text.contains(RESTARTING)))
+            .any(|content| matches!(content, Content::Text(text) if restarting_marker(&text.text)))
+}
+
+/// The structured refusal's discriminant check.
+fn restarting_marker(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(Value::as_str)
+        == Some("restarting")
 }
 
 /// One connect-handshake-call round against the daemon at `socket`.
@@ -217,11 +219,14 @@ async fn connect_or_start(
 
 /// Wait until the daemon generation serving `socket` changes.
 ///
-/// The socket refusing connections means the draining daemon exited, and
-/// the pidfile naming a different pid means a replacement is already up
-/// (auto-started by another caller) — either way the next call reaches
-/// the next daemon. The exited process may linger as an unreaped zombie,
-/// so pid liveness is not the signal — the socket is.
+/// The draining daemon's exit closes every client stream: a fresh
+/// connection's read end hits EOF the moment the process is gone — the
+/// real signal, not a poll. The connect can also land on a replacement
+/// another caller already auto-started: the daemon writes its pid file
+/// before binding, so a changed pid means this stream reached the next
+/// generation and there is nothing left to wait for. When the pid file
+/// cannot tell, the stream is awaited anyway — a misattributed peer only
+/// costs the deadline.
 ///
 /// # Errors
 ///
@@ -229,43 +234,47 @@ async fn connect_or_start(
 /// the daemon is still draining at the deadline.
 pub async fn wait_for_next_daemon(socket: &Path) -> Result<()> {
     let pid_path = socket.with_extension("sock.pid");
-    let was = std::fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|pid| pid.trim().parse::<u32>().ok());
-    let deadline = std::time::Instant::now() + RESTART_FOLLOW;
-    loop {
-        match async_net::unix::UnixStream::connect(socket).await {
-            Ok(_still_up) => {
-                let now = std::fs::read_to_string(&pid_path)
-                    .ok()
-                    .and_then(|pid| pid.trim().parse::<u32>().ok());
-                if now.is_some_and(|now| was.is_some_and(|was| now != was)) {
-                    return Ok(());
-                }
-            }
-            Err(source)
-                if matches!(
-                    source.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(source) => {
-                return Err(Error::DaemonConnect {
-                    path: socket.to_path_buf(),
-                    source,
-                });
-            }
+    let was = daemon_pid(&pid_path);
+    let mut stream = match async_net::unix::UnixStream::connect(socket).await {
+        Ok(stream) => stream,
+        // Nothing answers: the draining daemon already exited.
+        Err(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(Error::io(
-                format!("the daemon at {} is still draining", socket.display()),
-                std::io::Error::other("drain deadline"),
-            ));
+        Err(source) => {
+            return Err(Error::DaemonConnect {
+                path: socket.to_path_buf(),
+                source,
+            });
         }
-        tokio::time::sleep(DAEMON_STARTUP_POLL).await;
+    };
+    if daemon_pid(&pid_path).is_some_and(|now| was.is_some_and(|was| now != was)) {
+        return Ok(());
     }
+    // The server never writes unprompted, so a completed read means the
+    // stream ended — the daemon is gone.
+    let mut byte = [0_u8; 1];
+    match tokio::time::timeout(RESTART_FOLLOW, stream.read(&mut byte)).await {
+        Err(_deadline) => Err(Error::io(
+            format!("the daemon at {} is still draining", socket.display()),
+            std::io::Error::other("drain deadline"),
+        )),
+        // EOF, reset, or a byte the daemon never sends — the stream
+        // resolved, the draining daemon is gone.
+        Ok(_) => Ok(()),
+    }
+}
+
+/// The pid a daemon's pid file currently names, when it is readable.
+fn daemon_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|pid| pid.trim().parse().ok())
 }
 
 /// Spawn `acpsub daemon` detached: its own process group, no inherited

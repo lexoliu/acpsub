@@ -67,6 +67,11 @@ pub struct Resume {
     /// still run, so they ride the restart into the next daemon, which
     /// replays them into the session's queue after `session/load`.
     pub queued: Vec<String>,
+    /// The last resume attempt's error, when the load failed: kept so
+    /// `list`/`status` surface why the session did not come back and the
+    /// next restart knows to retry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
 }
 
 /// A session parked by its provider's rate limit.

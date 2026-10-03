@@ -312,6 +312,15 @@ enum Command {
         #[command(flatten)]
         conn: DaemonConn,
     },
+    /// Begin a graceful daemon restart drain: new turns are refused with
+    /// `restarting`, in-flight work finishes, then every live session is
+    /// marked for resume and the daemon exits. Returns once the drain
+    /// began — unlike `restart` it does not wait for the exit, and the
+    /// next client call auto-starts the replacement.
+    Drain {
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
     /// Restart the daemon: it drains in-flight turns, closes every live
     /// session marked for resume, and exits; the next daemon — started by
     /// this call when none answers — re-adopts them under the same ids.
@@ -523,6 +532,7 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
         Command::Close { session_id, conn } => (conn, "close", json!({"session_id": session_id})),
         Command::Forget { session_id, conn } => (conn, "forget", json!({"session_id": session_id})),
         Command::AgentsLive { conn } => (conn, "agents", json!({})),
+        Command::Drain { conn } => (conn, "daemon/drain", json!({})),
         _ => unreachable!("non-client commands are handled before `call`"),
     };
     let socket = conn.socket_path()?;

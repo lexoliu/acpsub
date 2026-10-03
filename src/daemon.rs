@@ -15,7 +15,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use aither_mcp::McpServer;
@@ -33,9 +32,6 @@ use crate::tools::build_tools;
 
 /// How often the reaper checks owner pids.
 const OWNER_CHECK: Duration = Duration::from_secs(2);
-/// How often the drain task re-checks for running turns: a backstop for
-/// the `progressed` notifications turn ends and live-map removals send.
-const DRAIN_POLL: Duration = Duration::from_millis(100);
 
 /// The default daemon socket: `~/.local/share/acpsub/daemon.sock`.
 #[must_use]
@@ -59,18 +55,27 @@ pub fn default_socket_path() -> Option<PathBuf> {
 ///
 /// Returns an error if the socket cannot be bound or its permissions set.
 pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
-    let listener = bind(socket_path).await?;
-    // The pid file lets a caller stop exactly this daemon:
-    // `kill "$(cat daemon.sock.pid)"`.
-    std::fs::write(
-        socket_path.with_extension("sock.pid"),
-        std::process::id().to_string(),
-    )
-    .map_err(|source| Error::io("cannot write daemon pid file", source))?;
+    // The pid file lets a caller stop exactly this daemon —
+    // `kill "$(cat daemon.sock.pid)"` — and tells a restart waiter which
+    // generation holds the socket. It is written before the bind so
+    // "the socket accepts ⇒ the pid file names its daemon" holds, and
+    // removed again when the bind fails.
+    let pid_path = socket_path.with_extension("sock.pid");
+    std::fs::write(&pid_path, std::process::id().to_string())
+        .map_err(|source| Error::io("cannot write daemon pid file", source))?;
+    let listener = match bind(socket_path).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = std::fs::remove_file(&pid_path);
+            return Err(error);
+        }
+    };
+    info!(socket = %socket_path.display(), "daemon listening");
     resume_marked(&state).await;
     tokio::spawn(reap_orphans(state.clone()));
+    let mut finished = state.drain.finished.subscribe();
     loop {
-        if state.drain.quiesced.load(Ordering::Relaxed) {
+        if *finished.borrow() {
             break;
         }
         tokio::select! {
@@ -90,7 +95,11 @@ pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
                     }
                 }
             }
-            () = state.drain.wake.notified() => {}
+            changed = finished.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
         }
     }
     handoff(&state).await;
@@ -99,12 +108,20 @@ pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
 
 /// The drain task the `daemon/drain` tool spawns: wait until no turn is
 /// running anywhere — queued prompts chain through the normal turn-end
-/// path, so the wait covers them — then flag quiescence so the accept
-/// loop hands off and exits. A `needs_permission` session is an in-flight
-/// turn too: `permit` keeps working through the drain to unblock it.
+/// path, so the wait covers them — then publish `finished` so the accept
+/// loop hands off and exits. A `needs_permission` session is an
+/// in-flight turn too: `permit` keeps working through the drain to
+/// unblock it. Every path that ends a turn funnels through
+/// `finish_turn`'s `progressed` notification — pending prompts resolve
+/// on connection close — so the enabled waiter cannot miss a transition.
 pub(crate) async fn drain_sessions(state: Arc<AppState>) {
     info!("drain requested; waiting for in-flight turns to finish");
     loop {
+        // Register the waiter BEFORE checking the live map: a turn that
+        // ends between the check and the await still wakes us.
+        let notified = state.drain.progressed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let running = state
             .live
             .lock()
@@ -117,14 +134,10 @@ pub(crate) async fn drain_sessions(state: Arc<AppState>) {
         if !running {
             break;
         }
-        tokio::select! {
-            () = state.drain.progressed.notified() => {}
-            () = tokio::time::sleep(DRAIN_POLL) => {}
-        }
+        notified.await;
     }
     info!("all turns finished; closing sessions for restart");
-    state.drain.quiesced.store(true, Ordering::Relaxed);
-    state.drain.wake.notify_waiters();
+    let _ = state.drain.finished.send(true);
 }
 
 /// The drain's handoff: close every live session, marking each registry
@@ -154,7 +167,10 @@ async fn handoff(state: &Arc<AppState>) {
         let result = state
             .update_registry(|registry| {
                 if let Some(entry) = registry.get_mut(&session_id) {
-                    entry.resume = Some(crate::registry::Resume { queued });
+                    entry.resume = Some(crate::registry::Resume {
+                        queued,
+                        failed: None,
+                    });
                 }
             })
             .await;
@@ -251,9 +267,24 @@ async fn resume_one(
         Ok(sub) => sub,
         Err(error) => {
             warn!(%session_id, %error, "session resume failed");
+            let message = error.to_string();
+            // The mark stays — the next restart retries the load — and
+            // records the failure so `list`/`status` surface it.
+            let persist = state
+                .update_registry(|registry| {
+                    if let Some(entry) = registry.get_mut(&session_id)
+                        && let Some(resume) = entry.resume.as_mut()
+                    {
+                        resume.failed = Some(message.clone());
+                    }
+                })
+                .await;
+            if let Err(error) = persist {
+                warn!(%session_id, %error, "registry persist failed");
+            }
             report.failed.push(ResumeFailure {
                 session_id,
-                error: error.to_string(),
+                error: message,
             });
             return;
         }

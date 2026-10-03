@@ -89,10 +89,11 @@ pub enum Error {
     },
 
     /// The daemon is draining for a restart: the call would start new
-    /// work, which a draining daemon refuses. The `restarting` marker in
-    /// the message is what the CLI client matches to wait for the next
-    /// daemon and retry.
-    #[error("restarting: {detail}")]
+    /// work, which a draining daemon refuses. The wire carries the error
+    /// text only, so the display is the structured refusal itself — a
+    /// JSON object whose `error` discriminant the CLI client parses to
+    /// wait for the next daemon and retry.
+    #[error("{{\"error\":\"restarting\",\"detail\":{detail:?}}}")]
     Restarting {
         /// What was refused and why.
         detail: String,

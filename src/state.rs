@@ -175,21 +175,33 @@ impl AppState {
 /// Daemon drain/restart coordination.
 ///
 /// `requested` is set by the `daemon/drain` tool; the drain task it
-/// spawns waits for quiescence, sets `quiesced`, and wakes the accept
-/// loop to hand off and exit. `progressed` wakes the drain task on every
-/// turn end; a short poll inside the task backstops live-map changes
-/// that carry no notification (a session closed out from under it).
-#[derive(Debug, Default)]
+/// spawns waits for quiescence — woken by `progressed` on every turn end
+/// — then publishes `finished`, which the accept loop subscribes to so
+/// checking and waiting are one race-free primitive: a drain that
+/// completes between the loop's value check and its wait still lands.
+/// Turn ends all funnel through `finish_turn` — pending prompts resolve
+/// on connection close — so `progressed` covers every path to
+/// quiescence.
+#[derive(Debug)]
 pub struct Drain {
     /// A `daemon/drain` call began a drain: turn-starting calls are
     /// refused with [`Error::Restarting`].
     pub requested: AtomicBool,
     /// Wakes the drain waiter when a turn ends.
     pub progressed: Notify,
-    /// The drain reached quiescence — no turn is running anywhere.
-    pub quiesced: AtomicBool,
-    /// Wakes the daemon's accept loop to hand off and exit.
-    pub wake: Notify,
+    /// `true` once the drain reached quiescence — no turn is running
+    /// anywhere — telling the accept loop to hand off and exit.
+    pub finished: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for Drain {
+    fn default() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            progressed: Notify::new(),
+            finished: tokio::sync::watch::channel(false).0,
+        }
+    }
 }
 
 /// What the daemon's startup resume pass did, reported by
