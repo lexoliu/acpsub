@@ -231,17 +231,10 @@ enum Command {
         expect: u64,
         /// The wait's own deadline in seconds. When it passes with the
         /// turn still running, wait returns `state: "running"` with an
-        /// activity `digest` of the window instead of dying silent under a
-        /// background-task kill limit — set it just below that limit. The
-        /// digest: `window_secs`; `tool_calls` (calls overlapping the
-        /// window); `tool_call_share` (fraction of window wall time inside
-        /// calls, >1 when calls overlap); `longest_tool_calls` (five
-        /// longest: id, title, `duration_secs`); `repeated_titles` (titles
-        /// seen >= 3 times: title, count); `secs_since_last_edit` (since
-        /// the last edit/delete/move call finished, ~0 while one runs,
-        /// null when none overlaps); `latest_tool_call`. Overrun results
-        /// carry the same digest. All values are measured from recorded
-        /// tool-call timestamps, never from command text.
+        /// activity `digest` of the window (shape documented in the
+        /// README's `wait` entry) instead of dying silent under a
+        /// background-task kill limit — set it just below that limit.
+        /// Overrun results carry the same digest.
         #[arg(long)]
         max_wait: Option<u64>,
         #[command(flatten)]

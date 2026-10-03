@@ -283,7 +283,7 @@ fn note_tool_call(turn: &mut Turn, call: ToolCall) {
             kind: call.kind,
             status: call.status,
             locations: call.locations,
-            started_at: Some(seen),
+            started_at: seen,
             ended_at: call.status.filter(|s| terminal_status(*s)).map(|_| seen),
         },
     );
@@ -304,7 +304,7 @@ fn note_tool_call_update(turn: &mut Turn, update: ToolCallUpdate) {
             kind: None,
             status: None,
             locations: Vec::new(),
-            started_at: Some(seen),
+            started_at: seen,
             ended_at: None,
         });
     if let Some(status) = update.status {

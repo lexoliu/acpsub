@@ -16,7 +16,7 @@ use aither_acp::{
 };
 use aither_core::llm::tool::{Progress, Tool, ToolContext, Tools};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{ConfigValue, PermissionPolicy};
@@ -270,19 +270,53 @@ enum WaitOutcome {
 ///
 /// A call counts toward the window when any of its recorded lifetime
 /// overlaps it — a call that ended before the wait began is excluded, and
-/// a still-running call's duration is measured to now. `window_secs` is
-/// the window's length; `tool_calls` the number of calls in it;
-/// `tool_call_share` the fraction of window wall time spent inside calls
-/// (above 1.0 when calls overlap); `longest_tool_calls` the five longest
-/// by in-window duration (`id`, `title`, `duration_secs`);
-/// `repeated_titles` every title seen three or more times (`title`,
-/// `count`); `secs_since_last_edit` the seconds since the most recent
-/// edit-kind call (`edit`/`delete`/`move`) finished — about 0 while one
-/// is still running — `null` when none overlaps the window; and
-/// `latest_tool_call` the turn's latest tool call summary.
-fn activity_digest(turn: Option<&Turn>, window_start: jiff::Timestamp) -> Value {
+/// a still-running call's duration is measured to now.
+#[derive(Debug, Serialize)]
+struct ActivityDigest {
+    /// The window's length in seconds.
+    window_secs: f64,
+    /// Calls whose recorded lifetime overlaps the window.
+    tool_calls: u64,
+    /// Fraction of window wall time spent inside calls — above 1.0 when
+    /// calls overlap.
+    tool_call_share: f64,
+    /// The five longest calls by in-window duration.
+    longest_tool_calls: Vec<DigestCall>,
+    /// Every title seen three or more times, with its count.
+    repeated_titles: Vec<DigestTitle>,
+    /// Seconds since the most recent edit-kind call (`edit`/`delete`/`move`)
+    /// finished — about 0 while one is still running; `null` when none
+    /// overlaps the window.
+    secs_since_last_edit: Option<f64>,
+    /// The turn's latest tool call summary.
+    latest_tool_call: Option<ToolCallSummary>,
+}
+
+/// A `longest_tool_calls` entry.
+#[derive(Debug, Serialize)]
+struct DigestCall {
+    /// Tool call id.
+    id: String,
+    /// Human-readable title.
+    title: String,
+    /// The call's in-window duration in seconds.
+    duration_secs: f64,
+}
+
+/// A `repeated_titles` entry.
+#[derive(Debug, Serialize)]
+struct DigestTitle {
+    /// The repeated title.
+    title: String,
+    /// How many in-window calls carry it.
+    count: u64,
+}
+
+/// Build the [`ActivityDigest`] of `turn` over the window from
+/// `window_start` to now.
+fn activity_digest(turn: Option<&Turn>, window_start: jiff::Timestamp) -> ActivityDigest {
     let now = jiff::Timestamp::now();
-    let window_secs = now.duration_since(window_start).as_secs_f64().max(0.0);
+    let window_secs = now.duration_since(window_start).as_secs_f64();
     let mut tool_calls = 0_u64;
     let mut busy_secs = 0.0_f64;
     let mut longest: Vec<(&ToolCallSummary, f64)> = Vec::new();
@@ -290,16 +324,13 @@ fn activity_digest(turn: Option<&Turn>, window_start: jiff::Timestamp) -> Value 
     let mut last_edit_end: Option<jiff::Timestamp> = None;
     if let Some(turn) = turn {
         for call in turn.tool_calls.values() {
-            let Some(call_start) = call.started_at else {
-                continue;
-            };
             let call_end = call.ended_at.unwrap_or(now);
             if call_end <= window_start {
                 continue;
             }
             tool_calls += 1;
             let duration = call_end
-                .duration_since(call_start.max(window_start))
+                .duration_since(call.started_at.max(window_start))
                 .as_secs_f64();
             busy_secs += duration;
             longest.push((call, duration));
@@ -318,28 +349,38 @@ fn activity_digest(turn: Option<&Turn>, window_start: jiff::Timestamp) -> Value 
         .filter(|(_, count)| *count >= 3)
         .collect();
     repeated.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    json!({
-        "window_secs": window_secs,
-        "tool_calls": tool_calls,
-        "tool_call_share": if window_secs > 0.0 { busy_secs / window_secs } else { 0.0 },
-        "longest_tool_calls": longest.iter().take(5).map(|(call, duration)| json!({
-            "id": call.id,
-            "title": call.title,
-            "duration_secs": duration,
-        })).collect::<Vec<_>>(),
-        "repeated_titles": repeated.iter().map(|(title, count)| json!({
-            "title": title,
-            "count": count,
-        })).collect::<Vec<_>>(),
-        "secs_since_last_edit": last_edit_end
-            .map(|end| now.duration_since(end).as_secs_f64()),
-        "latest_tool_call": turn.and_then(|turn| {
+    ActivityDigest {
+        window_secs,
+        tool_calls,
+        tool_call_share: if window_secs > 0.0 {
+            busy_secs / window_secs
+        } else {
+            0.0
+        },
+        longest_tool_calls: longest
+            .iter()
+            .take(5)
+            .map(|(call, duration)| DigestCall {
+                id: call.id.clone(),
+                title: call.title.clone(),
+                duration_secs: *duration,
+            })
+            .collect(),
+        repeated_titles: repeated
+            .iter()
+            .map(|(title, count)| DigestTitle {
+                title: (*title).to_string(),
+                count: *count,
+            })
+            .collect(),
+        secs_since_last_edit: last_edit_end.map(|end| now.duration_since(end).as_secs_f64()),
+        latest_tool_call: turn.and_then(|turn| {
             turn.latest_tool_call
                 .as_ref()
                 .and_then(|id| turn.tool_calls.get(id))
-        }).map(|call| serde_json::to_value(call)
-            .expect("ToolCallSummary holds only owned primitives; serialization cannot fail")),
-    })
+                .cloned()
+        }),
+    }
 }
 
 /// The `pending_permission` field of a wait result, for the first queued
@@ -466,7 +507,8 @@ fn wait_view(
         view["pending_permission"] = pending;
     }
     if let Some(digest) = digest {
-        view["digest"] = digest;
+        view["digest"] = serde_json::to_value(digest)
+            .expect("ActivityDigest holds only owned primitives; serialization cannot fail");
     }
     view
 }
@@ -858,10 +900,8 @@ impl Tool for SendTool {
 /// with a larger expectation.
 ///
 /// Both an `overrun` result and a `max_wait_secs` timeout carry an
-/// activity `digest` measured over the window since the wait began:
-/// `{window_secs, tool_calls, tool_call_share, longest_tool_calls,
-/// repeated_titles, secs_since_last_edit, latest_tool_call}` — see
-/// `max_wait_secs`.
+/// activity `digest` measured over the window since the wait began —
+/// its fields are documented on [`ActivityDigest`].
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitArgs {
     /// Session id, as returned by `spawn`/`adopt`.
@@ -875,18 +915,8 @@ struct WaitArgs {
     /// when the wait began — unlike `expect_secs` it bounds the wait, not
     /// the turn. When it passes before the awaited turn ends or overruns,
     /// the wait returns `state: "running"` with an activity `digest` of
-    /// the window, rather than dying silent under a caller-side kill
-    /// limit. The digest's shape: `window_secs` (the window's length);
-    /// `tool_calls` (calls whose recorded lifetime overlaps the window);
-    /// `tool_call_share` (fraction of window wall time inside calls — can
-    /// exceed 1 when calls overlap); `longest_tool_calls` (the five
-    /// longest by in-window duration, `{id, title, duration_secs}`);
-    /// `repeated_titles` (titles seen 3+ times, `{title, count}`);
-    /// `secs_since_last_edit` (since the last edit/delete/move call
-    /// finished, ~0 while one runs, `null` when none overlaps the
-    /// window); `latest_tool_call` (the turn's latest call summary).
-    /// Durations are measured from the calls' recorded `started_at` /
-    /// `ended_at`, never inferred from command text. Set it just below
+    /// the window (fields documented on `ActivityDigest`), rather than
+    /// dying silent under a caller-side kill limit — set it just below
     /// the caller's own timeout.
     max_wait_secs: Option<u64>,
 }
