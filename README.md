@@ -108,7 +108,7 @@ file that fails to parse is a tool error, never a stale fallback.
 | `close` | `session_id` | End the process; keep the registry entry (still adoptable). |
 | `forget` | `session_id` | Remove the registry entry (and the process if live). |
 | `agents` | — | Configured agents; for initialised ones their `agentInfo`, modes, config options. |
-| `daemon/drain` | — | Daemon only: begin a graceful restart — refuse new turns with a `restarting` error, let in-flight turns and accepted queued prompts finish, mark every live session for resume, close it, and exit. |
+| `daemon/drain` | — | Daemon only: begin a graceful restart — refuse new turns with a `restarting` error, let in-flight turns and accepted queued prompts finish, mark every live session for resume, close it, and exit. Returns once the gate is closed. |
 | `daemon/resumed` | — | Daemon only: the startup resume pass's report — which marked sessions came back via `session/load` and which failed, with the agent's error. |
 
 `agent` may be omitted anywhere it appears: the `[defaults].agent` setting
@@ -161,7 +161,7 @@ text:
 - A **subagent** = one process + one ACP session + a transcript file,
   addressed by its `session_id`. States: `idle | running | needs_permission |
   rate_limited(resume_at) | done(stop_reason) | cancelled | failed | exited |
-  closed`. `failed` means
+  closed | resume_pending | resume_failed`. `failed` means
   the last turn errored while the agent process stays live — `send` resumes
   the same ACP session with a new turn. `exited` means the process is gone —
   the husk stays listed until `adopt` reaps it (no `close` needed) or
@@ -190,17 +190,24 @@ text:
   daemon to `session/load`. `adopt` on a registered (or
   externally created) session id whose agent advertised `loadSession` runs
   `session/load` to resume it.
-- **Graceful daemon restart** (`acpsub restart`, or the `daemon/drain`
-  RPC): the daemon stops starting work — `spawn`/`send`/`adopt` are
-  refused with a `restarting` error the client waits out and retries once
+- **Graceful daemon restart** (`acpsub restart`, or `acpsub drain` /
+  the `daemon/drain` RPC): the daemon stops starting work —
+  `spawn`/`send`/`adopt` are refused with a `restarting` error the
+  client waits out and retries once
   against the next daemon — lets in-flight turns and accepted queued
   prompts finish, marks every live session for resume, and exits. The
   next daemon re-adopts every marked session via `session/load` before
   accepting clients: same ids, agent, model, mode, cwd and owner; a
-  failed load is reported in the resume report and stays registered for a
-  later `adopt`. Read-only calls and steers into running turns keep
+  failed load keeps its mark — the *next* restart retries it — is
+  reported in the resume report, and shows as `resume_failed` with the
+  agent's error in `list`/`status` until it resumes or is adopted.
+  Read-only calls and steers into running turns keep
   working through the drain; a `wait` dropped by the exit reconnects and
-  keeps waiting against the same deadline.
+  keeps waiting against the same deadline. Drain and resume live on the
+  daemon only: `serve` is tied to its host's stdio lifetime — there is
+  no successor process it could drain into, and a `serve` that
+  auto-adopted every marked session would spawn subagents its host
+  never asked for.
 - **Transcript**: every `session/update`, prompt, and turn end is appended to
   `<transcript_dir>/<session_id>.jsonl` as a verbatim JSON record. A turn's
   `reply` is that turn's concatenated `agent_message_chunk` text.
@@ -259,6 +266,9 @@ acpsub list
 acpsub close   <session_id>
 acpsub forget  <session_id>
 acpsub agents-live                              # the daemon's `agents` tool
+acpsub drain                                    # begin the restart drain;
+                                                #   returns once new work is
+                                                #   refused
 acpsub restart                                  # drain, then resume every
                                                 #   live session on the
                                                 #   next daemon; prints the

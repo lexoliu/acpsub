@@ -1399,6 +1399,13 @@ impl StatusTool {
                 view["resume_at"] = json!(parked.resume_at);
                 view["reason"] = json!(parked.reason);
             }
+            // A resume mark is the newer state: `resume_pending` while
+            // marked, `resume_failed` with the error when the load could
+            // not run — the next restart retries it.
+            if let Some((state, error)) = closed_resume_state(&entry) {
+                view["state"] = json!(state);
+                view["error"] = json!(error);
+            }
             return Ok(view);
         }
         Err(Error::UnknownSession(args.session_id))
@@ -1706,6 +1713,21 @@ fn live_view(sub: &Subagent) -> Value {
     view
 }
 
+/// A registered session's resume-mark state, when it carries one:
+/// `resume_pending` while marked for the next daemon's `session/load`,
+/// `resume_failed` with the attempt's error when the load could not run
+/// — the mark stays, so the next restart retries it.
+fn closed_resume_state(entry: &RegistryEntry) -> Option<(&'static str, Option<String>)> {
+    entry.resume.as_ref().map(|resume| {
+        resume
+            .failed
+            .as_ref()
+            .map_or(("resume_pending", None), |error| {
+                ("resume_failed", Some(error.clone()))
+            })
+    })
+}
+
 /// `list` view of a registered but closed session — a parked one reports
 /// `rate_limited` with its reset time; the schedule survives the process.
 fn closed_view(session_id: &str, entry: &RegistryEntry) -> Value {
@@ -1721,6 +1743,10 @@ fn closed_view(session_id: &str, entry: &RegistryEntry) -> Value {
         view["state"] = json!("rate_limited");
         view["resume_at"] = json!(parked.resume_at);
         view["reason"] = json!(parked.reason);
+    }
+    if let Some((state, error)) = closed_resume_state(entry) {
+        view["state"] = json!(state);
+        view["error"] = json!(error);
     }
     view
 }
