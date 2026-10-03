@@ -105,8 +105,16 @@ pub fn build_tools_with_progress_interval(
 
 /// The `spawn`/`adopt` tool's state summary.
 fn spawned_view(sub: &Subagent) -> Value {
-    let state = sub.rt.inner.lock().expect("inner poisoned").status.name();
-    json!({
+    let inner = sub.rt.inner.lock().expect("inner poisoned");
+    let (state, parked) = match &inner.status {
+        Status::RateLimited { resume_at, reason } => (
+            inner.status.name(),
+            Some((resume_at.to_string(), reason.clone())),
+        ),
+        _ => (inner.status.name(), None),
+    };
+    drop(inner);
+    let mut view = json!({
         "session_id": sub.session_id,
         "agent": sub.agent,
         "state": state,
@@ -114,7 +122,12 @@ fn spawned_view(sub: &Subagent) -> Value {
         "mode": sub.mode,
         "cwd": sub.cwd,
         "transcript": sub.transcript_path,
-    })
+    });
+    if let Some((resume_at, reason)) = parked {
+        view["resume_at"] = json!(resume_at);
+        view["reason"] = json!(reason);
+    }
+    view
 }
 
 /// The turn `wait`/`wait_any` binds to at call time: the number of the
@@ -152,6 +165,20 @@ enum Awaited {
     /// Still in flight: its elapsed seconds, measured from its own
     /// recorded start.
     Running(f64),
+    /// The awaited turn ended `rate_limited`: `active` is its own elapsed
+    /// seconds before the park — the only part that counts against
+    /// `expect_secs` — and `next` is the turn the resume's continuation
+    /// takes, which the wait rebinds to.
+    Parked {
+        /// The awaited turn's elapsed seconds before it parked.
+        active: f64,
+        /// The turn number the resume's continuation takes.
+        next: u64,
+    },
+    /// The awaited turn has not materialized and the session is parked
+    /// rate-limited: the wait freezes — it must not end, and the pause
+    /// does not count against `expect_secs`.
+    Paused,
     /// No longer the in-flight turn — settled into `turns`, superseded by
     /// a chained or materialized turn, parked on a permission request
     /// (the wait returns to report it), or gone with the session.
@@ -188,6 +215,24 @@ fn awaited_elapsed(sub: &Subagent, n: u64) -> Result<Awaited> {
             jiff::Timestamp::now().duration_since(started).as_secs_f64(),
         ));
     }
+    // The awaited turn settled: `rate_limited` means the wait follows
+    // the resume's turn — the park itself does not count against
+    // `expect_secs`. A settled turn that already chained into `current`
+    // was caught by the arm above.
+    if let Some(turn) = inner.turns.iter().find(|turn| turn.n == n)
+        && turn.rate_limited
+    {
+        let active = turn
+            .started_at
+            .zip(turn.ended_at)
+            .map_or(0.0, |(started, ended)| {
+                ended.duration_since(started).as_secs_f64()
+            });
+        return Ok(Awaited::Parked {
+            active,
+            next: next_turn_number(&inner),
+        });
+    }
     // The gap the awaited turn was predicted in: the slot is still
     // reserved (`Running`, no `current` yet) until `begin_turn` runs.
     if matches!(inner.status, Status::Running)
@@ -200,6 +245,10 @@ fn awaited_elapsed(sub: &Subagent, n: u64) -> Result<Awaited> {
         return Ok(Awaited::Running(
             jiff::Timestamp::now().duration_since(started).as_secs_f64(),
         ));
+    }
+    // The awaited turn is a resume the session is still parked for.
+    if matches!(inner.status, Status::RateLimited { .. }) {
+        return Ok(Awaited::Paused);
     }
     drop(inner);
     Ok(Awaited::Ended)
@@ -402,19 +451,35 @@ fn pending_view(perm: &crate::state::PendingPermission) -> Value {
     })
 }
 
+/// The `send`/`spawn`/`adopt` result for a prompt parked by a rate limit:
+/// where it parks and for how long — the continuation the scheduler sends
+/// at `resume_at` runs ahead of the queued prompts.
+fn parked_view(session_id: &str, parked: &crate::ratelimit::Parked) -> Value {
+    json!({
+        "session_id": session_id,
+        "state": "rate_limited",
+        "resume_at": parked.resume_at.to_string(),
+        "reason": parked.reason,
+        "position": parked.position,
+    })
+}
+
 /// A `wait`-style result for one subagent. `overrun` marks that the turn
 /// outlived `expect_secs`: the result reports `overrun`, the turn's own
 /// elapsed time, and its latest tool call. `awaited` is the turn the call
 /// bound to (see [`awaited_turn`]); `None` reports the latest turn, the
 /// shape a wait on a non-running subagent has always had. `window_start`
 /// is when the wait call began — the base of the activity digest an
-/// `Overrun`/`MaxWait` outcome carries.
+/// `Overrun`/`MaxWait` outcome carries; `parked_secs` is the active
+/// seconds an earlier bound turn banked before a rate-limit park, folded
+/// into the reported `elapsed_secs` on an overrun.
 fn wait_view(
     sub: &Subagent,
     started: Instant,
     outcome: WaitOutcome,
     awaited: Option<u64>,
     window_start: jiff::Timestamp,
+    parked_secs: f64,
 ) -> Value {
     let (status, reply, tool_calls, pending, turn_n, queued, elapsed, latest, ended_reason, digest) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
@@ -448,8 +513,9 @@ fn wait_view(
             pending,
             turn.map(|turn| turn.n).or(awaited),
             inner.queue.len(),
-            turn.and_then(|turn| turn.started_at)
-                .map(|started| jiff::Timestamp::now().duration_since(started).as_secs_f64()),
+            turn.and_then(|turn| turn.started_at).map(|started| {
+                parked_secs + jiff::Timestamp::now().duration_since(started).as_secs_f64()
+            }),
             turn.and_then(|turn| {
                 turn.latest_tool_call
                     .as_ref()
@@ -502,6 +568,13 @@ fn wait_view(
             }
             _ => {}
         }
+    }
+    // A parked session reports where the wait stands regardless of how
+    // the wait ended: `rate_limited`, the reset time, and the provider's
+    // own reason.
+    if let Status::RateLimited { resume_at, reason } = &status {
+        view["resume_at"] = json!(resume_at.to_string());
+        view["reason"] = json!(reason);
     }
     if let Some(pending) = pending {
         view["pending_permission"] = pending;
@@ -775,6 +848,11 @@ impl Tool for SendTool {
 
     async fn call(&self, args: SendArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let sub = self.0.get(&args.session_id)?;
+        // A quota gate for this agent's scope parks the prompt instead of
+        // letting it burn a request that is bound to fail.
+        if let Some(parked) = crate::ratelimit::park_prompt(&self.0, &sub, &args.prompt).await {
+            return Ok(parked_view(&args.session_id, &parked));
+        }
         match args.policy {
             SendPolicy::Try => {
                 start_turn(self.0.clone(), &sub, args.prompt).await?;
@@ -822,62 +900,75 @@ impl Tool for SendTool {
                     }
                 }
             }
-            SendPolicy::Steer => {
-                let wire = sub.rt.prompt_send.lock().await;
-                let status = {
-                    let inner = sub.rt.inner.lock().expect("inner poisoned");
-                    inner.status.clone()
-                };
-                match status {
-                    Status::Idle | Status::Done(_) | Status::Cancelled | Status::Failed(_) => {
-                        let (turn_n, fut) =
-                            begin_turn(&self.0, &sub, args.prompt, Gate::Check, false).await?;
-                        spawn_turn_task(self.0.clone(), &sub, fut, turn_n);
-                    }
-                    Status::Running | Status::NeedsPermission => {
-                        let (steer_id, turn_n, mut fut) = steer_turn(&sub, args.prompt).await?;
-                        drop(wire);
-                        // An accepted steer resolves only at turn end; a
-                        // rejection lands almost at once. Give the agent a
-                        // beat to reject before reporting `steered`.
-                        if let Ok(outcome) = tokio::time::timeout(STEER_ACK, &mut fut).await {
-                            if let Err(source) =
-                                steer_resolved(self.0.clone(), &sub, steer_id, turn_n, outcome)
-                                    .await
-                            {
-                                return Err(Error::Agent {
-                                    agent: sub.agent.clone(),
-                                    source,
-                                }
-                                .into());
-                            }
-                        } else {
-                            tokio::spawn(steer_waiter(
-                                self.0.clone(),
-                                sub.clone(),
-                                steer_id,
-                                turn_n,
-                                fut,
-                            ));
-                        }
-                        return Ok(json!({
-                            "session_id": args.session_id,
-                            "state": "steered",
-                            "turn": turn_n,
-                        }));
-                    }
-                    Status::Exited(_) => {
-                        drop(wire);
-                        return Err(Error::NotPromptable {
-                            session_id: args.session_id.clone(),
-                            status: status.name().to_string(),
-                        }
-                        .into());
-                    }
-                }
-            }
+            SendPolicy::Steer => return steer_send(&self.0, &sub, &args).await,
         }
         Ok(json!({"session_id": args.session_id, "state": "running"}))
+    }
+}
+
+/// `send` with `policy: "steer"`: inject the prompt into the running
+/// turn as a steering message — a second `session/prompt` while it is in
+/// flight. On a promptable session it just runs as the next turn; a
+/// parked or dead one is [`Error::NotPromptable`] (`park_prompt` in the
+/// caller has already parked prompts while a limit holds, so the
+/// `rate_limited` arm is unreachable but kept for completeness).
+async fn steer_send(
+    state: &Arc<AppState>,
+    sub: &Arc<Subagent>,
+    args: &SendArgs,
+) -> aither_core::Result<Value> {
+    let wire = sub.rt.prompt_send.lock().await;
+    let status = {
+        let inner = sub.rt.inner.lock().expect("inner poisoned");
+        inner.status.clone()
+    };
+    match status {
+        Status::Idle | Status::Done(_) | Status::Cancelled | Status::Failed(_) => {
+            let (turn_n, fut) =
+                begin_turn(state, sub, args.prompt.clone(), Gate::Check, false).await?;
+            spawn_turn_task(state.clone(), sub, fut, turn_n);
+            drop(wire);
+            Ok(json!({"session_id": args.session_id, "state": "running"}))
+        }
+        Status::Running | Status::NeedsPermission => {
+            let (steer_id, turn_n, mut fut) = steer_turn(sub, args.prompt.clone()).await?;
+            drop(wire);
+            // An accepted steer resolves only at turn end; a rejection
+            // lands almost at once. Give the agent a beat to reject
+            // before reporting `steered`.
+            if let Ok(outcome) = tokio::time::timeout(STEER_ACK, &mut fut).await {
+                if let Err(source) =
+                    steer_resolved(state.clone(), sub, steer_id, turn_n, outcome).await
+                {
+                    return Err(Error::Agent {
+                        agent: sub.agent.clone(),
+                        source,
+                    }
+                    .into());
+                }
+            } else {
+                tokio::spawn(steer_waiter(
+                    state.clone(),
+                    sub.clone(),
+                    steer_id,
+                    turn_n,
+                    fut,
+                ));
+            }
+            Ok(json!({
+                "session_id": args.session_id,
+                "state": "steered",
+                "turn": turn_n,
+            }))
+        }
+        Status::RateLimited { .. } | Status::Exited(_) => {
+            drop(wire);
+            Err(Error::NotPromptable {
+                session_id: args.session_id.clone(),
+                status: status.name().to_string(),
+            }
+            .into())
+        }
     }
 }
 
@@ -938,13 +1029,14 @@ impl Tool for WaitTool {
         let sub = self.state.get(&args.session_id)?;
         let started = Instant::now();
         let window_start = jiff::Timestamp::now();
-        let Some(awaited) = awaited_turn(&sub)? else {
+        let Some(mut awaited) = awaited_turn(&sub)? else {
             return Ok(wait_view(
                 &sub,
                 started,
                 WaitOutcome::Ended,
                 None,
                 window_start,
+                0.0,
             ));
         };
         // The wait's own deadline: `Instant` can represent anything the
@@ -956,11 +1048,21 @@ impl Tool for WaitTool {
         let expect = args.expect_secs as f64;
         let interval = self.interval;
         let mut next_report = started;
+        // Seconds the awaited turn ran before it parked rate-limited —
+        // they count once against `expect_secs`; the pause never does.
+        let mut parked_secs = 0.0;
         let outcome = loop {
             match awaited_elapsed(&sub, awaited)? {
                 Awaited::Ended => break WaitOutcome::Ended,
-                Awaited::Running(elapsed) if elapsed >= expect => break WaitOutcome::Overrun,
+                Awaited::Parked { active, next } => {
+                    parked_secs += active;
+                    awaited = next;
+                }
                 Awaited::Running(elapsed) => {
+                    let elapsed = parked_secs + elapsed;
+                    if elapsed >= expect {
+                        break WaitOutcome::Overrun;
+                    }
                     let now = Instant::now();
                     if deadline.is_some_and(|deadline| now >= deadline) {
                         break WaitOutcome::MaxWait;
@@ -981,6 +1083,23 @@ impl Tool for WaitTool {
                         () = tokio::time::sleep(Duration::from_secs_f64(wake)) => {},
                     }
                 }
+                // The session is parked rate-limited and the awaited turn
+                // is the resume's continuation: freeze — bound by the
+                // wait's own deadline alone. No turn progress happens
+                // while parked, so there is nothing new to report.
+                Awaited::Paused => {
+                    let now = Instant::now();
+                    if deadline.is_some_and(|deadline| now >= deadline) {
+                        break WaitOutcome::MaxWait;
+                    }
+                    let wake = 0.25_f64.min(deadline.map_or(f64::MAX, |deadline| {
+                        deadline.saturating_duration_since(now).as_secs_f64()
+                    }));
+                    tokio::select! {
+                        () = sub.rt.notify.notified() => {},
+                        () = tokio::time::sleep(Duration::from_secs_f64(wake)) => {},
+                    }
+                }
             }
         };
         Ok(wait_view(
@@ -989,6 +1108,7 @@ impl Tool for WaitTool {
             outcome,
             Some(awaited),
             window_start,
+            parked_secs,
         ))
     }
 }
@@ -1039,7 +1159,7 @@ impl Tool for WaitAnyTool {
         let window_start = jiff::Timestamp::now();
         // Each watched session binds to the turn in flight at call time,
         // the same rule `wait` applies to one.
-        let awaited = subs
+        let mut awaited = subs
             .iter()
             .map(|sub| awaited_turn(sub))
             .collect::<Result<Vec<_>>>()?;
@@ -1050,67 +1170,82 @@ impl Tool for WaitAnyTool {
         let expect = args.expect_secs as f64;
         let interval = self.interval;
         let mut next_report = started;
+        // Per-session active seconds before a rate-limit park — the same
+        // rebind `wait` applies to one turn.
+        let mut parked_secs = vec![0.0; subs.len()];
         loop {
             let mut poll = WAIT_ANY_POLL;
-            // Report the longest-running watched turn: it is the one a
-            // host-side idle timer would be most anxious about.
-            let mut longest: Option<(f64, &Arc<Subagent>, u64)> = None;
-            for (sub, awaited) in subs.iter().zip(&awaited) {
-                let Some(n) = awaited else {
+            // Report the longest-running watched turn — by index, so a
+            // rebind on park can update `awaited` in place.
+            let mut longest: Option<(f64, usize)> = None;
+            for index in 0..subs.len() {
+                let sub = &subs[index];
+                let Some(n) = awaited[index] else {
                     return Ok(wait_view(
                         sub,
                         started,
                         WaitOutcome::Ended,
                         None,
                         window_start,
+                        0.0,
                     ));
                 };
-                match awaited_elapsed(sub, *n)? {
+                match awaited_elapsed(sub, n)? {
                     Awaited::Ended => {
                         return Ok(wait_view(
                             sub,
                             started,
                             WaitOutcome::Ended,
-                            Some(*n),
+                            Some(n),
                             window_start,
+                            parked_secs[index],
                         ));
                     }
-                    Awaited::Running(elapsed) if elapsed >= expect => {
-                        return Ok(wait_view(
-                            sub,
-                            started,
-                            WaitOutcome::Overrun,
-                            Some(*n),
-                            window_start,
-                        ));
+                    Awaited::Parked { active, next } => {
+                        // The awaited turn ended rate-limited: its
+                        // pre-park time counts once, and the wait follows
+                        // the resume's turn.
+                        parked_secs[index] += active;
+                        awaited[index] = Some(next);
                     }
+                    // Parked rate-limited: nothing running to compare.
+                    Awaited::Paused => {}
                     Awaited::Running(elapsed) => {
+                        let elapsed = parked_secs[index] + elapsed;
+                        if elapsed >= expect {
+                            return Ok(wait_view(
+                                sub,
+                                started,
+                                WaitOutcome::Overrun,
+                                Some(n),
+                                window_start,
+                                parked_secs[index],
+                            ));
+                        }
                         poll = poll.min(Duration::from_secs_f64(expect - elapsed));
-                        if longest.is_none_or(|(max, _, _)| elapsed > max) {
-                            longest = Some((elapsed, sub, *n));
+                        if longest.is_none_or(|(max, _)| elapsed > max) {
+                            longest = Some((elapsed, index));
                         }
                     }
                 }
             }
             let now = Instant::now();
-            if deadline.is_some_and(|deadline| now >= deadline) {
-                // The bound passed with every watched turn still running:
-                // report the longest-running one's state and digest — the
-                // same turn progress has been naming.
-                let (_, sub, n) =
-                    longest.expect("the deadline check only runs while a watched turn runs");
+            if deadline.is_some_and(|deadline| now >= deadline)
+                && let Some(index) = max_wait_index(longest, &awaited)
+            {
                 return Ok(wait_view(
-                    sub,
+                    &subs[index],
                     started,
                     WaitOutcome::MaxWait,
-                    Some(n),
+                    awaited[index],
                     window_start,
+                    parked_secs[index],
                 ));
             }
             if now >= next_report
-                && let Some((elapsed, sub, _)) = longest
+                && let Some((elapsed, index)) = longest
             {
-                cx.report_progress(wait_progress(sub, elapsed, args.expect_secs))
+                cx.report_progress(wait_progress(&subs[index], elapsed, args.expect_secs))
                     .await?;
                 next_report = now + interval;
             }
@@ -1122,6 +1257,15 @@ impl Tool for WaitAnyTool {
             .await;
         }
     }
+}
+
+/// Which watched session a `max_wait_secs` expiry reports: the
+/// longest-running turn, else the first still-bound one — a parked
+/// session reports its `rate_limited` state either way.
+fn max_wait_index(longest: Option<(f64, usize)>, awaited: &[Option<u64>]) -> Option<usize> {
+    longest
+        .map(|(_, index)| index)
+        .or_else(|| awaited.iter().position(Option::is_some))
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,6 +1343,10 @@ impl StatusTool {
             if let Status::Failed(reason) | Status::Exited(reason) = &status {
                 view["error"] = json!(reason);
             }
+            if let Status::RateLimited { resume_at, reason } = &status {
+                view["resume_at"] = json!(resume_at.to_string());
+                view["reason"] = json!(reason);
+            }
             return Ok(view);
         }
         let entry = self
@@ -1209,7 +1357,7 @@ impl StatusTool {
             .get(&args.session_id)
             .cloned();
         if let Some(entry) = entry {
-            return Ok(json!({
+            let mut view = json!({
                 "session_id": args.session_id,
                 "agent": entry.agent,
                 "live": false,
@@ -1218,7 +1366,15 @@ impl StatusTool {
                 "turns": entry.turns,
                 "created": entry.created,
                 "last_turn": entry.last_turn,
-            }));
+            });
+            // A parked session's schedule outlives its process: report
+            // `rate_limited` over `closed` so the resume reads clearly.
+            if let Some(parked) = &entry.rate_limited {
+                view["state"] = json!("rate_limited");
+                view["resume_at"] = json!(parked.resume_at);
+                view["reason"] = json!(parked.reason);
+            }
+            return Ok(view);
         }
         Err(Error::UnknownSession(args.session_id))
     }
@@ -1497,33 +1653,51 @@ struct ListTool(Arc<AppState>);
 
 /// `list` view of a live subagent.
 fn live_view(sub: &Subagent) -> Value {
-    let (state, turns) = {
+    let (state, turns, parked) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
         (
             inner.status.name(),
             inner.turn_offset + inner.turns.len() as u64,
+            match &inner.status {
+                Status::RateLimited { resume_at, reason } => {
+                    Some((resume_at.to_string(), reason.clone()))
+                }
+                _ => None,
+            },
         )
     };
-    json!({
+    let mut view = json!({
         "session_id": sub.session_id,
         "agent": sub.agent,
         "live": true,
         "state": state,
         "cwd": sub.cwd,
         "turns": turns,
-    })
+    });
+    if let Some((resume_at, reason)) = parked {
+        view["resume_at"] = json!(resume_at);
+        view["reason"] = json!(reason);
+    }
+    view
 }
 
-/// `list` view of a registered but closed session.
+/// `list` view of a registered but closed session — a parked one reports
+/// `rate_limited` with its reset time; the schedule survives the process.
 fn closed_view(session_id: &str, entry: &RegistryEntry) -> Value {
-    json!({
+    let mut view = json!({
         "session_id": session_id,
         "agent": entry.agent,
         "live": false,
         "state": "closed",
         "cwd": entry.cwd,
         "turns": entry.turns,
-    })
+    });
+    if let Some(parked) = &entry.rate_limited {
+        view["state"] = json!("rate_limited");
+        view["resume_at"] = json!(parked.resume_at);
+        view["reason"] = json!(parked.reason);
+    }
+    view
 }
 
 impl Tool for ListTool {

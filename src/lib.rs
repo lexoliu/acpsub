@@ -19,6 +19,7 @@ pub mod config;
 pub mod daemon;
 pub mod error;
 pub mod handler;
+pub mod ratelimit;
 pub mod registry;
 pub mod state;
 pub mod terminal;
