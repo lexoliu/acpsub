@@ -164,10 +164,10 @@ client spawns `acpsub daemon` itself, in its own process group with a pid
 file at `<socket>.pid`:
 
 ```sh
-acpsub spawn   --cwd DIR --model M --mode M [--agent K] [--set K=V]...
+acpsub spawn   --cwd DIR [--model M] [--mode M] [--agent K] [--set K=V]...
               [--permission allow|deny|ask] [--owner PID]
               --prompt TEXT | --prompt-file FILE   # FILE of `-` reads stdin
-acpsub adopt   <session_id> --model M --mode M [--agent K] [--cwd DIR]
+acpsub adopt   <session_id> [--model M] [--mode M] [--agent K] [--cwd DIR]
               [--prompt TEXT | --prompt-file FILE] [--permission P] [--owner PID]
 acpsub send    <session_id> --policy try|queued|steer
               --prompt TEXT | --prompt-file FILE

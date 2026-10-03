@@ -153,12 +153,14 @@ enum Command {
         /// Session working directory.
         #[arg(long)]
         cwd: PathBuf,
-        /// Model to run (e.g. swe-2-max).
+        /// Model to run (e.g. swe-2-high). Required when the agent advertises
+        /// a `model` option; omit it for an agent that advertises none.
         #[arg(long)]
-        model: String,
-        /// Session mode to activate (e.g. bypass).
+        model: Option<String>,
+        /// Session mode to activate (e.g. bypass). Required when the agent
+        /// advertises session modes; omit it for an agent that advertises none.
         #[arg(long)]
-        mode: String,
+        mode: Option<String>,
         /// Configured agent key; falls back to the default.
         #[arg(long)]
         agent: Option<String>,
@@ -181,12 +183,13 @@ enum Command {
     Adopt {
         /// Session id to take over.
         session_id: String,
-        /// Model to run.
+        /// Model to run; omit it for an agent that advertises no `model` option.
         #[arg(long)]
-        model: String,
-        /// Session mode to activate.
+        model: Option<String>,
+        /// Session mode to activate; omit it for an agent that advertises no
+        /// session modes.
         #[arg(long)]
-        mode: String,
+        mode: Option<String>,
         /// Configured agent key.
         #[arg(long)]
         agent: Option<String>,
@@ -397,8 +400,8 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
             "spawn",
             spawn_args(
                 &cwd,
-                &model,
-                &mode,
+                model.as_deref(),
+                mode.as_deref(),
                 agent.as_deref(),
                 &config_options,
                 permission,
@@ -421,8 +424,8 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
             "adopt",
             adopt_args(
                 &session_id,
-                &model,
-                &mode,
+                model.as_deref(),
+                mode.as_deref(),
                 agent.as_deref(),
                 cwd.as_deref(),
                 permission,
@@ -504,8 +507,8 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
 #[expect(clippy::too_many_arguments, reason = "mirrors the clap surface")]
 fn spawn_args(
     cwd: &Path,
-    model: &str,
-    mode: &str,
+    model: Option<&str>,
+    mode: Option<&str>,
     agent: Option<&str>,
     config_options: &[String],
     permission: Option<Permission>,
@@ -518,9 +521,9 @@ fn spawn_args(
     let mut args = json!({
         "cwd": cwd,
         "prompt": prompt,
-        "model": model,
-        "mode": mode,
     });
+    set_if(&mut args, "model", model);
+    set_if(&mut args, "mode", mode);
     set_if(&mut args, "agent", agent);
     if !config_options.is_empty() {
         args["config"] = parse_config_options(config_options)?;
@@ -534,8 +537,8 @@ fn spawn_args(
 #[expect(clippy::too_many_arguments, reason = "mirrors the clap surface")]
 fn adopt_args(
     session_id: &str,
-    model: &str,
-    mode: &str,
+    model: Option<&str>,
+    mode: Option<&str>,
     agent: Option<&str>,
     cwd: Option<&Path>,
     permission: Option<Permission>,
@@ -544,9 +547,9 @@ fn adopt_args(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let mut args = json!({
         "session_id": session_id,
-        "model": model,
-        "mode": mode,
     });
+    set_if(&mut args, "model", model);
+    set_if(&mut args, "mode", mode);
     set_if(&mut args, "agent", agent);
     set_if(&mut args, "cwd", cwd);
     set_if(&mut args, "prompt", prompt.text()?);
