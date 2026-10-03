@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/lexoliu/acpsub/compare/v0.2.0...v0.3.0) - 2026-10-03
+
+### Added
+
+- *(daemon)* graceful restart — drain in-flight turns and resume every live session
+- park rate-limited turns and resume them when the limit lifts
+- *(tools)* --max-wait deadline with an activity digest on wait
+- add daemon + CLI client alongside the stdio MCP server
+- report MCP progress while wait/wait_any block ([#46](https://github.com/lexoliu/acpsub/pull/46))
+- [**breaking**] wait/wait_any take a required expect_secs and report overrun ([#44](https://github.com/lexoliu/acpsub/pull/44))
+- [**breaking**] make model and mode required spawn/adopt arguments
+- *(tools)* [**breaking**] require an explicit send policy (try|queued|steer) ([#35](https://github.com/lexoliu/acpsub/pull/35))
+
+### Fixed
+
+- *(restart)* surface failed resumes and sequence tests on real signals
+- *(restart)* race-free drain signaling, EOF restart waits, structured refusal
+- *(cli)* make --model and --mode optional on spawn and adopt
+- validate spawn/adopt mode, model, and config against agent advertisements ([#43](https://github.com/lexoliu/acpsub/pull/43))
+
+### Other
+
+- terminate files with a newline
+- *(tools)* type the activity digest and require tool-call start times
+- Merge remote-tracking branch 'origin/dev' into fix/cli-optional-model-mode
+- *(tools)* wait on the turn-end signal in the steer-turn test
+
 ### Added
 
 - *(cli)* `acpsub daemon` serves the tool set over a Unix socket
