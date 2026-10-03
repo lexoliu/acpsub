@@ -229,6 +229,14 @@ enum Command {
         /// `state: "overrun"` for investigation.
         #[arg(long)]
         expect: u64,
+        /// The wait's own deadline in seconds. When it passes with the
+        /// turn still running, wait returns `state: "running"` with an
+        /// activity `digest` of the window (shape documented in the
+        /// README's `wait` entry) instead of dying silent under a
+        /// background-task kill limit — set it just below that limit.
+        /// Overrun results carry the same digest.
+        #[arg(long)]
+        max_wait: Option<u64>,
         #[command(flatten)]
         conn: DaemonConn,
     },
@@ -239,6 +247,11 @@ enum Command {
         /// Expected turn duration in seconds.
         #[arg(long)]
         expect: u64,
+        /// The wait's own deadline in seconds, as in `wait`: on expiry the
+        /// result is the longest-running watched turn's `state: "running"`
+        /// with its activity `digest`.
+        #[arg(long)]
+        max_wait: Option<u64>,
         #[command(flatten)]
         conn: DaemonConn,
     },
@@ -456,21 +469,23 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
         Command::Wait {
             session_id,
             expect,
+            max_wait,
             conn,
-        } => (
-            conn,
-            "wait",
-            json!({"session_id": session_id, "expect_secs": expect}),
-        ),
+        } => {
+            let mut args = json!({"session_id": session_id, "expect_secs": expect});
+            set_if(&mut args, "max_wait_secs", max_wait);
+            (conn, "wait", args)
+        }
         Command::WaitAny {
             session_ids,
             expect,
+            max_wait,
             conn,
-        } => (
-            conn,
-            "wait_any",
-            json!({"session_ids": session_ids, "expect_secs": expect}),
-        ),
+        } => {
+            let mut args = json!({"session_ids": session_ids, "expect_secs": expect});
+            set_if(&mut args, "max_wait_secs", max_wait);
+            (conn, "wait_any", args)
+        }
         Command::Status { session_id, conn } => (conn, "status", json!({"session_id": session_id})),
         Command::Result {
             session_id,

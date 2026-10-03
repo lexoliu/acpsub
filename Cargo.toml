@@ -28,7 +28,7 @@ futures-lite = "2"
 async-process = "2"
 async-net = "2"
 libc = "0.2"
-jiff = "0.2"
+jiff = { version = "0.2", features = ["serde"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # aither's ToolContext (per-call progress reporting) is not released yet:

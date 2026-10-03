@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `steer` (inject into the running turn) ([#34](https://github.com/lexoliu/acpsub/issues/34))
 - *(tools)* `wait` and `status` report the current turn number and the
   queued prompt list ([#34](https://github.com/lexoliu/acpsub/issues/34))
+- *(tools)* `wait`/`wait_any` take `max_wait_secs` (`--max-wait`), the
+  wait call's own deadline: when it passes before the awaited turn ends
+  or overruns, a `running` result carries an activity `digest` of the
+  window (call count, wall-time share, five longest calls, repeated
+  titles, time since the last edit-kind call, latest call); `overrun`
+  results carry the same digest. Every value is measured from tool calls'
+  recorded `started_at`/`ended_at`, now reported in the `tool_calls`
+  summaries ([#55](https://github.com/lexoliu/acpsub/issues/55))
 
 ## [0.2.0](https://github.com/lexoliu/acpsub/compare/v0.1.0...v0.2.0) - 2026-09-16
 
