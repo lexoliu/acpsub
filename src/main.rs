@@ -312,6 +312,24 @@ enum Command {
         #[command(flatten)]
         conn: DaemonConn,
     },
+    /// Begin a graceful daemon restart drain: new turns are refused with
+    /// `restarting`, in-flight work finishes, then every live session is
+    /// marked for resume and the daemon exits. Returns once the drain
+    /// began — unlike `restart` it does not wait for the exit, and the
+    /// next client call auto-starts the replacement.
+    Drain {
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Restart the daemon: it drains in-flight turns, closes every live
+    /// session marked for resume, and exits; the next daemon — started by
+    /// this call when none answers — re-adopts them under the same ids.
+    /// Returns once the new daemon finished resuming and prints the
+    /// resume report.
+    Restart {
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
     /// Call the daemon's `agents` tool: configured agents plus the live
     /// sessions' reported agent info, modes, and config options.
     AgentsLive {
@@ -397,6 +415,9 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     reason = "one arm per subcommand; every arm is a thin flag-to-JSON mapping"
 )]
 async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if let Command::Restart { conn } = command {
+        return restart(conn).await;
+    }
     let (conn, tool, arguments) = match command {
         Command::Spawn {
             cwd,
@@ -511,6 +532,7 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
         Command::Close { session_id, conn } => (conn, "close", json!({"session_id": session_id})),
         Command::Forget { session_id, conn } => (conn, "forget", json!({"session_id": session_id})),
         Command::AgentsLive { conn } => (conn, "agents", json!({})),
+        Command::Drain { conn } => (conn, "daemon/drain", json!({})),
         _ => unreachable!("non-client commands are handled before `call`"),
     };
     let socket = conn.socket_path()?;
@@ -599,6 +621,27 @@ fn parse_config_options(pairs: &[String]) -> acpsub::Result<Value> {
         options.insert(key.to_string(), value);
     }
     Ok(Value::Object(options))
+}
+
+/// `acpsub restart`: ask the daemon to drain, wait for its exit — the
+/// socket refusing connections is the signal the drain completed — then
+/// let the auto-started replacement resume every marked session. The
+/// `daemon/resumed` answer only exists once resuming finished, so it is
+/// the report this prints.
+async fn restart(conn: DaemonConn) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let socket = conn.socket_path()?;
+    if async_net::unix::UnixStream::connect(&socket).await.is_err() {
+        return Err(format!("no acpsub daemon at {}", socket.display()).into());
+    }
+    let ack =
+        acpsub::client::call(&socket, "daemon/drain", json!({}), conn.config.as_deref()).await?;
+    if ack.is_error {
+        return Ok(print_result(ack));
+    }
+    acpsub::client::wait_for_next_daemon(&socket).await?;
+    let report =
+        acpsub::client::call(&socket, "daemon/resumed", json!({}), conn.config.as_deref()).await?;
+    Ok(print_result(report))
 }
 
 /// The owning coordinator pid from the environment.

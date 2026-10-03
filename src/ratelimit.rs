@@ -443,8 +443,12 @@ fn parked_next(state: &AppState) -> Option<jiff::Timestamp> {
 /// while the process lives, `session/load` on a fresh process when it is
 /// gone. The parked flag is consumed on the attempt — a session that
 /// cannot resume reports `failed`, a dead one stays registered for a
-/// manual `adopt`.
+/// manual `adopt`. A draining daemon leaves parked sessions alone: they
+/// hand off to the next daemon, whose scheduler owns the resume.
 async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
+    if state.draining() {
+        return;
+    }
     if let Ok(sub) = state.get(session_id) {
         let parked = {
             let mut inner = sub.rt.inner.lock().expect("inner poisoned");

@@ -2468,3 +2468,37 @@ async fn rate_limit_resume_keeps_owner() {
     assert_eq!(owner, 424_242);
     status_becomes(&state, sid.as_str(), "done").await;
 }
+
+/// A draining daemon refuses new work: `spawn`, `send` and `adopt` get
+/// the `restarting` error the client retries on, read-only calls keep
+/// working, and a second drain is refused outright.
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_refuses_new_work() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut tools) = test_state(dir.path());
+    acpsub::tools::register_daemon_tools(&mut tools, state.clone()).expect("daemon tools");
+
+    let draining = call_json(&tools, "daemon/drain", json!({})).await;
+    assert_eq!(draining["draining"], true, "{draining}");
+
+    for (tool, args) in [
+        ("spawn", spawn_args(dir.path(), "hi")),
+        (
+            "send",
+            json!({"session_id": "s", "prompt": "hi", "policy": "try"}),
+        ),
+        ("adopt", json!({"session_id": "s"})),
+    ] {
+        let err = call_err(&tools, tool, args).await;
+        assert!(err.contains("restarting"), "{tool}: {err}");
+    }
+
+    call_json(&tools, "list", json!({})).await;
+
+    let again = call_err(&tools, "daemon/drain", json!({})).await;
+    assert!(again.contains("already in progress"), "{again}");
+}

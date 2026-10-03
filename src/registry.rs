@@ -53,6 +53,25 @@ pub struct RegistryEntry {
     /// schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limited: Option<RateLimited>,
+    /// Marked by a draining daemon: the next daemon re-adopts the session
+    /// with `session/load` before accepting clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Resume>,
+}
+
+/// The resume mark a draining daemon leaves on a live session's registry
+/// entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Resume {
+    /// `send`-queued prompts the drain could not run — accepted sends
+    /// still run, so they ride the restart into the next daemon, which
+    /// replays them into the session's queue after `session/load`.
+    pub queued: Vec<String>,
+    /// The last resume attempt's error, when the load failed: kept so
+    /// `list`/`status` surface why the session did not come back and the
+    /// next restart knows to retry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
 }
 
 /// A session parked by its provider's rate limit.
@@ -203,6 +222,7 @@ mod tests {
                 mode: None,
                 owner: None,
                 rate_limited: None,
+                resume: None,
             },
         );
         let snapshot = registry.snapshot().expect("snapshot");
@@ -253,6 +273,7 @@ mod tests {
                 mode: None,
                 owner: None,
                 rate_limited: None,
+                resume: None,
             },
         );
         persist(&path, registry.snapshot().expect("snapshot"))

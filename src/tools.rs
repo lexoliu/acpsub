@@ -103,6 +103,19 @@ pub fn build_tools_with_progress_interval(
     Ok(tools)
 }
 
+/// The daemon-only tools, registered by the socket server on top of the
+/// shared set: `daemon/drain` and `daemon/resumed` drive the graceful
+/// restart `acpsub restart` performs.
+///
+/// # Errors
+///
+/// Returns an error if a tool fails to register.
+pub fn register_daemon_tools(tools: &mut Tools, state: Arc<AppState>) -> aither_core::Result<()> {
+    tools.register(DrainTool(state.clone()))?;
+    tools.register(ResumedTool(state))?;
+    Ok(())
+}
+
 /// The `spawn`/`adopt` tool's state summary.
 fn spawned_view(sub: &Subagent) -> Value {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
@@ -647,6 +660,9 @@ impl Tool for SpawnTool {
     type Res = Value;
 
     async fn call(&self, args: SpawnArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+        if self.0.draining() {
+            return Err(restarting().into());
+        }
         let config = self.0.load_config()?;
         let (agent, _) = config.resolve_agent(args.agent.as_deref())?;
         let sub = launch(
@@ -720,6 +736,9 @@ impl Tool for AdoptTool {
     type Res = Value;
 
     async fn call(&self, args: AdoptArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+        if self.0.draining() {
+            return Err(restarting().into());
+        }
         let registered = self
             .0
             .registry
@@ -847,6 +866,12 @@ impl Tool for SendTool {
     type Res = Value;
 
     async fn call(&self, args: SendArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+        // A draining daemon refuses sends that would start a new turn;
+        // a steer into a turn that is still running still goes through —
+        // it does not extend the drain.
+        if self.0.draining() && !matches!(args.policy, SendPolicy::Steer) {
+            return Err(restarting().into());
+        }
         let sub = self.0.get(&args.session_id)?;
         // A quota gate for this agent's scope parks the prompt instead of
         // letting it burn a request that is bound to fail.
@@ -1374,6 +1399,13 @@ impl StatusTool {
                 view["resume_at"] = json!(parked.resume_at);
                 view["reason"] = json!(parked.reason);
             }
+            // A resume mark is the newer state: `resume_pending` while
+            // marked, `resume_failed` with the error when the load could
+            // not run — the next restart retries it.
+            if let Some((state, error)) = closed_resume_state(&entry) {
+                view["state"] = json!(state);
+                view["error"] = json!(error);
+            }
             return Ok(view);
         }
         Err(Error::UnknownSession(args.session_id))
@@ -1681,6 +1713,21 @@ fn live_view(sub: &Subagent) -> Value {
     view
 }
 
+/// A registered session's resume-mark state, when it carries one:
+/// `resume_pending` while marked for the next daemon's `session/load`,
+/// `resume_failed` with the attempt's error when the load could not run
+/// — the mark stays, so the next restart retries it.
+fn closed_resume_state(entry: &RegistryEntry) -> Option<(&'static str, Option<String>)> {
+    entry.resume.as_ref().map(|resume| {
+        resume
+            .failed
+            .as_ref()
+            .map_or(("resume_pending", None), |error| {
+                ("resume_failed", Some(error.clone()))
+            })
+    })
+}
+
 /// `list` view of a registered but closed session — a parked one reports
 /// `rate_limited` with its reset time; the schedule survives the process.
 fn closed_view(session_id: &str, entry: &RegistryEntry) -> Value {
@@ -1696,6 +1743,10 @@ fn closed_view(session_id: &str, entry: &RegistryEntry) -> Value {
         view["state"] = json!("rate_limited");
         view["resume_at"] = json!(parked.resume_at);
         view["reason"] = json!(parked.reason);
+    }
+    if let Some((state, error)) = closed_resume_state(entry) {
+        view["state"] = json!(state);
+        view["error"] = json!(error);
     }
     view
 }
@@ -1948,4 +1999,92 @@ fn config_option_view(option: &ConfigOption) -> Value {
         "current_value": current,
         "options": options,
     })
+}
+
+// ---------------------------------------------------------------------------
+// daemon/drain / daemon/resumed
+// ---------------------------------------------------------------------------
+
+/// The `restarting` refusal for work a draining daemon will not start.
+fn restarting() -> Error {
+    Error::Restarting {
+        detail: "the daemon is draining for a restart; new work is refused".to_string(),
+    }
+}
+
+/// Begin a graceful daemon restart: stop accepting new turns and
+/// session-binds — every call that would start one is refused with a
+/// `restarting` error — let in-flight turns and already-accepted queued
+/// prompts finish, then close every live session marked for resume and
+/// exit. The next daemon re-adopts them; `daemon/resumed` reports how the
+/// resume went. Refused while a drain is already in progress.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DrainArgs {}
+
+struct DrainTool(Arc<AppState>);
+
+impl Tool for DrainTool {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("daemon/drain")
+    }
+    type Arguments = DrainArgs;
+    type Res = Value;
+
+    fn call(
+        &self,
+        _args: DrainArgs,
+        _cx: ToolContext,
+    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
+        std::future::ready(self.drain().map_err(Into::into))
+    }
+}
+
+impl DrainTool {
+    /// Synchronous body: the drain runs in its own task, so the call only
+    /// flips the flag and spawns it.
+    fn drain(&self) -> Result<Value> {
+        if self
+            .0
+            .drain
+            .requested
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Error::Restarting {
+                detail: "a drain is already in progress".to_string(),
+            });
+        }
+        tokio::spawn(crate::daemon::drain_sessions(self.0.clone()));
+        Ok(json!({"draining": true}))
+    }
+}
+
+/// Report what this daemon's startup resume pass did: which marked
+/// sessions came back live via `session/load` and which failed, with the
+/// agent's error. Both lists are empty on a daemon that did not start
+/// from a drain.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ResumedArgs {}
+
+struct ResumedTool(Arc<AppState>);
+
+impl Tool for ResumedTool {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("daemon/resumed")
+    }
+    type Arguments = ResumedArgs;
+    type Res = Value;
+
+    fn call(
+        &self,
+        _args: ResumedArgs,
+        _cx: ToolContext,
+    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
+        let report = self
+            .0
+            .resume_report
+            .lock()
+            .expect("resume report poisoned")
+            .clone();
+        std::future::ready(Ok(serde_json::to_value(report).unwrap_or_default()))
+    }
 }
