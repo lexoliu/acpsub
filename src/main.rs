@@ -1,23 +1,123 @@
-//! `acpsub` binary: `serve` (MCP over stdio), `agents`, and `transcript`.
+//! `acpsub` binary: `serve` (MCP over stdio), `daemon` (MCP over a Unix
+//! socket), the client commands (`spawn`, `send`, `wait`, …), `agents`,
+//! and `transcript`.
 
 use std::fmt::Write as _;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use acpsub::config::PermissionPolicy;
 use acpsub::{AppState, Config, RenderOptions, build_tools, default_config_path, render};
-use clap::{Parser, Subcommand};
+use aither_mcp::protocol::{CallToolResult, Content};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde_json::{Value, json};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// Any ACP agent as a resumable subagent over MCP.
+/// Any ACP agent as a resumable subagent: an MCP server, a daemon, or the
+/// CLI that drives the daemon.
 #[derive(Parser)]
 #[command(name = "acpsub", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Connection options every daemon client command accepts.
+#[derive(Args)]
+struct DaemonConn {
+    /// Daemon socket path (default ~/.local/share/acpsub/daemon.sock).
+    /// When no daemon answers, one is started automatically.
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    /// Config file path (default ~/.config/acpsub/config.toml); forwarded
+    /// to the daemon when it has to be started for this call.
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+impl DaemonConn {
+    /// Resolve the socket path.
+    fn socket_path(&self) -> acpsub::Result<PathBuf> {
+        self.socket
+            .clone()
+            .or_else(|| std::env::var_os("ACPSUB_SOCKET").map(PathBuf::from))
+            .or_else(acpsub::daemon::default_socket_path)
+            .ok_or_else(|| acpsub::Error::NoHome("~/.local/share/acpsub/daemon.sock".to_string()))
+    }
+}
+
+/// A prompt given inline or from a file (`--prompt-file -` reads stdin).
+#[derive(Args)]
+struct PromptArg {
+    /// The prompt text.
+    #[arg(long, conflicts_with = "prompt_file")]
+    prompt: Option<String>,
+    /// Read the prompt from this file; `-` reads stdin.
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+}
+
+impl PromptArg {
+    /// Resolve the prompt text.
+    fn text(&self) -> acpsub::Result<Option<String>> {
+        match (&self.prompt, &self.prompt_file) {
+            (Some(text), None) => Ok(Some(text.clone())),
+            (None, Some(path)) => {
+                let text = if path.as_os_str() == "-" {
+                    let mut text = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut text)
+                        .map_err(|source| {
+                            acpsub::Error::io("cannot read prompt from stdin", source)
+                        })?;
+                    text
+                } else {
+                    std::fs::read_to_string(path).map_err(|source| {
+                        acpsub::Error::io(format!("cannot read {}", path.display()), source)
+                    })?
+                };
+                Ok(Some(text))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `send`'s delivery policy while a turn is running.
+#[derive(Clone, Copy, ValueEnum)]
+enum SendPolicy {
+    /// Error unless the subagent is idle/done/cancelled.
+    Try,
+    /// Park the prompt on the subagent's FIFO queue.
+    Queued,
+    /// Inject the prompt into the running turn.
+    Steer,
+}
+
+/// A permission policy flag value.
+#[derive(Clone, Copy, ValueEnum)]
+enum Permission {
+    /// Auto-approve permission requests.
+    Allow,
+    /// Auto-reject permission requests.
+    Deny,
+    /// Queue requests for `permit`.
+    Ask,
+}
+
+impl Permission {
+    /// The tool argument value.
+    const fn policy(self) -> PermissionPolicy {
+        match self {
+            Self::Allow => PermissionPolicy::Allow,
+            Self::Deny => PermissionPolicy::Deny,
+            Self::Ask => PermissionPolicy::Ask,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -31,6 +131,179 @@ enum Command {
         /// Also write logs to this file.
         #[arg(long)]
         log_file: Option<PathBuf>,
+    },
+    /// Serve the subagent tools over a Unix socket as a standalone daemon.
+    /// Holds the live ACP sessions; the client commands below connect to it.
+    /// Stays resident across coordinator restarts; reaps sessions whose
+    /// owning coordinator pid (`--owner` at spawn) has exited.
+    Daemon {
+        /// Socket path (default ~/.local/share/acpsub/daemon.sock).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Config file path (default ~/.config/acpsub/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Log file (default <socket dir>/daemon.log).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
+    /// Spawn a subagent: start the agent, open a session in --cwd, send the
+    /// first prompt. Returns immediately with the session id.
+    Spawn {
+        /// Session working directory.
+        #[arg(long)]
+        cwd: PathBuf,
+        /// Model to run (e.g. swe-2-high). Required when the agent advertises
+        /// a `model` option; omit it for an agent that advertises none.
+        #[arg(long)]
+        model: Option<String>,
+        /// Session mode to activate (e.g. bypass). Required when the agent
+        /// advertises session modes; omit it for an agent that advertises none.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Configured agent key; falls back to the default.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Extra session config options as key=value (booleans accepted).
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        config_options: Vec<String>,
+        /// Permission policy for this subagent.
+        #[arg(long)]
+        permission: Option<Permission>,
+        /// Owning coordinator pid; the daemon reaps the session if it dies
+        /// (default: `$ACPSUB_OWNER`).
+        #[arg(long)]
+        owner: Option<u32>,
+        #[command(flatten)]
+        prompt: PromptArg,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Adopt an existing session id as a live subagent via session/load.
+    Adopt {
+        /// Session id to take over.
+        session_id: String,
+        /// Model to run; omit it for an agent that advertises no `model` option.
+        #[arg(long)]
+        model: Option<String>,
+        /// Session mode to activate; omit it for an agent that advertises no
+        /// session modes.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Configured agent key.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Session working directory (usually discovered).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Permission policy override.
+        #[arg(long)]
+        permission: Option<Permission>,
+        /// Owning coordinator pid.
+        #[arg(long)]
+        owner: Option<u32>,
+        #[command(flatten)]
+        prompt: PromptArg,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Send a prompt to a live subagent.
+    Send {
+        /// Session id.
+        session_id: String,
+        /// Delivery policy while a turn is running.
+        #[arg(long)]
+        policy: SendPolicy,
+        #[command(flatten)]
+        prompt: PromptArg,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Block until the subagent's turn ends, a permission needs an answer,
+    /// or the turn outlives --expect. Designed to run in the background:
+    /// exit means "check the result".
+    Wait {
+        /// Session id.
+        session_id: String,
+        /// Expected turn duration in seconds; an overrun returns early with
+        /// `state: "overrun"` for investigation.
+        #[arg(long)]
+        expect: u64,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Block until the first of several subagents leaves `running`.
+    WaitAny {
+        /// Session ids to watch.
+        session_ids: Vec<String>,
+        /// Expected turn duration in seconds.
+        #[arg(long)]
+        expect: u64,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Report a subagent's state.
+    Status {
+        /// Session id.
+        session_id: String,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Return a turn's reply (latest turn by default).
+    Result {
+        /// Session id.
+        session_id: String,
+        /// 1-based turn number.
+        #[arg(long)]
+        turn: Option<u64>,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Cancel a subagent's running turn.
+    Cancel {
+        /// Session id.
+        session_id: String,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Answer a pending permission request from `wait`'s
+    /// `pending_permission` field.
+    Permit {
+        /// Session id.
+        session_id: String,
+        /// Pending permission request id (perm-N).
+        #[arg(long)]
+        request: String,
+        /// Option id to select (one of the request's options).
+        #[arg(long)]
+        option: String,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// List subagents: live ones and registered (closed but resumable).
+    List {
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Close a subagent (registry entry stays; `forget` removes it).
+    Close {
+        /// Session id.
+        session_id: String,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Close a subagent and remove its registry entry.
+    Forget {
+        /// Session id.
+        session_id: String,
+        #[command(flatten)]
+        conn: DaemonConn,
+    },
+    /// Call the daemon's `agents` tool: configured agents plus the live
+    /// sessions' reported agent info, modes, and config options.
+    AgentsLive {
+        #[command(flatten)]
+        conn: DaemonConn,
     },
     /// Print the configured agents.
     Agents {
@@ -63,7 +336,7 @@ enum Command {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -71,10 +344,24 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     match Cli::parse().command {
-        Command::Serve { config, log_file } => serve(config, log_file).await,
-        Command::Agents { config } => agents(config),
+        Command::Serve { config, log_file } => {
+            serve(config, log_file).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Daemon {
+            config,
+            socket,
+            log_file,
+        } => {
+            daemon(config, socket, log_file).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Agents { config } => {
+            agents(config)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Transcript {
             session_id,
             from,
@@ -82,8 +369,253 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             full,
             thinking,
             config,
-        } => transcript(&session_id, config, from, tail, full, thinking),
+        } => {
+            transcript(&session_id, config, from, tail, full, thinking)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        command => call(command).await,
     }
+}
+
+/// Run a daemon client command: connect, call the matching tool, print the
+/// result.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per subcommand; every arm is a thin flag-to-JSON mapping"
+)]
+async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let (conn, tool, arguments) = match command {
+        Command::Spawn {
+            cwd,
+            model,
+            mode,
+            agent,
+            config_options,
+            permission,
+            owner,
+            prompt,
+            conn,
+        } => (
+            conn,
+            "spawn",
+            spawn_args(
+                &cwd,
+                model.as_deref(),
+                mode.as_deref(),
+                agent.as_deref(),
+                &config_options,
+                permission,
+                owner,
+                &prompt,
+            )?,
+        ),
+        Command::Adopt {
+            session_id,
+            model,
+            mode,
+            agent,
+            cwd,
+            permission,
+            owner,
+            prompt,
+            conn,
+        } => (
+            conn,
+            "adopt",
+            adopt_args(
+                &session_id,
+                model.as_deref(),
+                mode.as_deref(),
+                agent.as_deref(),
+                cwd.as_deref(),
+                permission,
+                owner,
+                &prompt,
+            )?,
+        ),
+        Command::Send {
+            session_id,
+            policy,
+            prompt,
+            conn,
+        } => {
+            let prompt = prompt
+                .text()?
+                .ok_or("send needs --prompt or --prompt-file")?;
+            let policy = match policy {
+                SendPolicy::Try => "try",
+                SendPolicy::Queued => "queued",
+                SendPolicy::Steer => "steer",
+            };
+            (
+                conn,
+                "send",
+                json!({"session_id": session_id, "prompt": prompt, "policy": policy}),
+            )
+        }
+        Command::Wait {
+            session_id,
+            expect,
+            conn,
+        } => (
+            conn,
+            "wait",
+            json!({"session_id": session_id, "expect_secs": expect}),
+        ),
+        Command::WaitAny {
+            session_ids,
+            expect,
+            conn,
+        } => (
+            conn,
+            "wait_any",
+            json!({"session_ids": session_ids, "expect_secs": expect}),
+        ),
+        Command::Status { session_id, conn } => (conn, "status", json!({"session_id": session_id})),
+        Command::Result {
+            session_id,
+            turn,
+            conn,
+        } => {
+            let mut args = json!({"session_id": session_id});
+            set_if(&mut args, "turn", turn);
+            (conn, "result", args)
+        }
+        Command::Cancel { session_id, conn } => (conn, "cancel", json!({"session_id": session_id})),
+        Command::Permit {
+            session_id,
+            request,
+            option,
+            conn,
+        } => (
+            conn,
+            "permit",
+            json!({"session_id": session_id, "request_id": request, "option_id": option}),
+        ),
+        Command::List { conn } => (conn, "list", json!({})),
+        Command::Close { session_id, conn } => (conn, "close", json!({"session_id": session_id})),
+        Command::Forget { session_id, conn } => (conn, "forget", json!({"session_id": session_id})),
+        Command::AgentsLive { conn } => (conn, "agents", json!({})),
+        _ => unreachable!("non-client commands are handled before `call`"),
+    };
+    let socket = conn.socket_path()?;
+    let result = acpsub::client::call(&socket, tool, arguments, conn.config.as_deref()).await?;
+    Ok(print_result(result))
+}
+
+/// Build the `spawn` tool arguments from the CLI flags.
+#[expect(clippy::too_many_arguments, reason = "mirrors the clap surface")]
+fn spawn_args(
+    cwd: &Path,
+    model: Option<&str>,
+    mode: Option<&str>,
+    agent: Option<&str>,
+    config_options: &[String],
+    permission: Option<Permission>,
+    owner: Option<u32>,
+    prompt: &PromptArg,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let prompt = prompt
+        .text()?
+        .ok_or("spawn needs --prompt or --prompt-file")?;
+    let mut args = json!({
+        "cwd": cwd,
+        "prompt": prompt,
+    });
+    set_if(&mut args, "model", model);
+    set_if(&mut args, "mode", mode);
+    set_if(&mut args, "agent", agent);
+    if !config_options.is_empty() {
+        args["config"] = parse_config_options(config_options)?;
+    }
+    set_if(&mut args, "permission", permission.map(Permission::policy));
+    set_if(&mut args, "owner", owner.or_else(owner_env));
+    Ok(args)
+}
+
+/// Build the `adopt` tool arguments from the CLI flags.
+#[expect(clippy::too_many_arguments, reason = "mirrors the clap surface")]
+fn adopt_args(
+    session_id: &str,
+    model: Option<&str>,
+    mode: Option<&str>,
+    agent: Option<&str>,
+    cwd: Option<&Path>,
+    permission: Option<Permission>,
+    owner: Option<u32>,
+    prompt: &PromptArg,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut args = json!({
+        "session_id": session_id,
+    });
+    set_if(&mut args, "model", model);
+    set_if(&mut args, "mode", mode);
+    set_if(&mut args, "agent", agent);
+    set_if(&mut args, "cwd", cwd);
+    set_if(&mut args, "prompt", prompt.text()?);
+    set_if(&mut args, "permission", permission.map(Permission::policy));
+    set_if(&mut args, "owner", owner.or_else(owner_env));
+    Ok(args)
+}
+
+/// Insert `key` into `args` when the value is present.
+fn set_if(args: &mut Value, key: &str, value: Option<impl serde::Serialize>) {
+    if let Some(value) = value {
+        args[key] = serde_json::to_value(value).expect("serializable arg");
+    }
+}
+
+/// Parse `--set KEY=VALUE` pairs into session config options; `true`/`false`
+/// become toggle values, anything else a select id.
+fn parse_config_options(pairs: &[String]) -> acpsub::Result<Value> {
+    let mut options = serde_json::Map::new();
+    for pair in pairs {
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            acpsub::Error::io(
+                format!("--set expects KEY=VALUE, got '{pair}'"),
+                std::io::Error::other("bad --set syntax"),
+            )
+        })?;
+        let value = match value {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            other => Value::String(other.to_string()),
+        };
+        options.insert(key.to_string(), value);
+    }
+    Ok(Value::Object(options))
+}
+
+/// The owning coordinator pid from the environment.
+fn owner_env() -> Option<u32> {
+    std::env::var("ACPSUB_OWNER")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// Print a tool result: JSON pretty-printed when it parses, raw text
+/// otherwise; tool errors go to stderr with a failure exit.
+fn print_result(result: CallToolResult) -> ExitCode {
+    let mut text = String::new();
+    for item in result.content {
+        if let Content::Text(item) = item {
+            text.push_str(&item.text);
+        }
+    }
+    if result.is_error {
+        eprintln!("{text}");
+        return ExitCode::FAILURE;
+    }
+    match serde_json::from_str::<Value>(text.trim()) {
+        Ok(value) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).expect("Value serializes")
+            );
+        }
+        Err(_) => println!("{text}"),
+    }
+    ExitCode::SUCCESS
 }
 
 /// Resolve the config path from `--config` or the default location.
@@ -97,11 +629,9 @@ fn load_config(path: Option<PathBuf>) -> acpsub::Result<Config> {
     Config::load(&config_path(path)?)
 }
 
-/// `acpsub serve`: MCP over stdio; diagnostics on stderr and `--log-file`.
-async fn serve(
-    config: Option<PathBuf>,
-    log_file: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// Shared tracing setup for `serve` and `daemon`: stderr plus an optional
+/// log file.
+fn init_logging(log_file: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("acpsub=info,warn"));
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
@@ -120,7 +650,15 @@ async fn serve(
     } else {
         registry.init();
     }
+    Ok(())
+}
 
+/// `acpsub serve`: MCP over stdio; diagnostics on stderr and `--log-file`.
+async fn serve(
+    config: Option<PathBuf>,
+    log_file: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    init_logging(log_file)?;
     let config_path = config_path(config)?;
     let config = Config::load(&config_path)?;
     let state = AppState::new(config, config_path)?;
@@ -130,6 +668,27 @@ async fn serve(
         error!(%error, "MCP server failed");
         error
     })?;
+    Ok(())
+}
+
+/// `acpsub daemon`: MCP over a Unix socket; sessions outlive the caller and
+/// are reaped when their owning coordinator pid dies.
+async fn daemon(
+    config: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    log_file: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = socket
+        .or_else(acpsub::daemon::default_socket_path)
+        .ok_or_else(|| acpsub::Error::NoHome("~/.local/share/acpsub/daemon.sock".to_string()))?;
+    // A detached daemon has no useful stderr: default the log file to
+    // daemon.log beside the socket.
+    let log_file = log_file.or_else(|| socket.parent().map(|dir| dir.join("daemon.log")));
+    init_logging(log_file)?;
+    let config_path = config_path(config)?;
+    let config = Config::load(&config_path)?;
+    let state = AppState::new(config, config_path)?;
+    acpsub::daemon::run(state, &socket).await?;
     Ok(())
 }
 

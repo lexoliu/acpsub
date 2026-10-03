@@ -6,7 +6,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aither_acp::{
@@ -322,6 +322,11 @@ pub struct SubRuntime {
     pub next_steer: AtomicU64,
     /// Set by `close`/`forget` before the connection is shut down.
     pub closing: AtomicBool,
+    /// Process id of the coordinator that owns this subagent, or 0 when
+    /// none was claimed at `spawn`/`adopt`. The daemon reaps a subagent
+    /// whose owner is dead, so sessions cannot outlive their coordinator
+    /// as unsupervised orphans.
+    pub owner: AtomicU32,
 }
 
 impl SubRuntime {
@@ -396,6 +401,33 @@ pub struct Subagent {
     pub rt: Arc<SubRuntime>,
 }
 
+impl Subagent {
+    /// Whether the coordinator process that claimed this subagent at
+    /// `spawn`/`adopt` is gone — meaning the daemon may reap it. Always
+    /// `false` for an unowned subagent.
+    ///
+    /// # Panics
+    ///
+    /// Panics never; a 0 owner means "unowned".
+    #[must_use]
+    pub fn owner_dead(&self) -> bool {
+        let pid = self.rt.owner.load(Ordering::Relaxed);
+        pid != 0 && !pid_alive(pid)
+    }
+}
+
+/// Whether `pid` exists on this machine: `kill(pid, 0)` reports
+/// `ESRCH` for a dead pid and `EPERM` for a live one we may not signal.
+#[must_use]
+pub fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs liveness checking only; nothing is sent.
+    (unsafe { libc::kill(pid, 0) } == 0)
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Current RFC 3339 timestamp.
 #[must_use]
 pub fn now() -> String {
@@ -439,6 +471,9 @@ pub struct Launch {
     pub permission: Option<PermissionPolicy>,
     /// `adopt`: the existing session id to load instead of `session/new`.
     pub load: Option<String>,
+    /// Owning coordinator pid, for the daemon's orphan reaper. `None`
+    /// leaves the subagent unowned — nothing reaps it.
+    pub owner: Option<u32>,
 }
 
 /// Spawn an agent process, run the ACP handshake, and register the subagent.
@@ -542,6 +577,7 @@ async fn launch_inner(
         next_steer: AtomicU64::new(1),
         next_term: AtomicU64::new(1),
         closing: AtomicBool::new(false),
+        owner: AtomicU32::new(args.owner.unwrap_or(0)),
     });
 
     let handler = SubagentHandler::new(
@@ -1050,10 +1086,16 @@ fn on_disconnect(rt: &SubRuntime) {
     rt.notify.notify_waiters();
 }
 
-/// Close procedure shared by the `close` and `forget` tools and by `adopt`
-/// reaping an `exited` husk: drop pending requests and queues, close the
-/// client, and take the connection and stderr tasks down.
-pub(crate) async fn close_sub(sub: &Subagent) {
+/// Close a subagent: drop pending requests and queues, close the client, and
+/// take the connection and stderr tasks down.
+///
+/// Shared by the `close` and `forget` tools, by `adopt` reaping an `exited`
+/// husk, and by the daemon's orphan reaper.
+///
+/// # Panics
+///
+/// Panics if a state mutex is poisoned.
+pub async fn close_sub(sub: &Subagent) {
     sub.rt.closing.store(true, Ordering::Relaxed);
     {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");

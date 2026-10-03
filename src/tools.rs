@@ -397,6 +397,11 @@ struct SpawnArgs {
     /// Permission policy for this subagent: `allow` auto-approves, `deny`
     /// auto-rejects, `ask` queues requests for the `permit` tool.
     permission: Option<PermissionPolicy>,
+    /// Pid of the coordinator process this subagent belongs to. When the
+    /// server runs as a daemon it reaps the subagent once that pid dies,
+    /// so a session cannot outlive its coordinator as an orphan. Omit to
+    /// leave the subagent unowned.
+    owner: Option<u32>,
 }
 
 struct SpawnTool(Arc<AppState>);
@@ -423,6 +428,7 @@ impl Tool for SpawnTool {
                 config: args.config.unwrap_or_default(),
                 permission: args.permission,
                 load: None,
+                owner: args.owner,
             },
         )
         .await?;
@@ -467,6 +473,8 @@ struct AdoptArgs {
     mode: Option<String>,
     /// Permission policy override, as in `spawn`.
     permission: Option<PermissionPolicy>,
+    /// Owning coordinator pid, as in `spawn`.
+    owner: Option<u32>,
 }
 
 struct AdoptTool(Arc<AppState>);
@@ -537,6 +545,7 @@ impl Tool for AdoptTool {
                 config: BTreeMap::new(),
                 permission: args.permission,
                 load: Some(args.session_id),
+                owner: args.owner,
             },
         )
         .await?;

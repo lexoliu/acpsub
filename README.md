@@ -1,14 +1,16 @@
 # acpsub
 
-Any [ACP](https://agentclientprotocol.com) agent as a resumable subagent
-over [MCP](https://modelcontextprotocol.io).
+Any [ACP](https://agentclientprotocol.com) agent as a resumable subagent —
+over [MCP](https://modelcontextprotocol.io) or over the built-in CLI.
 
 `acpsub` serves a set of MCP tools that let an orchestrating agent spawn
 long-lived subagents backed by ACP agents (`devin acp`,
-`claude-code-acp`, ...). Each subagent keeps its own ACP session, transcript
-file, and a registry entry keyed by its session id, so sessions survive
-server restarts and externally created sessions can be adopted via
-`session/load`.
+`claude-code-acp`, ...). The tool set is served two ways: `acpsub serve`
+speaks MCP over stdio for an MCP host, and `acpsub daemon` serves the same
+tools over a Unix socket for the `acpsub` CLI. Each subagent keeps its own
+ACP session, transcript file, and a registry entry keyed by its session id,
+so sessions survive restarts and externally created sessions can be adopted
+via `session/load`.
 
 ## Install
 
@@ -28,14 +30,23 @@ cargo install acpsub --locked
 
 ## Wire it into your orchestrating agent
 
-Claude Code:
+**CLI (daemon)**: the client commands below start `acpsub daemon`
+automatically when the socket is silent — nothing to wire up. `daemon` keeps
+running after the caller exits; it reaps a session whose `--owner` pid has
+died, so a subagent cannot outlive its coordinator as an orphan.
 
 ```sh
-claude mcp add --scope user acpsub -- acpsub serve
+acpsub spawn --cwd . --model swe-2-high --mode bypass --prompt "Fix the typo in README" --owner $PPID
+acpsub wait <session_id> --expect 600   # blocks until the turn ends —
+                                      # run it in the background
 ```
 
-Any other MCP client: run `acpsub serve` and speak MCP over stdio. Logs go to
-stderr (stdout is the MCP channel); add `--log-file PATH` for a copy.
+**MCP**: an orchestrating agent that prefers tool calls over a CLI adds the
+stdio server — `claude mcp add --scope user acpsub -- acpsub serve` for
+Claude Code, or `acpsub serve` directly for any other MCP client. In this
+mode a blocking `wait` holds the caller's turn; the CLI path exists to avoid
+that. Logs go to stderr (stdout is the MCP channel); add `--log-file PATH`
+for a copy.
 
 ## Configuration
 
@@ -83,8 +94,8 @@ file that fails to parse is a tool error, never a stale fallback.
 
 | tool | arguments | behaviour |
 |---|---|---|
-| `spawn` | `cwd, prompt, model?, mode?, agent?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. `model`/`mode` are required when the agent advertises a `model` option / session modes and must be omitted when it does not (the calls are skipped). Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. |
-| `adopt` | `session_id, model?, mode?, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, a live `exited` one (the dead runtime is reaped, no `close` needed), or an external one such as a Devin session created elsewhere. Same `model`/`mode` rule as `spawn`. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
+| `spawn` | `cwd, prompt, model?, mode?, agent?, config?, permission?, owner?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. `model`/`mode` are required when the agent advertises a `model` option / session modes and must be omitted when it does not (the calls are skipped). Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. `owner` (a pid) lets the daemon reap the subagent when its coordinator exits. |
+| `adopt` | `session_id, model?, mode?, agent?, cwd?, prompt?, permission?, owner?` | Take over an existing ACP session via `session/load` — a registered (closed) session, a live `exited` one (the dead runtime is reaped, no `close` needed), or an external one such as a Devin session created elsewhere. Same `model`/`mode` rule as `spawn`. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
 | `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled`/`failed` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not surface an error; agents configured `steer = "folded"` never answer it and the steer settles folded at the turn's end), returning `{state: "steered", turn}`. On a promptable subagent all three just start the turn: `{state: "running"}`. |
 | `wait` | `session_id, expect_secs` | Block until the turn ends, a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?}`; a turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. |
 | `wait_any` | `session_ids, expect_secs` | First of them to leave `running` — a turn end, a permission request, or an `overrun`. |
@@ -158,9 +169,43 @@ steer), never to re-wait with a larger number. For an instant check use
 
 ```sh
 acpsub serve [--config PATH] [--log-file PATH]   # MCP over stdio
+acpsub daemon [--socket PATH] [--config PATH] [--log-file PATH]
+                                                # MCP over a Unix socket
 acpsub agents [--config PATH]                    # list configured agents
 acpsub transcript <session_id> [--from N] [--tail N] [--full] [--thinking]
 ```
+
+Every tool in the table above is also a client subcommand that talks to the
+daemon (`--socket PATH` overrides the default `~/.local/share/acpsub/
+daemon.sock`; `ACPSUB_SOCKET` works too). When the socket is silent the
+client spawns `acpsub daemon` itself, in its own process group with a pid
+file at `<socket>.pid`:
+
+```sh
+acpsub spawn   --cwd DIR [--model M] [--mode M] [--agent K] [--set K=V]...
+              [--permission allow|deny|ask] [--owner PID]
+              --prompt TEXT | --prompt-file FILE   # FILE of `-` reads stdin
+acpsub adopt   <session_id> [--model M] [--mode M] [--agent K] [--cwd DIR]
+              [--prompt TEXT | --prompt-file FILE] [--permission P] [--owner PID]
+acpsub send    <session_id> --policy try|queued|steer
+              --prompt TEXT | --prompt-file FILE
+acpsub wait    <session_id> --expect SECS
+acpsub wait-any <session_id>... --expect SECS
+acpsub status  <session_id>
+acpsub result  <session_id> [--turn N]
+acpsub cancel  <session_id>
+acpsub permit  <session_id> --request REQ --option OPT
+acpsub list
+acpsub close   <session_id>
+acpsub forget  <session_id>
+acpsub agents-live                              # the daemon's `agents` tool
+```
+
+Client output is the tool's JSON result on stdout; a tool error exits 1 with
+the message on stderr. `wait` is meant for a background task: the process
+exit is the completion signal, so an orchestrating agent that backgrounds
+`acpsub wait` is woken the moment the turn ends instead of holding a tool
+call open.
 
 `acpsub transcript` renders a session's JSONL file:
 
