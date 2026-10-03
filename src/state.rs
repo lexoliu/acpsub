@@ -201,6 +201,20 @@ pub struct ToolCallSummary {
     /// Affected locations.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<ToolCallLocation>,
+    /// When the call first appeared in a `session/update` — the start every
+    /// digest duration is measured from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<jiff::Timestamp>,
+    /// When the call first reached a terminal status (`completed` or
+    /// `failed`); absent while it is still running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<jiff::Timestamp>,
+}
+
+/// Whether a tool call status ends the call — `completed` or `failed`.
+/// `pending`/`in_progress` (or no status) leave it open.
+pub(crate) const fn terminal_status(status: ToolCallStatus) -> bool {
+    matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed)
 }
 
 /// One prompt turn's accumulated state.

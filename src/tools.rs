@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use aither_acp::{
     ConfigOption, ConfigOptionValue, ConfigSelectOptions, RequestPermissionOutcome, StopReason,
+    ToolKind,
 };
 use aither_core::llm::tool::{Progress, Tool, ToolContext, Tools};
 use schemars::JsonSchema;
@@ -22,9 +23,9 @@ use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Gate, Launch, Status, Subagent, begin_turn, close_sub, launch, next_turn_number,
-    prompt_slot_free, record_queue_dropped, spawn_turn_task, start_turn, steer_resolved,
-    steer_turn, steer_waiter,
+    AppState, Gate, Launch, Status, Subagent, ToolCallSummary, Turn, begin_turn, close_sub, launch,
+    next_turn_number, prompt_slot_free, record_queue_dropped, spawn_turn_task, start_turn,
+    steer_resolved, steer_turn, steer_waiter,
 };
 use crate::transcript::{RenderOptions, render};
 
@@ -246,13 +247,135 @@ const fn check_expect(cx: &ToolContext, expect_secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// How a `wait`/`wait_any` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    /// The awaited turn left `running` — ended, parked on a permission,
+    /// or gone with the session — and the result reports that state.
+    Ended,
+    /// The awaited turn outlived `expect_secs`: the result reports
+    /// `overrun`, the turn's own elapsed time, its latest tool call, and
+    /// the activity digest.
+    Overrun,
+    /// The call's own `max_wait_secs` bound passed first: the result
+    /// reports `running` with the activity digest.
+    MaxWait,
+}
+
+/// The activity digest a `wait`/`wait_any` result carries on `overrun` and
+/// on a `max_wait_secs` timeout, measured over the window from when the
+/// wait call began to now. Every value comes from the tool calls'
+/// recorded `started_at`/`ended_at`; nothing is classified from command
+/// text.
+///
+/// A call counts toward the window when any of its recorded lifetime
+/// overlaps it — a call that ended before the wait began is excluded, and
+/// a still-running call's duration is measured to now. `window_secs` is
+/// the window's length; `tool_calls` the number of calls in it;
+/// `tool_call_share` the fraction of window wall time spent inside calls
+/// (above 1.0 when calls overlap); `longest_tool_calls` the five longest
+/// by in-window duration (`id`, `title`, `duration_secs`);
+/// `repeated_titles` every title seen three or more times (`title`,
+/// `count`); `secs_since_last_edit` the seconds since the most recent
+/// edit-kind call (`edit`/`delete`/`move`) finished — about 0 while one
+/// is still running — `null` when none overlaps the window; and
+/// `latest_tool_call` the turn's latest tool call summary.
+fn activity_digest(turn: Option<&Turn>, window_start: jiff::Timestamp) -> Value {
+    let now = jiff::Timestamp::now();
+    let window_secs = now.duration_since(window_start).as_secs_f64().max(0.0);
+    let mut tool_calls = 0_u64;
+    let mut busy_secs = 0.0_f64;
+    let mut longest: Vec<(&ToolCallSummary, f64)> = Vec::new();
+    let mut titles: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut last_edit_end: Option<jiff::Timestamp> = None;
+    if let Some(turn) = turn {
+        for call in turn.tool_calls.values() {
+            let Some(call_start) = call.started_at else {
+                continue;
+            };
+            let call_end = call.ended_at.unwrap_or(now);
+            if call_end <= window_start {
+                continue;
+            }
+            tool_calls += 1;
+            let duration = call_end
+                .duration_since(call_start.max(window_start))
+                .as_secs_f64();
+            busy_secs += duration;
+            longest.push((call, duration));
+            *titles.entry(call.title.as_str()).or_default() += 1;
+            if matches!(
+                call.kind,
+                Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
+            ) {
+                last_edit_end = Some(last_edit_end.map_or(call_end, |prev| prev.max(call_end)));
+            }
+        }
+    }
+    longest.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut repeated: Vec<(&str, u64)> = titles
+        .into_iter()
+        .filter(|(_, count)| *count >= 3)
+        .collect();
+    repeated.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    json!({
+        "window_secs": window_secs,
+        "tool_calls": tool_calls,
+        "tool_call_share": if window_secs > 0.0 { busy_secs / window_secs } else { 0.0 },
+        "longest_tool_calls": longest.iter().take(5).map(|(call, duration)| json!({
+            "id": call.id,
+            "title": call.title,
+            "duration_secs": duration,
+        })).collect::<Vec<_>>(),
+        "repeated_titles": repeated.iter().map(|(title, count)| json!({
+            "title": title,
+            "count": count,
+        })).collect::<Vec<_>>(),
+        "secs_since_last_edit": last_edit_end
+            .map(|end| now.duration_since(end).as_secs_f64()),
+        "latest_tool_call": turn.and_then(|turn| {
+            turn.latest_tool_call
+                .as_ref()
+                .and_then(|id| turn.tool_calls.get(id))
+        }).map(|call| serde_json::to_value(call)
+            .expect("ToolCallSummary holds only owned primitives; serialization cannot fail")),
+    })
+}
+
+/// The `pending_permission` field of a wait result, for the first queued
+/// permission request.
+fn pending_view(perm: &crate::state::PendingPermission) -> Value {
+    json!({
+        "request_id": perm.request_id,
+        "tool_call": {
+            "id": perm.tool_call.tool_call_id,
+            "title": perm.tool_call.title,
+            "kind": perm.tool_call.kind,
+            "status": perm.tool_call.status,
+        },
+        "options": perm.options.iter().map(|o| json!({
+            "option_id": o.option_id,
+            "name": o.name,
+            "kind": o.kind,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// A `wait`-style result for one subagent. `overrun` marks that the turn
 /// outlived `expect_secs`: the result reports `overrun`, the turn's own
 /// elapsed time, and its latest tool call. `awaited` is the turn the call
 /// bound to (see [`awaited_turn`]); `None` reports the latest turn, the
-/// shape a wait on a non-running subagent has always had.
-fn wait_view(sub: &Subagent, started: Instant, overrun: bool, awaited: Option<u64>) -> Value {
-    let (status, reply, tool_calls, pending, turn_n, queued, elapsed, latest, ended_reason) = {
+/// shape a wait on a non-running subagent has always had. `window_start`
+/// is when the wait call began — the base of the activity digest an
+/// `Overrun`/`MaxWait` outcome carries.
+fn wait_view(
+    sub: &Subagent,
+    started: Instant,
+    outcome: WaitOutcome,
+    awaited: Option<u64>,
+    window_start: jiff::Timestamp,
+) -> Value {
+    let (status, reply, tool_calls, pending, turn_n, queued, elapsed, latest, ended_reason, digest) = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
         // The awaited turn's own record — the same lookup `result` uses
         // for an explicit turn number: `turns` once settled, `current`
@@ -268,22 +391,13 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool, awaited: Option<u6
                     .or_else(|| inner.current.as_ref().filter(|turn| turn.n == n))
             },
         );
-        let pending = inner.pending.first().map(|perm| {
-            json!({
-                "request_id": perm.request_id,
-                "tool_call": {
-                    "id": perm.tool_call.tool_call_id,
-                    "title": perm.tool_call.title,
-                    "kind": perm.tool_call.kind,
-                    "status": perm.tool_call.status,
-                },
-                "options": perm.options.iter().map(|o| json!({
-                    "option_id": o.option_id,
-                    "name": o.name,
-                    "kind": o.kind,
-                })).collect::<Vec<_>>(),
-            })
-        });
+        let digest = match outcome {
+            WaitOutcome::Ended => None,
+            WaitOutcome::Overrun | WaitOutcome::MaxWait => {
+                Some(activity_digest(turn, window_start))
+            }
+        };
+        let pending = inner.pending.first().map(pending_view);
         (
             inner.status.clone(),
             turn.map_or_else(String::new, |turn| turn.reply.clone()),
@@ -303,6 +417,7 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool, awaited: Option<u6
             }),
             turn.and_then(|turn| turn.stop_reason)
                 .filter(|_| awaited.is_some()),
+            digest,
         )
     };
     let mut view = json!({
@@ -314,7 +429,7 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool, awaited: Option<u6
         "queued": queued,
         "elapsed_secs": started.elapsed().as_secs_f64(),
     });
-    if overrun {
+    if outcome == WaitOutcome::Overrun {
         view["state"] = json!("overrun");
         if let Some(elapsed) = elapsed {
             view["elapsed_secs"] = json!(elapsed);
@@ -349,6 +464,9 @@ fn wait_view(sub: &Subagent, started: Instant, overrun: bool, awaited: Option<u6
     }
     if let Some(pending) = pending {
         view["pending_permission"] = pending;
+    }
+    if let Some(digest) = digest {
+        view["digest"] = digest;
     }
     view
 }
@@ -738,6 +856,12 @@ impl Tool for SendTool {
 /// turn's elapsed time and its latest tool call: an overrun is to be
 /// investigated (`status`, `transcript`, a `send` steer), not re-waited
 /// with a larger expectation.
+///
+/// Both an `overrun` result and a `max_wait_secs` timeout carry an
+/// activity `digest` measured over the window since the wait began:
+/// `{window_secs, tool_calls, tool_call_share, longest_tool_calls,
+/// repeated_titles, secs_since_last_edit, latest_tool_call}` — see
+/// `max_wait_secs`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitArgs {
     /// Session id, as returned by `spawn`/`adopt`.
@@ -747,6 +871,24 @@ struct WaitArgs {
     /// extends it. The wait returns early on any state change, so an
     /// accurate expectation is free.
     expect_secs: u64,
+    /// Optional: the wait call's own deadline in seconds, measured from
+    /// when the wait began — unlike `expect_secs` it bounds the wait, not
+    /// the turn. When it passes before the awaited turn ends or overruns,
+    /// the wait returns `state: "running"` with an activity `digest` of
+    /// the window, rather than dying silent under a caller-side kill
+    /// limit. The digest's shape: `window_secs` (the window's length);
+    /// `tool_calls` (calls whose recorded lifetime overlaps the window);
+    /// `tool_call_share` (fraction of window wall time inside calls — can
+    /// exceed 1 when calls overlap); `longest_tool_calls` (the five
+    /// longest by in-window duration, `{id, title, duration_secs}`);
+    /// `repeated_titles` (titles seen 3+ times, `{title, count}`);
+    /// `secs_since_last_edit` (since the last edit/delete/move call
+    /// finished, ~0 while one runs, `null` when none overlaps the
+    /// window); `latest_tool_call` (the turn's latest call summary).
+    /// Durations are measured from the calls' recorded `started_at` /
+    /// `ended_at`, never inferred from command text. Set it just below
+    /// the caller's own timeout.
+    max_wait_secs: Option<u64>,
 }
 
 struct WaitTool {
@@ -765,19 +907,34 @@ impl Tool for WaitTool {
         check_expect(&cx, args.expect_secs)?;
         let sub = self.state.get(&args.session_id)?;
         let started = Instant::now();
+        let window_start = jiff::Timestamp::now();
         let Some(awaited) = awaited_turn(&sub)? else {
-            return Ok(wait_view(&sub, started, false, None));
+            return Ok(wait_view(
+                &sub,
+                started,
+                WaitOutcome::Ended,
+                None,
+                window_start,
+            ));
         };
+        // The wait's own deadline: `Instant` can represent anything the
+        // caller would wait through; an overflowing bound is no bound.
+        let deadline = args
+            .max_wait_secs
+            .and_then(|secs| started.checked_add(Duration::from_secs(secs)));
         #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
         let expect = args.expect_secs as f64;
         let interval = self.interval;
         let mut next_report = started;
-        let overrun = loop {
+        let outcome = loop {
             match awaited_elapsed(&sub, awaited)? {
-                Awaited::Ended => break false,
-                Awaited::Running(elapsed) if elapsed >= expect => break true,
+                Awaited::Ended => break WaitOutcome::Ended,
+                Awaited::Running(elapsed) if elapsed >= expect => break WaitOutcome::Overrun,
                 Awaited::Running(elapsed) => {
                     let now = Instant::now();
+                    if deadline.is_some_and(|deadline| now >= deadline) {
+                        break WaitOutcome::MaxWait;
+                    }
                     if now >= next_report {
                         cx.report_progress(wait_progress(&sub, elapsed, args.expect_secs))
                             .await?;
@@ -785,7 +942,10 @@ impl Tool for WaitTool {
                     }
                     let wake = (expect - elapsed)
                         .min(0.25)
-                        .min(next_report.saturating_duration_since(now).as_secs_f64());
+                        .min(next_report.saturating_duration_since(now).as_secs_f64())
+                        .min(deadline.map_or(f64::MAX, |deadline| {
+                            deadline.saturating_duration_since(now).as_secs_f64()
+                        }));
                     tokio::select! {
                         () = sub.rt.notify.notified() => {},
                         () = tokio::time::sleep(Duration::from_secs_f64(wake)) => {},
@@ -793,7 +953,13 @@ impl Tool for WaitTool {
                 }
             }
         };
-        Ok(wait_view(&sub, started, overrun, Some(awaited)))
+        Ok(wait_view(
+            &sub,
+            started,
+            outcome,
+            Some(awaited),
+            window_start,
+        ))
     }
 }
 
@@ -802,6 +968,10 @@ impl Tool for WaitTool {
 /// request needs an answer, or an `overrun` once a turn has run past
 /// `expect_secs` — then return that one's wait-style result. An overrun
 /// is to be investigated, not re-waited with a larger number.
+///
+/// On a `max_wait_secs` timeout the result is the longest-running watched
+/// turn's `running` state with its activity digest — the same shape
+/// `wait` reports, documented there.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitAnyArgs {
     /// Session ids to watch.
@@ -810,6 +980,10 @@ struct WaitAnyArgs {
     /// seconds. Measured from each turn's recorded start — re-issuing a
     /// wait never extends it.
     expect_secs: u64,
+    /// Optional: the wait call's own deadline in seconds, as in `wait` —
+    /// on expiry the result is the longest-running watched turn's
+    /// `running` state with its activity `digest`.
+    max_wait_secs: Option<u64>,
 }
 
 struct WaitAnyTool {
@@ -832,12 +1006,16 @@ impl Tool for WaitAnyTool {
             .map(|session_id| self.state.get(session_id))
             .collect::<Result<Vec<_>>>()?;
         let started = Instant::now();
+        let window_start = jiff::Timestamp::now();
         // Each watched session binds to the turn in flight at call time,
         // the same rule `wait` applies to one.
         let awaited = subs
             .iter()
             .map(|sub| awaited_turn(sub))
             .collect::<Result<Vec<_>>>()?;
+        let deadline = args
+            .max_wait_secs
+            .and_then(|secs| started.checked_add(Duration::from_secs(secs)));
         #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
         let expect = args.expect_secs as f64;
         let interval = self.interval;
@@ -846,33 +1024,72 @@ impl Tool for WaitAnyTool {
             let mut poll = WAIT_ANY_POLL;
             // Report the longest-running watched turn: it is the one a
             // host-side idle timer would be most anxious about.
-            let mut longest: Option<(f64, &Arc<Subagent>)> = None;
+            let mut longest: Option<(f64, &Arc<Subagent>, u64)> = None;
             for (sub, awaited) in subs.iter().zip(&awaited) {
                 let Some(n) = awaited else {
-                    return Ok(wait_view(sub, started, false, None));
+                    return Ok(wait_view(
+                        sub,
+                        started,
+                        WaitOutcome::Ended,
+                        None,
+                        window_start,
+                    ));
                 };
                 match awaited_elapsed(sub, *n)? {
-                    Awaited::Ended => return Ok(wait_view(sub, started, false, Some(*n))),
+                    Awaited::Ended => {
+                        return Ok(wait_view(
+                            sub,
+                            started,
+                            WaitOutcome::Ended,
+                            Some(*n),
+                            window_start,
+                        ));
+                    }
                     Awaited::Running(elapsed) if elapsed >= expect => {
-                        return Ok(wait_view(sub, started, true, Some(*n)));
+                        return Ok(wait_view(
+                            sub,
+                            started,
+                            WaitOutcome::Overrun,
+                            Some(*n),
+                            window_start,
+                        ));
                     }
                     Awaited::Running(elapsed) => {
                         poll = poll.min(Duration::from_secs_f64(expect - elapsed));
-                        if longest.is_none_or(|(max, _)| elapsed > max) {
-                            longest = Some((elapsed, sub));
+                        if longest.is_none_or(|(max, _, _)| elapsed > max) {
+                            longest = Some((elapsed, sub, *n));
                         }
                     }
                 }
             }
             let now = Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                // The bound passed with every watched turn still running:
+                // report the longest-running one's state and digest — the
+                // same turn progress has been naming.
+                let (_, sub, n) =
+                    longest.expect("the deadline check only runs while a watched turn runs");
+                return Ok(wait_view(
+                    sub,
+                    started,
+                    WaitOutcome::MaxWait,
+                    Some(n),
+                    window_start,
+                ));
+            }
             if now >= next_report
-                && let Some((elapsed, sub)) = longest
+                && let Some((elapsed, sub, _)) = longest
             {
                 cx.report_progress(wait_progress(sub, elapsed, args.expect_secs))
                     .await?;
                 next_report = now + interval;
             }
-            tokio::time::sleep(poll.min(next_report.saturating_duration_since(now))).await;
+            tokio::time::sleep(poll.min(next_report.saturating_duration_since(now)).min(
+                deadline.map_or(Duration::MAX, |deadline| {
+                    deadline.saturating_duration_since(now)
+                }),
+            ))
+            .await;
         }
     }
 }

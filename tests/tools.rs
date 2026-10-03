@@ -870,6 +870,94 @@ async fn wait_any_reports_overrun() {
     call_json(&tools, "cancel", json!({"session_id": sid})).await;
 }
 
+/// `--max-wait` is the wait's own deadline: it returns `state: "running"`
+/// with an activity digest measured from the tool calls' recorded
+/// timestamps — the still-open call named as the longest, repeated titles
+/// counted, and the mid-window edit's end measured.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_max_wait_returns_activity_digest() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "loops")).await;
+
+    let out = call_json(
+        &tools,
+        "wait",
+        json!({"session_id": sid.as_str(), "expect_secs": 60, "max_wait_secs": 1}),
+    )
+    .await;
+    assert_eq!(out["state"], "running", "{out}");
+    let digest = &out["digest"];
+    let window = digest["window_secs"].as_f64().expect("window_secs");
+    assert!((0.9..10.0).contains(&window), "{digest}");
+    // tc-1, tc-edit, tc-sleep and the three "run check" calls all overlap
+    // the window.
+    assert_eq!(digest["tool_calls"], 6, "{digest}");
+    // tc-sleep is the only call still open at the deadline: it owns the
+    // window's wall time and the top of the longest list.
+    let longest = digest["longest_tool_calls"]
+        .as_array()
+        .expect("longest_tool_calls");
+    assert_eq!(longest[0]["id"], "tc-sleep", "{digest}");
+    assert_eq!(longest[0]["title"], "run sleep 300", "{digest}");
+    assert!(
+        longest[0]["duration_secs"].as_f64().expect("duration_secs") >= 0.9,
+        "{digest}"
+    );
+    assert_eq!(
+        digest["repeated_titles"],
+        json!([{"title": "run check", "count": 3}]),
+        "{digest}"
+    );
+    // The edit finished ~0.3 s in, inside the window.
+    let since_edit = digest["secs_since_last_edit"]
+        .as_f64()
+        .expect("secs_since_last_edit");
+    assert!(since_edit > 0.1 && since_edit < window, "{digest}");
+    assert_eq!(digest["latest_tool_call"]["id"], "tc-edit", "{digest}");
+    assert!(
+        digest["tool_call_share"].as_f64().expect("tool_call_share") >= 0.9,
+        "{digest}"
+    );
+
+    // An overrun carries the same digest — over that wait's own window,
+    // where only the still-running call remains in scope.
+    let over = call_json(
+        &tools,
+        "wait",
+        json!({"session_id": sid.as_str(), "expect_secs": 1}),
+    )
+    .await;
+    assert_eq!(over["state"], "overrun", "{over}");
+    let digest = &over["digest"];
+    assert_eq!(digest["tool_calls"], 1, "{digest}");
+    assert_eq!(
+        digest["longest_tool_calls"][0]["id"], "tc-sleep",
+        "{digest}"
+    );
+    assert_eq!(digest["repeated_titles"], json!([]), "{digest}");
+
+    // `wait_any` takes the same bound and reports the same digest.
+    let any = call_json(
+        &tools,
+        "wait_any",
+        json!({"session_ids": [sid.as_str()], "expect_secs": 60, "max_wait_secs": 1}),
+    )
+    .await;
+    assert_eq!(any["state"], "running", "{any}");
+    assert_eq!(any["session_id"], sid, "{any}");
+    assert_eq!(any["digest"]["tool_calls"], 1, "{any}");
+    assert_eq!(
+        any["digest"]["longest_tool_calls"][0]["id"], "tc-sleep",
+        "{any}"
+    );
+    call_json(&tools, "cancel", json!({"session_id": sid})).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn permission_ask_then_permit() {
     if !python3() {

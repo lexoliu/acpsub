@@ -97,8 +97,8 @@ file that fails to parse is a tool error, never a stale fallback.
 | `spawn` | `cwd, prompt, model?, mode?, agent?, config?, permission?, owner?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. `model`/`mode` are required when the agent advertises a `model` option / session modes and must be omitted when it does not (the calls are skipped). Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. `owner` (a pid) lets the daemon reap the subagent when its coordinator exits. |
 | `adopt` | `session_id, model?, mode?, agent?, cwd?, prompt?, permission?, owner?` | Take over an existing ACP session via `session/load` — a registered (closed) session, a live `exited` one (the dead runtime is reaped, no `close` needed), or an external one such as a Devin session created elsewhere. Same `model`/`mode` rule as `spawn`. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
 | `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled`/`failed` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not surface an error; agents configured `steer = "folded"` never answer it and the steer settles folded at the turn's end), returning `{state: "steered", turn}`. On a promptable subagent all three just start the turn: `{state: "running"}`. |
-| `wait` | `session_id, expect_secs` | Block until the turn ends, a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?}`; a turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. |
-| `wait_any` | `session_ids, expect_secs` | First of them to leave `running` — a turn end, a permission request, or an `overrun`. |
+| `wait` | `session_id, expect_secs, max_wait_secs?` | Block until the turn ends, a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?, digest?}`; a turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. `max_wait_secs` bounds the wait call itself: when it passes first, the result is `state: "running"` with an activity `digest` (below). `overrun` results carry the same digest. |
+| `wait_any` | `session_ids, expect_secs, max_wait_secs?` | First of them to leave `running` — a turn end, a permission request, or an `overrun`. On a `max_wait_secs` timeout, the longest-running watched turn's `running` state with its `digest`. |
 | `status` | `session_id` | State, cwd, agent, model, mode (`null` for agents without them), turns, queued prompts, transcript path — instant check. |
 | `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
 | `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
@@ -125,6 +125,34 @@ is `overrun` with the turn's elapsed time and latest tool call — an
 overrun is a signal to investigate (`status`, `transcript`, a `send`
 steer), never to re-wait with a larger number. For an instant check use
 `status`.
+
+`max_wait_secs` is the cap on how long the wait call itself blocks —
+measured from when the wait began, unlike `expect_secs`. It exists
+because a backgrounded `wait` can outlive its host's task limit: set it
+just below that limit and the wait returns `state: "running"` with an
+activity `digest` instead of dying silent. The digest covers the window
+since the wait began, and every value is measured from the tool calls'
+recorded `started_at`/`ended_at` — nothing is classified from command
+text:
+
+```json
+"digest": {
+  "window_secs": 60.1,          // length of the measured window
+  "tool_calls": 6,              // calls whose recorded lifetime overlaps it
+  "tool_call_share": 0.83,      // fraction of window wall time inside calls
+                                //   (> 1 when calls overlap)
+  "longest_tool_calls": [       // up to 5, by in-window duration
+    {"id": "tc-7", "title": "run sleep 300", "duration_secs": 60.1}
+  ],
+  "repeated_titles": [          // every title seen 3+ times
+    {"title": "run check", "count": 3}
+  ],
+  "secs_since_last_edit": 42.7, // since the last edit/delete/move call
+                                //   finished; ~0 while one runs; null
+                                //   when none overlaps the window
+  "latest_tool_call": {"id": "tc-7", "title": "run sleep 300", ...}
+}
+```
 
 ## Model
 
@@ -189,8 +217,8 @@ acpsub adopt   <session_id> [--model M] [--mode M] [--agent K] [--cwd DIR]
               [--prompt TEXT | --prompt-file FILE] [--permission P] [--owner PID]
 acpsub send    <session_id> --policy try|queued|steer
               --prompt TEXT | --prompt-file FILE
-acpsub wait    <session_id> --expect SECS
-acpsub wait-any <session_id>... --expect SECS
+acpsub wait    <session_id> --expect SECS [--max-wait SECS]
+acpsub wait-any <session_id>... --expect SECS [--max-wait SECS]
 acpsub status  <session_id>
 acpsub result  <session_id> [--turn N]
 acpsub cancel  <session_id>

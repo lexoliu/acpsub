@@ -11,7 +11,7 @@ use aither_acp::{
     SessionNotification, SessionUpdate, TerminalCreateParams, TerminalCreateResult,
     TerminalExitStatus, TerminalKillParams, TerminalKillResult, TerminalOutputParams,
     TerminalOutputResult, TerminalReleaseParams, TerminalReleaseResult, TerminalWaitForExitParams,
-    WriteTextFileParams, WriteTextFileResult,
+    ToolCall, ToolCallUpdate, WriteTextFileParams, WriteTextFileResult,
 };
 use aither_mcp::protocol::JsonRpcError;
 use tokio::sync::oneshot;
@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 use crate::config::PermissionPolicy;
 use crate::state::{
     PendingPermission, Status, SubRuntime, ToolCallSummary, Turn, now, oldest_steer,
+    terminal_status,
 };
 use crate::terminal::{self, Terminal};
 
@@ -137,44 +138,8 @@ impl ClientHandler for SubagentHandler {
                     turn.reply.push_str(&text.text);
                 }
             }
-            SessionUpdate::ToolCall(call) => {
-                turn.latest_tool_call = Some(call.tool_call_id.clone());
-                turn.tool_calls.insert(
-                    call.tool_call_id.clone(),
-                    ToolCallSummary {
-                        id: call.tool_call_id,
-                        title: call.title,
-                        kind: call.kind,
-                        status: call.status,
-                        locations: call.locations,
-                    },
-                );
-            }
-            SessionUpdate::ToolCallUpdate(update) => {
-                turn.latest_tool_call = Some(update.tool_call_id.clone());
-                let entry = turn
-                    .tool_calls
-                    .entry(update.tool_call_id.clone())
-                    .or_insert_with(|| ToolCallSummary {
-                        id: update.tool_call_id.clone(),
-                        title: String::new(),
-                        kind: None,
-                        status: None,
-                        locations: Vec::new(),
-                    });
-                if let Some(status) = update.status {
-                    entry.status = Some(status);
-                }
-                if let Some(title) = update.title {
-                    entry.title = title;
-                }
-                if let Some(kind) = update.kind {
-                    entry.kind = Some(kind);
-                }
-                if let Some(locations) = update.locations {
-                    entry.locations = locations;
-                }
-            }
+            SessionUpdate::ToolCall(call) => note_tool_call(turn, call),
+            SessionUpdate::ToolCallUpdate(update) => note_tool_call_update(turn, update),
             SessionUpdate::Plan(plan) => turn.plan = plan.entries,
             SessionUpdate::CurrentModeUpdate(mode) => {
                 turn.mode = Some(mode.current_mode_id);
@@ -301,6 +266,61 @@ impl ClientHandler for SubagentHandler {
         // Dropping the entry kills the child if still running (kill_on_drop).
         self.rt.terminals.lock().await.remove(&params.terminal_id);
         Ok(TerminalReleaseResult { meta: None })
+    }
+}
+
+/// Record a `tool_call` update: insert the call's summary with the
+/// sighting as `started_at`, and `ended_at` when it arrives already
+/// terminal. These timestamps are what `wait`'s digest measures from.
+fn note_tool_call(turn: &mut Turn, call: ToolCall) {
+    let seen = jiff::Timestamp::now();
+    turn.latest_tool_call = Some(call.tool_call_id.clone());
+    turn.tool_calls.insert(
+        call.tool_call_id.clone(),
+        ToolCallSummary {
+            id: call.tool_call_id,
+            title: call.title,
+            kind: call.kind,
+            status: call.status,
+            locations: call.locations,
+            started_at: Some(seen),
+            ended_at: call.status.filter(|s| terminal_status(*s)).map(|_| seen),
+        },
+    );
+}
+
+/// Record a `tool_call_update`: refresh the call's summary, stamping
+/// `ended_at` on the first terminal status — later updates keep the
+/// original end.
+fn note_tool_call_update(turn: &mut Turn, update: ToolCallUpdate) {
+    let seen = jiff::Timestamp::now();
+    turn.latest_tool_call = Some(update.tool_call_id.clone());
+    let entry = turn
+        .tool_calls
+        .entry(update.tool_call_id.clone())
+        .or_insert_with(|| ToolCallSummary {
+            id: update.tool_call_id.clone(),
+            title: String::new(),
+            kind: None,
+            status: None,
+            locations: Vec::new(),
+            started_at: Some(seen),
+            ended_at: None,
+        });
+    if let Some(status) = update.status {
+        entry.status = Some(status);
+        if terminal_status(status) && entry.ended_at.is_none() {
+            entry.ended_at = Some(seen);
+        }
+    }
+    if let Some(title) = update.title {
+        entry.title = title;
+    }
+    if let Some(kind) = update.kind {
+        entry.kind = Some(kind);
+    }
+    if let Some(locations) = update.locations {
+        entry.locations = locations;
     }
 }
 

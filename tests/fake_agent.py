@@ -17,6 +17,9 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 - "KILL <cmd>" -> terminal/create, terminal/kill, then wait_for_exit and
   output; the kill's signal exit is recorded into the reply.
 - "wait" -> the prompt never completes until session/cancel.
+- "loops" -> a busy-looping turn that never completes: an edit call and
+  the standard call stay open ~0.3 s while three same-titled calls run
+  and close, leaving one long in-progress call.
 - "gather" -> the prompt completes once a steered prompt arrives; the
   steered text is recorded into the reply.
 - "die" -> the process exits mid-turn with status 3.
@@ -57,6 +60,8 @@ import json
 import os
 import shlex
 import sys
+import threading
+import time
 
 
 def send(message):
@@ -182,6 +187,64 @@ def begin_turn(request_id, text):
         {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "in_progress"},
     )
     if text in ("wait", "gather", "hold"):
+        return
+    if text == "loops":
+        # A busy-looping turn: tc-1 and an edit call stay in progress for
+        # ~0.3 s while three same-titled calls run, then everything closes
+        # but a long in-progress call — all inside any wait's window.
+        update(
+            session_id,
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-edit",
+                "title": "edit src/main.rs",
+                "kind": "edit",
+                "status": "in_progress",
+                "locations": [{"path": "/tmp/fake/src/main.rs", "line": 1}],
+            },
+        )
+        update(
+            session_id,
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-sleep",
+                "title": "run sleep 300",
+                "kind": "execute",
+                "status": "in_progress",
+            },
+        )
+
+        def loop_traffic():
+            time.sleep(0.3)
+            update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-1",
+                    "status": "completed",
+                },
+            )
+            for i in range(3):
+                update(
+                    session_id,
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": f"tc-loop-{i}",
+                        "title": "run check",
+                        "kind": "execute",
+                        "status": "completed",
+                    },
+                )
+            update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-edit",
+                    "status": "completed",
+                },
+            )
+
+        threading.Thread(target=loop_traffic, daemon=True).start()
         return
     if "PERMISSION" in text:
         new_request(
