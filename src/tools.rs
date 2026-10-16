@@ -57,6 +57,15 @@ const STEER_ACK: Duration = Duration::from_millis(250);
 /// <https://modelcontextprotocol.io/specification/2025-06-18/basic/utilities/progress>
 const NO_LISTENER_EXPECT_LIMIT: u64 = 600;
 
+/// Largest `expect_secs`/`max_wait_secs` a `wait`/`wait_any` accepts
+/// unless the call passes `long` — 30 minutes.
+///
+/// An acpsub session is a local subagent meant for short execution, so an
+/// armed wait beyond this is almost always a planning error rather than a
+/// real need: the caller must own it explicitly with `long`. A value
+/// equal to the limit still passes.
+const EXPECT_LIMIT: u64 = 1800;
+
 /// Build the full tool set over `state`.
 ///
 /// # Errors
@@ -290,20 +299,49 @@ fn wait_progress(sub: &Subagent, elapsed: f64, expect_secs: u64) -> Progress {
         .with_message(message)
 }
 
-/// Reject a blocked wait that could never return: without a progress
-/// listener the call stays silent until it returns, and a host abandons a
-/// silent `tools/call` long before an expectation beyond
-/// [`NO_LISTENER_EXPECT_LIMIT`] plays out.
+/// Reject a blocked wait that could never return or is armed unreasonably
+/// long.
+///
+/// Without a progress listener the call stays silent until it returns,
+/// and a host abandons a silent `tools/call` long before an expectation
+/// beyond [`NO_LISTENER_EXPECT_LIMIT`] plays out — that ceiling is a
+/// property of the transport, so `long` does not lift it. An expectation
+/// or wait deadline beyond [`EXPECT_LIMIT`] is a planning error unless
+/// the call passes `long`, which lifts the limit for that call only.
 ///
 /// # Errors
 ///
 /// Returns [`Error::ExpectExceedsNoToken`] when `!cx.is_listening()` and
-/// `expect_secs` exceeds the ceiling.
-const fn check_expect(cx: &ToolContext, expect_secs: u64) -> Result<()> {
+/// `expect_secs` exceeds the ceiling, and [`Error::ExpectExceedsLimit`]
+/// when `expect_secs` or `max_wait_secs` exceeds the limit without
+/// `long`.
+const fn check_expect(
+    cx: &ToolContext,
+    expect_secs: u64,
+    max_wait_secs: Option<u64>,
+    long: bool,
+) -> Result<()> {
     if !cx.is_listening() && expect_secs > NO_LISTENER_EXPECT_LIMIT {
         return Err(Error::ExpectExceedsNoToken {
             expect_secs,
             ceiling_secs: NO_LISTENER_EXPECT_LIMIT,
+        });
+    }
+    if !long && expect_secs > EXPECT_LIMIT {
+        return Err(Error::ExpectExceedsLimit {
+            field: "expect_secs",
+            secs: expect_secs,
+            limit_secs: EXPECT_LIMIT,
+        });
+    }
+    if !long
+        && let Some(secs) = max_wait_secs
+        && secs > EXPECT_LIMIT
+    {
+        return Err(Error::ExpectExceedsLimit {
+            field: "max_wait_secs",
+            secs,
+            limit_secs: EXPECT_LIMIT,
         });
     }
     Ok(())
@@ -1025,7 +1063,8 @@ struct WaitArgs {
     /// Required: how long the awaited turn is expected to take, in seconds.
     /// Measured from the turn's recorded start — re-issuing a wait never
     /// extends it. The wait returns early on any state change, so an
-    /// accurate expectation is free.
+    /// accurate expectation is free. Values beyond 1800 (30 minutes) are
+    /// rejected unless `long` is set.
     expect_secs: u64,
     /// Optional: the wait call's own deadline in seconds, measured from
     /// when the wait began — unlike `expect_secs` it bounds the wait, not
@@ -1033,8 +1072,15 @@ struct WaitArgs {
     /// the wait returns `state: "running"` with an activity `digest` of
     /// the window (fields documented on `ActivityDigest`), rather than
     /// dying silent under a caller-side kill limit — set it just below
-    /// the caller's own timeout.
+    /// the caller's own timeout. Values beyond 1800 are rejected unless
+    /// `long` is set.
     max_wait_secs: Option<u64>,
+    /// Optional: lift the 1800-second (30-minute) limit on `expect_secs`
+    /// and `max_wait_secs` for this call — a local subagent is meant for
+    /// short execution, so a wait armed longer is rejected as a planning
+    /// error without it.
+    #[serde(default)]
+    long: bool,
 }
 
 struct WaitTool {
@@ -1050,7 +1096,7 @@ impl Tool for WaitTool {
     type Res = Value;
 
     async fn call(&self, args: WaitArgs, mut cx: ToolContext) -> aither_core::Result<Value> {
-        check_expect(&cx, args.expect_secs)?;
+        check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let sub = self.state.get(&args.session_id)?;
         let started = Instant::now();
         let window_start = jiff::Timestamp::now();
@@ -1153,12 +1199,18 @@ struct WaitAnyArgs {
     session_ids: Vec<String>,
     /// Required: how long the awaited turns are expected to take, in
     /// seconds. Measured from each turn's recorded start — re-issuing a
-    /// wait never extends it.
+    /// wait never extends it. Values beyond 1800 (30 minutes) are
+    /// rejected unless `long` is set.
     expect_secs: u64,
     /// Optional: the wait call's own deadline in seconds, as in `wait` —
     /// on expiry the result is the longest-running watched turn's
-    /// `running` state with its activity `digest`.
+    /// `running` state with its activity `digest`. Values beyond 1800 are
+    /// rejected unless `long` is set.
     max_wait_secs: Option<u64>,
+    /// Optional: lift the 1800-second (30-minute) limit on `expect_secs`
+    /// and `max_wait_secs` for this call, as in `wait`.
+    #[serde(default)]
+    long: bool,
 }
 
 struct WaitAnyTool {
@@ -1174,7 +1226,7 @@ impl Tool for WaitAnyTool {
     type Res = Value;
 
     async fn call(&self, args: WaitAnyArgs, mut cx: ToolContext) -> aither_core::Result<Value> {
-        check_expect(&cx, args.expect_secs)?;
+        check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let subs = args
             .session_ids
             .iter()
@@ -2086,5 +2138,66 @@ impl Tool for ResumedTool {
             .expect("resume report poisoned")
             .clone();
         std::future::ready(Ok(serde_json::to_value(report).unwrap_or_default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aither_core::llm::tool::ProgressSink;
+
+    use super::*;
+
+    /// A sink that swallows reports, standing in for a listening caller.
+    struct Sink;
+
+    impl ProgressSink for Sink {
+        async fn report(&mut self, _progress: Progress) {}
+    }
+
+    /// The no-listener ceiling binds regardless of `long`: it is the
+    /// transport's limit — a silent call that long could never return.
+    #[test]
+    fn silent_expect_ceiling() {
+        let cx = ToolContext::new();
+        assert!(check_expect(&cx, 600, None, false).is_ok());
+        assert!(matches!(
+            check_expect(&cx, 601, None, false),
+            Err(Error::ExpectExceedsNoToken {
+                expect_secs: 601,
+                ceiling_secs: 600,
+            })
+        ));
+        assert!(matches!(
+            check_expect(&cx, 601, None, true),
+            Err(Error::ExpectExceedsNoToken { .. })
+        ));
+    }
+
+    /// The 30-minute limit on `expect_secs`/`max_wait_secs`: a value equal
+    /// to it passes, one second over is rejected naming the field, and
+    /// `long` lifts it for that call.
+    #[test]
+    fn expect_limit() {
+        let cx = ToolContext::with_progress(Sink);
+        assert!(check_expect(&cx, 1800, None, false).is_ok());
+        assert!(check_expect(&cx, 60, Some(1800), false).is_ok());
+        assert!(matches!(
+            check_expect(&cx, 1801, None, false),
+            Err(Error::ExpectExceedsLimit {
+                field: "expect_secs",
+                secs: 1801,
+                limit_secs: 1800,
+            })
+        ));
+        assert!(matches!(
+            check_expect(&cx, 60, Some(1801), false),
+            Err(Error::ExpectExceedsLimit {
+                field: "max_wait_secs",
+                secs: 1801,
+                limit_secs: 1800,
+            })
+        ));
+        assert!(check_expect(&cx, 7200, Some(7200), true).is_ok());
+        assert!(check_expect(&cx, 7200, None, false).is_err());
     }
 }

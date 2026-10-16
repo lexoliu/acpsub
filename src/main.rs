@@ -226,7 +226,8 @@ enum Command {
         /// Session id.
         session_id: String,
         /// Expected turn duration in seconds; an overrun returns early with
-        /// `state: "overrun"` for investigation.
+        /// `state: "overrun"` for investigation. Rejected above 1800 (30
+        /// minutes) unless --long.
         #[arg(long)]
         expect: u64,
         /// The wait's own deadline in seconds. When it passes with the
@@ -234,9 +235,16 @@ enum Command {
         /// activity `digest` of the window (shape documented in the
         /// README's `wait` entry) instead of dying silent under a
         /// background-task kill limit — set it just below that limit.
-        /// Overrun results carry the same digest.
+        /// Overrun results carry the same digest. Rejected above 1800
+        /// unless --long.
         #[arg(long)]
         max_wait: Option<u64>,
+        /// Lift the 1800-second (30-minute) limit on --expect and
+        /// --max-wait for this call: a local subagent is meant for short
+        /// execution, so a longer wait is rejected as a planning error
+        /// without it.
+        #[arg(long)]
+        long: bool,
         #[command(flatten)]
         conn: DaemonConn,
     },
@@ -244,14 +252,19 @@ enum Command {
     WaitAny {
         /// Session ids to watch.
         session_ids: Vec<String>,
-        /// Expected turn duration in seconds.
+        /// Expected turn duration in seconds. Rejected above 1800 (30
+        /// minutes) unless --long.
         #[arg(long)]
         expect: u64,
         /// The wait's own deadline in seconds, as in `wait`: on expiry the
         /// result is the longest-running watched turn's `state: "running"`
-        /// with its activity `digest`.
+        /// with its activity `digest`. Rejected above 1800 unless --long.
         #[arg(long)]
         max_wait: Option<u64>,
+        /// Lift the 1800-second (30-minute) limit on --expect and
+        /// --max-wait for this call, as in `wait`.
+        #[arg(long)]
+        long: bool,
         #[command(flatten)]
         conn: DaemonConn,
     },
@@ -491,9 +504,10 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
             session_id,
             expect,
             max_wait,
+            long,
             conn,
         } => {
-            let mut args = json!({"session_id": session_id, "expect_secs": expect});
+            let mut args = json!({"session_id": session_id, "expect_secs": expect, "long": long});
             set_if(&mut args, "max_wait_secs", max_wait);
             (conn, "wait", args)
         }
@@ -501,9 +515,10 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
             session_ids,
             expect,
             max_wait,
+            long,
             conn,
         } => {
-            let mut args = json!({"session_ids": session_ids, "expect_secs": expect});
+            let mut args = json!({"session_ids": session_ids, "expect_secs": expect, "long": long});
             set_if(&mut args, "max_wait_secs", max_wait);
             (conn, "wait_any", args)
         }

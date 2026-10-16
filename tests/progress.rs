@@ -23,7 +23,8 @@ use tokio::sync::mpsc;
 const TEST_INTERVAL_MS: u64 = 50;
 /// The `expect_secs` the tests wait against: beyond the no-listener
 /// ceiling, so only a progress-reporting call may proceed — and only the
-/// test's own `cancel` ends it.
+/// test's own `cancel` ends it. Beyond the 30-minute limit too, so these
+/// calls pass `long`.
 const EXPECT_SECS: u64 = 3600;
 
 /// Every report goes to the test's channel, stamped on arrival.
@@ -148,6 +149,93 @@ async fn silent_long_expect_is_rejected() {
     }
 }
 
+/// An `expect_secs`/`max_wait_secs` past the 30-minute limit is rejected
+/// even with a progress token — a local subagent is meant for short
+/// execution — unless the call passes `long`. The limit itself passes.
+#[tokio::test]
+async fn long_wait_requires_the_opt_in() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    // "hi" ends at once, so an accepted wait returns immediately.
+    let session_id = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    let sid = session_id.as_str();
+    let listening = || {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ToolContext::with_progress(Collect(tx))
+    };
+
+    for (name, field, args) in [
+        (
+            "wait",
+            "expect_secs",
+            json!({"session_id": sid, "expect_secs": 1801}),
+        ),
+        (
+            "wait_any",
+            "expect_secs",
+            json!({"session_ids": [sid], "expect_secs": 1801}),
+        ),
+        (
+            "wait",
+            "max_wait_secs",
+            json!({"session_id": sid, "expect_secs": 60, "max_wait_secs": 1801}),
+        ),
+        (
+            "wait_any",
+            "max_wait_secs",
+            json!({"session_ids": [sid], "expect_secs": 60, "max_wait_secs": 1801}),
+        ),
+    ] {
+        let error = match call_with(&tools, name, args, listening()).await {
+            Err(error) => error,
+            Ok(result) if result.is_error() => {
+                result.error_message().expect("error message").to_string()
+            }
+            Ok(result) => panic!(
+                "{name}: expected error, got {}",
+                result.render_for_model().unwrap_or_default()
+            ),
+        };
+        assert!(error.contains(field), "{name}: {error}");
+        assert!(error.contains("1801"), "{name}: {error}");
+        assert!(error.contains("1800"), "{name}: {error}");
+        assert!(error.contains("--long"), "{name}: {error}");
+    }
+
+    for (name, args) in [
+        ("wait", json!({"session_id": sid, "expect_secs": 1800})),
+        (
+            "wait_any",
+            json!({"session_ids": [sid], "expect_secs": 1800}),
+        ),
+        (
+            "wait",
+            json!({"session_id": sid, "expect_secs": 7200, "long": true}),
+        ),
+        (
+            "wait_any",
+            json!({"session_ids": [sid], "expect_secs": 7200, "long": true}),
+        ),
+        (
+            "wait",
+            json!({"session_id": sid, "expect_secs": 60, "max_wait_secs": 7200, "long": true}),
+        ),
+    ] {
+        let result = call_with(&tools, name, args, listening())
+            .await
+            .expect("call failed");
+        assert!(
+            !result.is_error(),
+            "{name}: {}",
+            result.error_message().unwrap_or("?")
+        );
+    }
+}
+
 /// A short expectation still waits normally with no progress token: it
 /// returns — here `overrun` — before any host idle limit could bite.
 #[tokio::test]
@@ -195,7 +283,7 @@ async fn wait_returns_the_turn_it_started_on() {
             call_with(
                 &tools,
                 "wait",
-                json!({"session_id": session_id, "expect_secs": EXPECT_SECS}),
+                json!({"session_id": session_id, "expect_secs": EXPECT_SECS, "long": true}),
                 ToolContext::with_progress(Collect(tx)),
             )
             .await
@@ -271,7 +359,7 @@ async fn wait_reports_progress_at_the_interval() {
     let seen = reports_while_blocked(
         &tools,
         "wait",
-        json!({"session_id": session_id, "expect_secs": EXPECT_SECS}),
+        json!({"session_id": session_id, "expect_secs": EXPECT_SECS, "long": true}),
         &session_id,
     )
     .await;
@@ -293,7 +381,7 @@ async fn wait_any_reports_progress_at_the_interval() {
     let seen = reports_while_blocked(
         &tools,
         "wait_any",
-        json!({"session_ids": [session_id], "expect_secs": EXPECT_SECS}),
+        json!({"session_ids": [session_id], "expect_secs": EXPECT_SECS, "long": true}),
         &session_id,
     )
     .await;

@@ -133,6 +133,20 @@ pub enum Error {
         request: String,
     },
 
+    /// A `wait`/`wait_any` expectation or deadline exceeded the
+    /// 30-minute limit without the call's `long` opt-in.
+    #[error(
+        "{field} {secs} exceeds the {limit_secs} s limit: pass `long` (--long) to arm a wait this long"
+    )]
+    ExpectExceedsLimit {
+        /// The rejected field (`expect_secs` or `max_wait_secs`).
+        field: &'static str,
+        /// The rejected value.
+        secs: u64,
+        /// The limit it exceeded.
+        limit_secs: u64,
+    },
+
     /// The chosen option was not offered by the permission request.
     #[error("option '{option}' was not offered by permission request '{request}' (offered: {})", .offered.join(", "))]
     BadOption {

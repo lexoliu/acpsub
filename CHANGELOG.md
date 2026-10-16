@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schedule — and the session's owner — persists in the registry, so
   both survive a daemon restart
   ([#56](https://github.com/lexoliu/acpsub/issues/56))
+- *(tools)* `wait`/`wait_any` reject `expect_secs`/`max_wait_secs`
+  (`--expect`/`--max-wait`) over 1800 s (30 minutes) unless the call
+  passes `long` (`--long`) — a local subagent is meant for short
+  execution, so a longer expectation is a planning error the caller must
+  own ([#61](https://github.com/lexoliu/acpsub/issues/61))
 
 ## [0.2.0](https://github.com/lexoliu/acpsub/compare/v0.1.0...v0.2.0) - 2026-09-16
 
