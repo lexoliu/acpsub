@@ -143,6 +143,71 @@ fn daemon_spawn_wait_result_close() {
     assert_eq!(closed["closed"], true, "{closed}");
 }
 
+/// `--expect`/`--max-wait` over 1800 s (30 minutes) are rejected unless
+/// `--long` is passed; the limit itself passes, and `--long` lifts it.
+#[test]
+fn wait_expect_limit() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    // "hi" ends at once, so an accepted wait returns immediately.
+    let spawned = daemon.call_json(&[
+        "spawn",
+        "--cwd",
+        &dir.path().to_string_lossy(),
+        "--model",
+        "b",
+        "--mode",
+        "bypass",
+        "--prompt",
+        "hi",
+    ]);
+    let sid = spawned["session_id"].as_str().expect("session_id");
+
+    for (args, field) in [
+        (vec!["wait", sid, "--expect", "1801"], "expect_secs"),
+        (vec!["wait-any", sid, "--expect", "1801"], "expect_secs"),
+        (
+            vec!["wait", sid, "--expect", "60", "--max-wait", "1801"],
+            "max_wait_secs",
+        ),
+        (
+            vec!["wait-any", sid, "--expect", "60", "--max-wait", "1801"],
+            "max_wait_secs",
+        ),
+    ] {
+        let output = daemon.run(&args).expect("client runs");
+        assert!(!output.status.success(), "{args:?} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(field), "{args:?}: {stderr}");
+        assert!(stderr.contains("1801"), "{args:?}: {stderr}");
+        assert!(stderr.contains("1800"), "{args:?}: {stderr}");
+        assert!(stderr.contains("--long"), "{args:?}: {stderr}");
+    }
+
+    for args in [
+        vec!["wait", sid, "--expect", "1800"],
+        vec!["wait-any", sid, "--expect", "1800"],
+        vec!["wait", sid, "--expect", "7200", "--long"],
+        vec!["wait-any", sid, "--expect", "7200", "--long"],
+        vec![
+            "wait",
+            sid,
+            "--expect",
+            "60",
+            "--max-wait",
+            "7200",
+            "--long",
+        ],
+    ] {
+        let done = daemon.call_json(&args);
+        assert_eq!(done["state"], "done", "{args:?}: {done}");
+    }
+}
+
 #[test]
 fn client_starts_daemon_when_absent() {
     if !python3() {

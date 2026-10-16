@@ -97,8 +97,8 @@ file that fails to parse is a tool error, never a stale fallback.
 | `spawn` | `cwd, prompt, model?, mode?, agent?, config?, permission?, owner?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. `model`/`mode` are required when the agent advertises a `model` option / session modes and must be omitted when it does not (the calls are skipped). Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. `owner` (a pid) lets the daemon reap the subagent when its coordinator exits. While a rate limit holds in the agent's quota scope the prompt parks instead: `{state: "rate_limited", resume_at, reason, position}`. |
 | `adopt` | `session_id, model?, mode?, agent?, cwd?, prompt?, permission?, owner?` | Take over an existing ACP session via `session/load` — a registered (closed) session, a live `exited` one (the dead runtime is reaped, no `close` needed), or an external one such as a Devin session created elsewhere. Same `model`/`mode` rule as `spawn`. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
 | `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled`/`failed` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not surface an error; agents configured `steer = "folded"` never answer it and the steer settles folded at the turn's end), returning `{state: "steered", turn}`. On a promptable subagent all three just start the turn: `{state: "running"}`. Under a rate limit in the session's quota scope, any policy's prompt parks and returns `{state: "rate_limited", resume_at, reason, position}`. |
-| `wait` | `session_id, expect_secs, max_wait_secs?` | Block until the turn ends, a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?, digest?, resume_at?, reason?}`; a turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. `max_wait_secs` bounds the wait call itself: when it passes first, the result is `state: "running"` with an activity `digest` (below). `overrun` results carry the same digest. A bound turn that ends rate-limited does not end the wait: it rebinds to the resume's continuation turn and freezes while parked — the parked seconds never count against `expect_secs` — and a parked session reports `state: "rate_limited"` with `resume_at` and the provider's `reason`. |
-| `wait_any` | `session_ids, expect_secs, max_wait_secs?` | First of them to leave `running` — a turn end, a permission request, or an `overrun`. On a `max_wait_secs` timeout, the longest-running watched turn's `running` state with its `digest`. |
+| `wait` | `session_id, expect_secs, max_wait_secs?, long?` | Block until the turn ends, a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. `expect_secs` and `max_wait_secs` over 1800 (30 minutes) are rejected unless `long` is set. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, pending_permission?, digest?, resume_at?, reason?}`; a turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. `max_wait_secs` bounds the wait call itself: when it passes first, the result is `state: "running"` with an activity `digest` (below). `overrun` results carry the same digest. A bound turn that ends rate-limited does not end the wait: it rebinds to the resume's continuation turn and freezes while parked — the parked seconds never count against `expect_secs` — and a parked session reports `state: "rate_limited"` with `resume_at` and the provider's `reason`. |
+| `wait_any` | `session_ids, expect_secs, max_wait_secs?, long?` | First of them to leave `running` — a turn end, a permission request, or an `overrun`. On a `max_wait_secs` timeout, the longest-running watched turn's `running` state with its `digest`. Same 1800-second limit and `long` opt-in as `wait`. |
 | `status` | `session_id` | State, cwd, agent, model, mode (`null` for agents without them), turns, queued prompts, transcript path — instant check; a parked session also reports `resume_at` and `reason`. |
 | `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
 | `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
@@ -127,6 +127,11 @@ is `overrun` with the turn's elapsed time and latest tool call — an
 overrun is a signal to investigate (`status`, `transcript`, a `send`
 steer), never to re-wait with a larger number. For an instant check use
 `status`.
+
+`expect_secs` and `max_wait_secs` are capped at 1800 s (30 minutes): a
+local subagent turn expected to run longer is almost always a
+misestimate, so a wait armed past the limit is rejected with an error
+naming the value — pass `long` (CLI `--long`) to lift it for that call.
 
 `max_wait_secs` is the cap on how long the wait call itself blocks —
 measured from when the wait began, unlike `expect_secs`. It exists
@@ -256,8 +261,8 @@ acpsub adopt   <session_id> [--model M] [--mode M] [--agent K] [--cwd DIR]
               [--prompt TEXT | --prompt-file FILE] [--permission P] [--owner PID]
 acpsub send    <session_id> --policy try|queued|steer
               --prompt TEXT | --prompt-file FILE
-acpsub wait    <session_id> --expect SECS [--max-wait SECS]
-acpsub wait-any <session_id>... --expect SECS [--max-wait SECS]
+acpsub wait    <session_id> --expect SECS [--max-wait SECS] [--long]
+acpsub wait-any <session_id>... --expect SECS [--max-wait SECS] [--long]
 acpsub status  <session_id>
 acpsub result  <session_id> [--turn N]
 acpsub cancel  <session_id>
