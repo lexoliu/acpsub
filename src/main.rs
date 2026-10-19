@@ -325,20 +325,11 @@ enum Command {
         #[command(flatten)]
         conn: DaemonConn,
     },
-    /// Begin a graceful daemon restart drain: new turns are refused with
-    /// `restarting`, in-flight work finishes, then every live session is
-    /// marked for resume and the daemon exits. Returns once the drain
-    /// began — unlike `restart` it does not wait for the exit, and the
-    /// next client call auto-starts the replacement.
-    Drain {
-        #[command(flatten)]
-        conn: DaemonConn,
-    },
-    /// Restart the daemon: it drains in-flight turns, closes every live
-    /// session marked for resume, and exits; the next daemon — started by
-    /// this call when none answers — re-adopts them under the same ids.
-    /// Returns once the new daemon finished resuming and prints the
-    /// resume report.
+    /// Restart the daemon: start the next generation, which takes the
+    /// socket over and adopts every session the old one was not running —
+    /// in-flight turns finish in the old daemon and their sessions follow
+    /// when they end. Returns once the new daemon is serving and prints
+    /// the resume report.
     Restart {
         #[command(flatten)]
         conn: DaemonConn,
@@ -547,7 +538,6 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
         Command::Close { session_id, conn } => (conn, "close", json!({"session_id": session_id})),
         Command::Forget { session_id, conn } => (conn, "forget", json!({"session_id": session_id})),
         Command::AgentsLive { conn } => (conn, "agents", json!({})),
-        Command::Drain { conn } => (conn, "daemon/drain", json!({})),
         _ => unreachable!("non-client commands are handled before `call`"),
     };
     let socket = conn.socket_path()?;
@@ -638,22 +628,39 @@ fn parse_config_options(pairs: &[String]) -> acpsub::Result<Value> {
     Ok(Value::Object(options))
 }
 
-/// `acpsub restart`: ask the daemon to drain, wait for its exit — the
-/// socket refusing connections is the signal the drain completed — then
-/// let the auto-started replacement resume every marked session. The
-/// `daemon/resumed` answer only exists once resuming finished, so it is
-/// the report this prints.
+/// `acpsub restart`: spawn the next daemon — it takes the socket over
+/// and adopts every session the old one hands off. The pid file naming
+/// a new generation is the takeover signal: the socket then reaches the
+/// new daemon, whose `daemon/resumed` answer is the report this prints.
 async fn restart(conn: DaemonConn) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let socket = conn.socket_path()?;
     if async_net::unix::UnixStream::connect(&socket).await.is_err() {
         return Err(format!("no acpsub daemon at {}", socket.display()).into());
     }
-    let ack =
-        acpsub::client::call(&socket, "daemon/drain", json!({}), conn.config.as_deref()).await?;
-    if ack.is_error {
-        return Ok(print_result(ack));
+    let pid_path = socket.with_extension("sock.pid");
+    let pid = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+    };
+    let mut child = acpsub::client::start_daemon(&socket, conn.config.as_deref())?;
+    let next = child.id();
+    // The new daemon names itself in the pid file once the public socket
+    // is its own; a daemon that exits first failed its takeover.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while pid(&pid_path) != Some(next) {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "the next daemon exited with {status} before taking over {}",
+                socket.display()
+            )
+            .into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("the next daemon never took over {}", socket.display()).into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    acpsub::client::wait_for_next_daemon(&socket).await?;
     let report =
         acpsub::client::call(&socket, "daemon/resumed", json!({}), conn.config.as_deref()).await?;
     Ok(print_result(report))

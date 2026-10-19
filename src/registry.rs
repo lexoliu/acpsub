@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use aither_acp::StopReason;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -17,7 +18,7 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// One registered session: everything needed to resume it, keyed in the
 /// registry by its ACP session id.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RegistryEntry {
     /// Agent config key that owns the session.
     pub agent: String,
@@ -53,17 +54,17 @@ pub struct RegistryEntry {
     /// schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limited: Option<RateLimited>,
-    /// Marked by a draining daemon: the next daemon re-adopts the session
+    /// Marked by a handing-over daemon: the next daemon re-adopts the session
     /// with `session/load` before accepting clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
 }
 
-/// The resume mark a draining daemon leaves on a live session's registry
+/// The resume mark a handing-over daemon leaves on a live session's registry
 /// entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Resume {
-    /// `send`-queued prompts the drain could not run — accepted sends
+    /// `send`-queued prompts the handing-over daemon did not run — accepted sends
     /// still run, so they ride the restart into the next daemon, which
     /// replays them into the session's queue after `session/load`.
     pub queued: Vec<String>,
@@ -72,10 +73,35 @@ pub struct Resume {
     /// next restart knows to retry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed: Option<String>,
+    /// How the session's last turn ended in the handing-over daemon: the
+    /// next daemon reports it after `session/load` instead of a fresh
+    /// `idle`, so a `wait` that lands after the handoff still sees the
+    /// turn it asked about end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<LastTurn>,
+}
+
+/// How a session's last turn ended, carried across a handoff.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LastTurn {
+    /// The turn finished with the agent's stop reason.
+    Done {
+        /// The agent's stop reason, in its ACP wire form.
+        #[schemars(with = "String")]
+        stop_reason: StopReason,
+    },
+    /// The turn was cancelled.
+    Cancelled,
+    /// The turn errored; the session takes another prompt.
+    Failed {
+        /// The error the turn ended with.
+        reason: String,
+    },
 }
 
 /// A session parked by its provider's rate limit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RateLimited {
     /// RFC 3339 timestamp the provider named for the reset.
     pub resume_at: String,

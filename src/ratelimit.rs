@@ -451,10 +451,18 @@ fn parked_next(state: &AppState) -> Option<jiff::Timestamp> {
 /// while the process lives, `session/load` on a fresh process when it is
 /// gone. The parked flag is consumed on the attempt — a session that
 /// cannot resume reports `failed`, a dead one stays registered for a
-/// manual `adopt`. A draining daemon leaves parked sessions alone: they
-/// hand off to the next daemon, whose scheduler owns the resume.
+/// manual `adopt`. A superseded daemon leaves parked sessions alone: they
+/// hand off to the next generation, whose scheduler owns the resume — and
+/// that scheduler skips any session an older generation still owns.
 async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
-    if state.draining() {
+    if state.handover.superseded.load(Ordering::Relaxed)
+        || state
+            .handover
+            .foreign
+            .lock()
+            .expect("foreign poisoned")
+            .contains_key(session_id)
+    {
         return;
     }
     if let Ok(sub) = state.get(session_id) {

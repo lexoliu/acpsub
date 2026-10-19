@@ -1,7 +1,7 @@
 //! The subagent model: per-subagent runtime state, the shared app state, and
 //! the spawn/turn machinery.
 
-use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
@@ -27,7 +27,7 @@ use tracing::{debug, warn};
 use crate::config::{AgentConfig, Config, ConfigValue, PermissionPolicy, SteerSemantics};
 use crate::error::{Error, Result};
 use crate::handler::{SubagentHandler, note_tool_call, note_tool_call_update};
-use crate::registry::{Registry, RegistryEntry, persist};
+use crate::registry::{LastTurn, Registry, RegistryEntry, persist};
 use crate::terminal::Terminals;
 use crate::transcript::TranscriptWriter;
 
@@ -70,8 +70,8 @@ pub struct AppState {
     pub limits_notify: Notify,
     /// Set once the resume scheduler is running.
     pub scheduler_started: AtomicBool,
-    /// Daemon drain/restart coordination.
-    pub drain: Drain,
+    /// Daemon-generation handover coordination.
+    pub handover: Handover,
     /// What this daemon's startup resume pass did — filled by
     /// [`crate::daemon::run`] before it accepts clients; empty everywhere
     /// else.
@@ -105,7 +105,7 @@ impl AppState {
             limits: Mutex::new(limits),
             limits_notify: Notify::new(),
             scheduler_started: AtomicBool::new(false),
-            drain: Drain::default(),
+            handover: Handover::default(),
             resume_report: Mutex::new(ResumeReport::default()),
         });
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -147,12 +147,6 @@ impl AppState {
             .ok_or_else(|| Error::UnknownSession(session_id.to_string()))
     }
 
-    /// Whether the daemon is draining for a restart — calls that would
-    /// start new work get [`Error::Restarting`].
-    pub fn draining(&self) -> bool {
-        self.drain.requested.load(Ordering::Relaxed)
-    }
-
     /// Mutate the registry, then persist the result.
     ///
     /// `registry_write` is held across both steps, so concurrent tool calls
@@ -171,6 +165,14 @@ impl AppState {
         let snapshot = {
             let mut registry = self.registry.lock().expect("registry poisoned");
             mutate(&mut registry);
+            // A superseded daemon stops persisting — the newest generation
+            // owns `registry.json`; this mutation still lands in memory and
+            // rides the next handoff or release report to it. The flag is
+            // set under `registry_write`, so a mutation serialized after
+            // the takeover is always reported rather than written.
+            if self.handover.superseded.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             registry.snapshot()
         }?;
         persist(&self.registry_path, snapshot).await
@@ -193,34 +195,65 @@ pub struct Reservation {
     pub forgotten: bool,
 }
 
-/// Daemon drain/restart coordination.
+/// Daemon-generation handover coordination.
 ///
-/// `requested` is set by the `daemon/drain` tool; the drain task it
-/// spawns waits for quiescence — woken by `progressed` on every turn end
-/// — then publishes `finished`, which the accept loop subscribes to so
-/// checking and waiting are one race-free primitive: a drain that
-/// completes between the loop's value check and its wait still lands.
-/// Turn ends all funnel through `finish_turn` — pending prompts resolve
-/// on connection close — so `progressed` covers every path to
-/// quiescence.
+/// A restart starts the next daemon first: it takes the public socket
+/// over, then calls `daemon/takeover` on this daemon's private socket,
+/// which sets `superseded`. The superseded daemon stops persisting the
+/// registry, keeps only sessions with a turn or launch in flight, hands
+/// each off as it settles — woken by `progressed`, which fires on every
+/// turn end, launch settle, and session departure — and publishes
+/// `finished` once it owns nothing, so the accept loop exits.
+///
+/// On the newest daemon `foreign` maps sessions an older generation
+/// still owns to that daemon's private socket — calls for them forward
+/// there until a `daemon/handoff` or `daemon/release` lands — and
+/// `resuming` holds the ids of sessions mid-`session/load` after a
+/// handoff.
 #[derive(Debug)]
-pub struct Drain {
-    /// A `daemon/drain` call began a drain: turn-starting calls are
-    /// refused with [`Error::Restarting`].
-    pub requested: AtomicBool,
-    /// Wakes the drain waiter when a turn ends.
+pub struct Handover {
+    /// A newer daemon told this one it is superseded. Registry persists
+    /// stop; in-flight sessions hand off as they settle.
+    pub superseded: AtomicBool,
+    /// The superseding daemon's private socket — handoff and release
+    /// reports go here while `superseded` holds. Also the relay target
+    /// for handovers this daemon receives after being superseded itself.
+    pub next: Mutex<Option<PathBuf>>,
+    /// Sessions another generation still owns, by that daemon's private
+    /// socket — calls for them forward there until the owner hands them
+    /// off or releases them.
+    pub foreign: Mutex<HashMap<String, PathBuf>>,
+    /// The superseded generation's private socket while it may still own
+    /// sessions this daemon has not heard of — a spawn it accepted on a
+    /// connection opened before the takeover. A call for a session this
+    /// daemon does not know forwards there; cleared once it stops
+    /// answering.
+    pub prev: Mutex<Option<PathBuf>>,
+    /// Sessions mid-resume after a handoff — a call for one waits on
+    /// `progressed` until the launch settles.
+    pub resuming: Mutex<HashSet<String>>,
+    /// Wakes the handover watcher on a superseded daemon and the
+    /// resuming-call waiters on the newest one.
     pub progressed: Notify,
-    /// `true` once the drain reached quiescence — no turn is running
-    /// anywhere — telling the accept loop to hand off and exit.
+    /// `true` once a superseded daemon owns nothing — the accept loop
+    /// exits.
     pub finished: tokio::sync::watch::Sender<bool>,
+    /// This daemon's private socket path — set by `daemon::run` once
+    /// bound; `daemon/takeover` names it for the sessions it keeps.
+    pub private_socket: Mutex<Option<PathBuf>>,
 }
 
-impl Default for Drain {
+impl Default for Handover {
     fn default() -> Self {
         Self {
-            requested: AtomicBool::new(false),
+            superseded: AtomicBool::new(false),
+            next: Mutex::new(None),
+            foreign: Mutex::new(HashMap::new()),
+            prev: Mutex::new(None),
+            resuming: Mutex::new(HashSet::new()),
             progressed: Notify::new(),
             finished: tokio::sync::watch::channel(false).0,
+            private_socket: Mutex::new(None),
         }
     }
 }
@@ -233,6 +266,11 @@ pub struct ResumeReport {
     pub resumed: Vec<String>,
     /// Sessions whose resume failed, with the agent's error.
     pub failed: Vec<ResumeFailure>,
+    /// Sessions the previous generation still owns or that are
+    /// mid-resume — they land here when their turn ends and the handoff
+    /// completes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<String>,
 }
 
 /// One session's failed resume in a [`ResumeReport`].
@@ -275,7 +313,37 @@ pub enum Status {
     Exited(String),
 }
 
+impl From<LastTurn> for Status {
+    fn from(last_turn: LastTurn) -> Self {
+        match last_turn {
+            LastTurn::Done { stop_reason } => Self::Done(stop_reason),
+            LastTurn::Cancelled => Self::Cancelled,
+            LastTurn::Failed { reason } => Self::Failed(reason),
+        }
+    }
+}
+
 impl Status {
+    /// How the last turn ended, when this status reports a finished one —
+    /// what a handoff carries to the next daemon.
+    #[must_use]
+    pub fn last_turn(&self) -> Option<LastTurn> {
+        match self {
+            Self::Done(stop_reason) => Some(LastTurn::Done {
+                stop_reason: *stop_reason,
+            }),
+            Self::Cancelled => Some(LastTurn::Cancelled),
+            Self::Failed(reason) => Some(LastTurn::Failed {
+                reason: reason.clone(),
+            }),
+            Self::Idle
+            | Self::Running
+            | Self::NeedsPermission
+            | Self::RateLimited { .. }
+            | Self::Exited(_) => None,
+        }
+    }
+
     /// Stable lowercase name used in tool output.
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -780,6 +848,7 @@ pub async fn launch(state: &Arc<AppState>, config: &Config, args: Launch) -> Res
             .lock()
             .expect("reserved poisoned")
             .remove(session_id);
+        state.handover.progressed.notify_waiters();
     }
     result
 }
@@ -1011,7 +1080,10 @@ async fn release_reservation(
         (released, reservation.forgotten)
     };
     match released {
-        Released::Clean => return Ok(()),
+        Released::Clean => {
+            state.handover.progressed.notify_waiters();
+            return Ok(());
+        }
         Released::Marked => end_session(state, sub).await,
         Released::Taken => {}
     }
@@ -1028,6 +1100,7 @@ async fn release_reservation(
             warn!(%session_id, %error, "registry persist failed");
         }
     }
+    state.handover.progressed.notify_waiters();
     Err(Error::ClosedWhileLaunching(session_id.to_string()))
 }
 
@@ -1512,7 +1585,7 @@ pub(crate) enum SessionEnd {
 pub(crate) fn end_target(state: &AppState, session_id: &str, forgotten: bool) -> SessionEnd {
     let mut live = state.live.lock().expect("live poisoned");
     let mut reserved = state.reserved.lock().expect("reserved poisoned");
-    match live.remove(session_id) {
+    let end = match live.remove(session_id) {
         Some(sub) => SessionEnd::Live(sub),
         None => match reserved.get_mut(session_id) {
             Some(reservation) => {
@@ -1522,7 +1595,11 @@ pub(crate) fn end_target(state: &AppState, session_id: &str, forgotten: bool) ->
             }
             None => SessionEnd::Missing,
         },
-    }
+    };
+    drop(reserved);
+    drop(live);
+    state.handover.progressed.notify_waiters();
+    end
 }
 
 /// Close a subagent: drop pending requests and queues, close the client, and
@@ -1618,6 +1695,7 @@ pub async fn end_session(state: &Arc<AppState>, sub: &Subagent) {
     sub.rt.closing.store(true, Ordering::Relaxed);
     unschedule_resume(state, &sub.session_id).await;
     close_sub(sub).await;
+    state.handover.progressed.notify_waiters();
 }
 
 /// Pump agent stderr into the tail buffer and tracing.
@@ -1735,19 +1813,12 @@ pub(crate) async fn begin_turn(
     let turn_n = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         let ready = match gate {
-            Gate::Check => prompt_slot_free(&inner) && !state.draining(),
+            // `closing` also blocks a fresh turn: a session mid-handoff to
+            // the next daemon generation must not start one here.
+            Gate::Check => prompt_slot_free(&inner) && !sub.rt.closing.load(Ordering::Relaxed),
             Gate::Chained => matches!(inner.status, Status::Running) && inner.current.is_none(),
         };
         if !ready {
-            // A draining daemon refuses to start new turns — the
-            // `restarting` marker is what the CLI client matches to wait
-            // for the next daemon and retry.
-            if state.draining() && matches!(gate, Gate::Check) {
-                return Err(Error::Restarting {
-                    detail: "the daemon is draining for a restart; new turns are refused"
-                        .to_string(),
-                });
-            }
             let status = if inner.status.accepts_prompt() {
                 "steer in flight".to_string()
             } else {
@@ -1958,6 +2029,7 @@ pub(crate) async fn steer_resolved(
             && inner.steer_pending.is_empty()
             && inner.current.is_none()
             && inner.status.accepts_prompt()
+            && !state.handover.superseded.load(Ordering::Relaxed)
             && !inner.queue.is_empty();
         let prompt = if kick {
             inner.status = Status::Running;
@@ -2012,11 +2084,13 @@ pub(crate) type PromptFut =
 /// (the status stays `running` — no `done` interlude), anything else settles
 /// `done`. A steered prompt still in flight may materialize as a turn ahead
 /// of the queue on the wire, so the queue pops only once they all resolve.
-/// Returns the prompt to chain, the prompts the queue dropped, and the ids
-/// of steers settled as folded.
+/// On a superseded daemon the queue never chains — it rides the session's
+/// handoff to the next generation instead. Returns the prompt to chain, the
+/// prompts the queue dropped, and the ids of steers settled as folded.
 fn settle_turn(
     rt: &SubRuntime,
     reason: StopReason,
+    superseded: bool,
 ) -> (Option<String>, VecDeque<String>, Vec<u64>) {
     let mut inner = rt.inner.lock().expect("inner poisoned");
     if let Some(mut turn) = inner.current.take() {
@@ -2032,7 +2106,8 @@ fn settle_turn(
     } else if reason == StopReason::Cancelled {
         inner.status = Status::Cancelled;
         (None, std::mem::take(&mut inner.queue))
-    } else if inner.steer_pending.is_empty()
+    } else if !superseded
+        && inner.steer_pending.is_empty()
         && let Some(next) = inner.queue.pop_front()
     {
         // The chained turn's slot is reserved now; `begin_turn` stamps its
@@ -2204,7 +2279,11 @@ async fn finish_turn(
             if let Err(error) = rt.transcript.lock().await.append(&record).await {
                 warn!(%error, "transcript write failed");
             }
-            let (next, dropped, folded) = settle_turn(rt, reason);
+            let (next, dropped, folded) = settle_turn(
+                rt,
+                reason,
+                state.handover.superseded.load(Ordering::Relaxed),
+            );
             record_steers_folded(rt, turn_n, folded).await;
             if let Some(prompt) = next {
                 spawn_chained(state.clone(), session_id.clone(), prompt, wire);
@@ -2279,7 +2358,7 @@ async fn finish_turn(
         warn!(%error, "registry persist failed");
     }
     rt.notify.notify_waiters();
-    state.drain.progressed.notify_waiters();
+    state.handover.progressed.notify_waiters();
 }
 
 /// Best-effort `cwd` discovery for `adopt`.

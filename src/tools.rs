@@ -113,15 +113,14 @@ pub fn build_tools_with_progress_interval(
     Ok(tools)
 }
 
-/// The daemon-only tools, registered by the socket server on top of the
-/// shared set: `daemon/drain` and `daemon/resumed` drive the graceful
-/// restart `acpsub restart` performs.
+/// The daemon-only tool, registered by the socket server on top of the
+/// shared set: `daemon/resumed` reports what a daemon's resume pass did
+/// after a restart.
 ///
 /// # Errors
 ///
 /// Returns an error if a tool fails to register.
 pub fn register_daemon_tools(tools: &mut Tools, state: Arc<AppState>) -> aither_core::Result<()> {
-    tools.register(DrainTool(state.clone()))?;
     tools.register(ResumedTool(state))?;
     Ok(())
 }
@@ -701,9 +700,6 @@ impl Tool for SpawnTool {
     type Res = Value;
 
     async fn call(&self, args: SpawnArgs, _cx: ToolContext) -> aither_core::Result<Value> {
-        if self.0.draining() {
-            return Err(restarting().into());
-        }
         let config = self.0.load_config()?;
         let (agent, _) = config.resolve_agent(args.agent.as_deref())?;
         let sub = launch(
@@ -777,9 +773,6 @@ impl Tool for AdoptTool {
     type Res = Value;
 
     async fn call(&self, args: AdoptArgs, _cx: ToolContext) -> aither_core::Result<Value> {
-        if self.0.draining() {
-            return Err(restarting().into());
-        }
         let registered = self
             .0
             .registry
@@ -907,12 +900,6 @@ impl Tool for SendTool {
     type Res = Value;
 
     async fn call(&self, args: SendArgs, _cx: ToolContext) -> aither_core::Result<Value> {
-        // A draining daemon refuses sends that would start a new turn;
-        // a steer into a turn that is still running still goes through —
-        // it does not extend the drain.
-        if self.0.draining() && !matches!(args.policy, SendPolicy::Steer) {
-            return Err(restarting().into());
-        }
         let sub = self.0.get(&args.session_id)?;
         // A quota gate for this agent's scope parks the prompt instead of
         // letting it burn a request that is bound to fail.
@@ -1863,6 +1850,21 @@ impl ListTool {
             .map(|(session_id, entry)| (session_id.clone(), closed_view(session_id, entry)))
             .collect();
         by_session.extend(live_views);
+        // A session an older daemon generation still owns is live, just
+        // not here — it lists as handing over, not closed.
+        for session_id in self
+            .0
+            .handover
+            .foreign
+            .lock()
+            .expect("foreign poisoned")
+            .keys()
+        {
+            if let Some(view) = by_session.get_mut(session_id) {
+                view["live"] = json!(true);
+                view["state"] = json!("handing_over");
+            }
+        }
         json!({"subagents": by_session.into_values().collect::<Vec<_>>()})
     }
 }
@@ -2087,66 +2089,14 @@ fn config_option_view(option: &ConfigOption) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// daemon/drain / daemon/resumed
+// daemon/resumed
 // ---------------------------------------------------------------------------
 
-/// The `restarting` refusal for work a draining daemon will not start.
-fn restarting() -> Error {
-    Error::Restarting {
-        detail: "the daemon is draining for a restart; new work is refused".to_string(),
-    }
-}
-
-/// Begin a graceful daemon restart: stop accepting new turns and
-/// session-binds — every call that would start one is refused with a
-/// `restarting` error — let in-flight turns and already-accepted queued
-/// prompts finish, then close every live session marked for resume and
-/// exit. The next daemon re-adopts them; `daemon/resumed` reports how the
-/// resume went. Refused while a drain is already in progress.
-#[derive(Debug, Deserialize, JsonSchema)]
-struct DrainArgs {}
-
-struct DrainTool(Arc<AppState>);
-
-impl Tool for DrainTool {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("daemon/drain")
-    }
-    type Arguments = DrainArgs;
-    type Res = Value;
-
-    fn call(
-        &self,
-        _args: DrainArgs,
-        _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        std::future::ready(self.drain().map_err(Into::into))
-    }
-}
-
-impl DrainTool {
-    /// Synchronous body: the drain runs in its own task, so the call only
-    /// flips the flag and spawns it.
-    fn drain(&self) -> Result<Value> {
-        if self
-            .0
-            .drain
-            .requested
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(Error::Restarting {
-                detail: "a drain is already in progress".to_string(),
-            });
-        }
-        tokio::spawn(crate::daemon::drain_sessions(self.0.clone()));
-        Ok(json!({"draining": true}))
-    }
-}
-
-/// Report what this daemon's startup resume pass did: which marked
-/// sessions came back live via `session/load` and which failed, with the
-/// agent's error. Both lists are empty on a daemon that did not start
-/// from a drain.
+/// Report what this daemon's resume did after a restart: which sessions
+/// came back live via `session/load` and which failed, with the agent's
+/// error, and which the previous generation still owns (their turn is
+/// still in flight — they hand off and resume when it ends). All lists
+/// are empty on a daemon that did not take over from a previous one.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ResumedArgs {}
 
@@ -2164,12 +2114,33 @@ impl Tool for ResumedTool {
         _args: ResumedArgs,
         _cx: ToolContext,
     ) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        let report = self
+        let mut report = self
             .0
             .resume_report
             .lock()
             .expect("resume report poisoned")
             .clone();
+        // Sessions still owned by the previous generation or mid-resume
+        // after its handoff.
+        let mut pending: Vec<String> = self
+            .0
+            .handover
+            .foreign
+            .lock()
+            .expect("foreign poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        pending.extend(
+            self.0
+                .handover
+                .resuming
+                .lock()
+                .expect("resuming poisoned")
+                .iter()
+                .cloned(),
+        );
+        report.pending = pending;
         std::future::ready(Ok(serde_json::to_value(report).unwrap_or_default()))
     }
 }

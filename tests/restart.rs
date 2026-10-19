@@ -1,16 +1,14 @@
-//! Graceful daemon restart through the socket: `acpsub daemon` drains its
-//! in-flight turns, marks every live session for resume, exits, and the
-//! auto-started replacement re-adopts them — while client calls in flight
-//! across the handoff reconnect and retry instead of failing.
+//! Daemon generation handover through the socket: `acpsub restart`
+//! starts the next daemon, which takes `daemon.sock` over and resumes
+//! every session the old one was not running — while in-flight turns
+//! finish in the old daemon, calls for its sessions forward to it, and
+//! client connections it already holds keep working.
 //!
 //! Sequencing is signal-driven, never timed: daemon readiness is the
 //! `daemon listening` line on its stderr, a turn's end is observed
-//! through `acpsub wait`, and "the drain's gate is closed" is the
-//! `daemon/drain` call's return — it answers only after the flag is set.
-//! The one transition with no client-visible signal is a parked
-//! session's scheduler resume (a `wait` on it returns the park, it does
-//! not block to the resume), so the rate-limit test asserts the park
-//! carried over instead of waiting the schedule out.
+//! through `acpsub wait`, the restart's own completion is the handover
+//! ordering, and a session's arrival on the new daemon is `status`
+//! reporting it live again.
 
 #[expect(
     dead_code,
@@ -32,8 +30,8 @@ use serde_json::Value;
 /// The agent set the restart tests need: `fake` (loadSession), `noload`
 /// (same script with `FAKE_NO_LOAD=1`, so `session/load` is refused) and
 /// `slowlimit` (every "ratelimit" prompt parks the turn after a 3 s delay
-/// and keeps the session parked for an 8 s window — long enough to drain
-/// and restart inside it).
+/// and keeps the session parked for an 8 s window — long enough to hand
+/// over inside it).
 fn agents() -> BTreeMap<String, acpsub::config::AgentConfig> {
     let fake = fake_agent_config();
     let mut agents = BTreeMap::new();
@@ -134,42 +132,27 @@ impl Daemon {
         );
     }
 
-    /// The daemon's pid — after a restart it is the replacement's.
-    fn pid(&self) -> u32 {
-        std::fs::read_to_string(self.socket.with_extension("sock.pid"))
-            .expect("pidfile")
-            .trim()
-            .parse()
-            .expect("pidfile is a pid")
-    }
-
     /// Run a client subcommand against this daemon.
     fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        Command::new(env!("CARGO_BIN_EXE_acpsub"))
-            .args(args)
-            .arg("--socket")
-            .arg(&self.socket)
-            .arg("--config")
-            .arg(&self.config)
-            .output()
+        self.command(args).output()
     }
 
     /// Run a client subcommand in a thread and return its handle.
     fn run_thread(&self, args: &[&str]) -> std::thread::JoinHandle<std::process::Output> {
-        let exe = PathBuf::from(env!("CARGO_BIN_EXE_acpsub"));
-        let socket = self.socket.clone();
-        let config = self.config.clone();
-        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        std::thread::spawn(move || {
-            Command::new(exe)
-                .args(&args)
-                .arg("--socket")
-                .arg(&socket)
-                .arg("--config")
-                .arg(&config)
-                .output()
-                .expect("client runs")
-        })
+        let mut command = self.command(args);
+        std::thread::spawn(move || command.output().expect("client runs"))
+    }
+
+    /// A client subcommand addressed to this daemon.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_acpsub"));
+        command
+            .args(args)
+            .arg("--socket")
+            .arg(&self.socket)
+            .arg("--config")
+            .arg(&self.config);
+        command
     }
 
     /// Run a client subcommand and return its stdout as JSON.
@@ -177,10 +160,25 @@ impl Daemon {
         let output = self.run(args).expect("client runs");
         assert!(
             output.status.success(),
-            "{args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "{args:?} failed: {}\nfirst daemon log:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            self.seen.lock().expect("seen").join("\n")
         );
         serde_json::from_slice(&output.stdout).expect("client output is json")
+    }
+
+    /// Poll `status` until `live` reports `want` or the deadline passes:
+    /// the real signal that a handoff — or a release — landed, bounded
+    /// instead of slept.
+    fn status_until(&self, session_id: &str, reached: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = self.call_json(&["status", session_id]);
+            if reached(&status) || Instant::now() >= deadline {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -191,17 +189,21 @@ impl Drop for Daemon {
         // A restarted daemon replaced the original child; its pid is in
         // the pidfile. Kill it so no test daemon outlives the test.
         if self.socket.with_extension("sock.pid").exists() {
-            let pid = self.pid().cast_signed();
+            let pid: i32 = std::fs::read_to_string(self.socket.with_extension("sock.pid"))
+                .expect("pidfile")
+                .trim()
+                .parse()
+                .expect("pidfile is a pid");
             unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
 }
 
-/// A drain with one running turn and one idle session: the turn finishes
-/// with its result recorded, and both sessions come back live under the
-/// same ids and owner.
+/// A turn in flight during the restart finishes in the old daemon; its
+/// session then comes back live under the same id on the new one, while
+/// an idle session was handed over and resumed immediately.
 #[test]
-fn drain_resumes_sessions() {
+fn inflight_turn_hands_off() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
@@ -246,69 +248,78 @@ fn drain_resumes_sessions() {
     let ended = daemon.call_json(&["wait", &b, "--expect", "60"]);
     assert_eq!(ended["state"], "done", "{ended}");
 
-    // Steering the open turn is what releases the drain — a steer is
-    // accepted whether or not the drain already began, so no ordering
-    // between the two calls is needed.
-    let restart = daemon.run_thread(&["restart"]);
-    let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
-    assert_eq!(steered["state"], "steered", "{steered}");
-
-    let output = restart.join().expect("restart thread");
+    // The restart completes while A's turn still runs: the new daemon is
+    // serving and reports A as still owned by the old one, and the idle
+    // session already resumed.
+    let output = daemon.run(&["restart"]).expect("restart runs");
     assert!(
         output.status.success(),
         "restart failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout).expect("restart output is json");
-    let resumed: Vec<&str> = report["resumed"]
-        .as_array()
-        .expect("resumed")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
-    assert!(resumed.contains(&a.as_str()), "{report}");
-    assert!(resumed.contains(&b.as_str()), "{report}");
-    assert_eq!(
-        report["failed"].as_array().expect("failed").len(),
-        0,
+    assert!(
+        report["resumed"]
+            .as_array()
+            .expect("resumed")
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|sid| sid == b),
+        "{report}"
+    );
+    assert!(
+        report["pending"]
+            .as_array()
+            .expect("pending")
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|sid| sid == a),
         "{report}"
     );
 
-    // `restart` returns only once resuming finished, so each session's
-    // restored state is a single read: live under the same id, its turn
-    // result still answering, its owner carried over.
-    for sid in [&a, &b] {
-        let status = daemon.call_json(&["status", sid]);
-        assert_eq!(status["state"], "idle", "{status}");
-        assert_eq!(status["live"], true, "{status}");
-        assert_eq!(status["turns"], 1, "{status}");
-    }
-    let result = daemon.call_json(&["result", &a, "--turn", "1"]);
-    assert_eq!(result["stop_reason"], "end_turn", "{result}");
+    // A's turn ends in the old daemon — its result is recorded — and the
+    // session hands over and resumes on the new one.
+    let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
+    assert_eq!(steered["state"], "steered", "{steered}");
+    let done = daemon.call_json(&["wait", &a, "--expect", "60"]);
+    assert_eq!(done["state"], "done", "{done}");
     assert!(
-        result["reply"]
-            .as_str()
-            .expect("reply")
-            .contains("steer:go"),
-        "{result}"
+        done["reply"].as_str().expect("reply").contains("steer:go"),
+        "{done}"
     );
+
+    // The handoff itself has no client signal; `status` going live on
+    // the new daemon is the observable arrival.
+    let status = daemon.status_until(&a, |status| status["live"] == true);
+    assert_eq!(status["state"], "done", "{status}");
+    assert_eq!(status["turns"], 1, "{status}");
+
+    // And it is a real session again: prompts run on the new daemon.
+    let sent = daemon.call_json(&["send", &a, "--policy", "try", "--prompt", "again"]);
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = daemon.call_json(&["wait", &a, "--expect", "60"]);
+    assert_eq!(done["state"], "done", "{done}");
 
     let registry: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("registry.json")).unwrap())
             .expect("registry is json");
-    for sid in [&a, &b] {
-        assert_eq!(
-            registry[sid]["owner"].as_u64().expect("owner"),
-            u64::from(std::process::id()),
-            "{registry}"
-        );
-    }
+    let entries = registry.as_object().expect("registry entries");
+    assert_eq!(entries.len(), 2, "{registry}");
+    assert!(entries.contains_key(&a), "{registry}");
+    assert!(entries.contains_key(&b), "{registry}");
+    // The old daemon's turn and the new daemon's both count: the single
+    // registry writer lost neither.
+    assert_eq!(
+        registry[&a]["turns"].as_u64().expect("turns"),
+        2,
+        "{registry}"
+    );
 }
 
-/// A `send` issued during the drain is refused with `restarting`; the
-/// client waits for the next daemon and retries — it does not fail.
+/// A spawn issued while a turn is in flight during the restart is served
+/// at once — no restart gate, no wait for the old daemon's turn.
 #[test]
-fn send_during_drain_retries() {
+fn spawn_during_restart_serves_immediately() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
@@ -332,7 +343,10 @@ fn send_during_drain_retries() {
         .expect("session_id")
         .to_string();
 
-    let idle = daemon.call_json(&[
+    // The spawn races the restart: whichever generation it lands on, it
+    // runs — the turn in flight on A does not block it.
+    let restart = daemon.run_thread(&["restart"]);
+    let spawn = daemon.run_thread(&[
         "spawn",
         "--cwd",
         &dir.path().to_string_lossy(),
@@ -343,41 +357,38 @@ fn send_during_drain_retries() {
         "--prompt",
         "hi",
     ]);
-    let b = idle["session_id"].as_str().expect("session_id").to_string();
-    let ended = daemon.call_json(&["wait", &b, "--expect", "60"]);
-    assert_eq!(ended["state"], "done", "{ended}");
 
-    // `drain` answers once the gate is closed — every turn-starting call
-    // after this return is refused. The drain itself waits on A's turn.
-    let drained = daemon.call_json(&["drain"]);
-    assert_eq!(drained["draining"], true, "{drained}");
-
-    // Issued while the drain is in progress: the call is refused, waits
-    // out the exit, and lands on the auto-started replacement.
-    let send = daemon.run_thread(&["send", &b, "--policy", "try", "--prompt", "after"]);
-
-    let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
-    assert_eq!(steered["state"], "steered", "{steered}");
-
-    let output = send.join().expect("send thread");
-    assert!(
-        output.status.success(),
-        "send failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let retried: Value = serde_json::from_slice(&output.stdout).expect("send output is json");
-    assert_eq!(retried["state"], "running", "{retried}");
-
+    let spawned: Value = serde_json::from_slice(&spawn.join().expect("spawn thread").stdout)
+        .expect("spawn output is json");
+    assert_eq!(spawned["state"], "running", "{spawned}");
+    let b = spawned["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
     let done = daemon.call_json(&["wait", &b, "--expect", "60"]);
     assert_eq!(done["state"], "done", "{done}");
     assert_eq!(done["reply"], "Hello abworld", "{done}");
+
+    let output = restart.join().expect("restart thread");
+    assert!(
+        output.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A's old-daemon turn still finishes and its session still follows.
+    let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
+    assert_eq!(steered["state"], "steered", "{steered}");
+    let done = daemon.call_json(&["wait", &a, "--expect", "60"]);
+    assert_eq!(done["state"], "done", "{done}");
+    let status = daemon.status_until(&a, |status| status["live"] == true);
+    assert_eq!(status["live"], true, "{status}");
 }
 
-/// A `wait` blocked across the restart treats the dropped connection as
-/// a restart, not a failure: it reconnects to the next daemon and answers
-/// with the awaited turn's recorded result.
+/// A `wait` bound on the old daemon's connection survives the socket
+/// rename — the answer comes from the turn that ended in the old daemon.
 #[test]
-fn wait_survives_restart() {
+fn wait_blocked_across_restart() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
@@ -385,9 +396,119 @@ fn wait_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path());
 
-    // A "ratelimit" prompt keeps the turn running ~3 s, then parks the
-    // session for an 8 s window — the bound wait follows the park and
-    // stays blocked through the drain and the exit.
+    let spawned = daemon.call_json(&[
+        "spawn",
+        "--cwd",
+        &dir.path().to_string_lossy(),
+        "--model",
+        "b",
+        "--mode",
+        "bypass",
+        "--prompt",
+        "gather",
+    ]);
+    let a = spawned["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // Bound while the turn runs; the connection lands on the old
+    // daemon's listener before the rename takes the socket over — or
+    // forwards through the new one if it is late. Either way it must
+    // answer, not fail.
+    let wait = daemon.run_thread(&["wait", &a, "--expect", "60"]);
+    let restart = daemon.run_thread(&["restart"]);
+
+    let output = restart.join().expect("restart thread");
+    assert!(
+        output.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
+    assert_eq!(steered["state"], "steered", "{steered}");
+
+    let output = wait.join().expect("wait thread");
+    assert!(
+        output.status.success(),
+        "wait failed across the restart: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let done: Value = serde_json::from_slice(&output.stdout).expect("wait output is json");
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(
+        done["reply"].as_str().expect("reply").contains("steer:go"),
+        "{done}"
+    );
+}
+
+/// Calls for a session the old generation still owns forward to it:
+/// `status` answers the live running state only the owner can have, and
+/// `cancel` ends its turn there — the session then follows.
+#[test]
+fn forwarded_calls_for_old_owned_session() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+
+    // "wait" never completes until cancelled: the session stays
+    // old-owned until its turn ends.
+    let spawned = daemon.call_json(&[
+        "spawn",
+        "--cwd",
+        &dir.path().to_string_lossy(),
+        "--model",
+        "b",
+        "--mode",
+        "bypass",
+        "--prompt",
+        "wait",
+    ]);
+    let a = spawned["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let output = daemon.run(&["restart"]).expect("restart runs");
+    assert!(
+        output.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The session is not live on the new daemon — a live "running"
+    // answer could only come from the owner the call forwarded to.
+    let status = daemon.call_json(&["status", &a]);
+    assert_eq!(status["live"], true, "{status}");
+    assert_eq!(status["state"], "running", "{status}");
+
+    // The cancel forwards too: it ends the turn in the old daemon, and
+    // the session hands over.
+    let cancelled = daemon.call_json(&["cancel", &a]);
+    assert_eq!(cancelled["cancelled"], true, "{cancelled}");
+
+    // The cancelled turn's end is `wait`'s return, wherever the session
+    // is by then.
+    let ended = daemon.call_json(&["wait", &a, "--expect", "60"]);
+    assert_eq!(ended["state"], "cancelled", "{ended}");
+}
+
+/// A parked session is handed over with its schedule: after the restart
+/// it is live on the new daemon, still `rate_limited`, scheduled by the
+/// new daemon's own scheduler.
+#[test]
+fn parked_session_follows_restart() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+
     let spawned = daemon.call_json(&[
         "spawn",
         "--cwd",
@@ -406,13 +527,12 @@ fn wait_survives_restart() {
         .expect("session_id")
         .to_string();
 
-    // Bound while the turn is still running; the drain ends when the
-    // turn parks — a parked session is quiescent work — so no park
-    // signal is needed: the restart's own completion is the ordering.
-    let wait = daemon.run_thread(&["wait", &a, "--expect", "60"]);
-    let restart = daemon.run_thread(&["restart"]);
+    // `wait` follows a park through to the resumed turn, so the park is
+    // observed on `status` — quiescent work that hands off at once.
+    let parked = daemon.status_until(&a, |status| status["state"] == "rate_limited");
+    assert_eq!(parked["state"], "rate_limited", "{parked}");
 
-    let output = restart.join().expect("restart thread");
+    let output = daemon.run(&["restart"]).expect("restart runs");
     assert!(
         output.status.success(),
         "restart failed: {}",
@@ -429,23 +549,10 @@ fn wait_survives_restart() {
         "{report}"
     );
 
-    let output = wait.join().expect("wait thread");
-    assert!(
-        output.status.success(),
-        "wait failed across the restart: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let done: Value = serde_json::from_slice(&output.stdout).expect("wait output is json");
-    // The re-issued wait lands inside the still-open window and answers
-    // with the awaited turn's recorded end.
-    assert_eq!(done["state"], "rate_limited", "{done}");
-    assert!(done["resume_at"].is_string(), "{done}");
-
-    // And the park carried over — the resumed session is re-parked under
-    // the same id, scheduled by the new daemon. The schedule's own
-    // resume has no client signal (a `wait` returns the park rather than
-    // blocking to it), so the assertion stops at the carried-over state.
-    let status = daemon.call_json(&["status", &a]);
+    // The schedule's own resume has no client signal (a `wait` returns
+    // the park rather than blocking to it), so the assertion stops at
+    // the carried-over state.
+    let status = daemon.status_until(&a, |status| status["live"] == true);
     assert_eq!(status["state"], "rate_limited", "{status}");
     assert!(status["resume_at"].is_string(), "{status}");
 }
