@@ -1,7 +1,7 @@
 //! The subagent model: per-subagent runtime state, the shared app state, and
 //! the spawn/turn machinery.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry};
 use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
@@ -47,9 +47,12 @@ pub struct AppState {
     pub transcript_dir: PathBuf,
     /// Live subagents by session id.
     pub live: Mutex<HashMap<String, Arc<Subagent>>>,
-    /// Session ids reserved by an in-flight `adopt`, before the subagent is
+    /// Session ids claimed by an in-flight `session/load` launch — an
+    /// `adopt` or a daemon resume — before the subagent is live. A
+    /// `close`/`forget` landing while the id is held marks the
+    /// reservation; the launch ends the session instead of returning it
     /// live. Locked after `live` wherever both are held.
-    pub reserved: Mutex<HashSet<String>>,
+    pub reserved: Mutex<HashMap<String, Reservation>>,
     /// The persisted session id → session registry.
     pub registry: Mutex<Registry>,
     /// Serializes registry mutations with their `persist` so the file can
@@ -95,7 +98,7 @@ impl AppState {
             config_path,
             transcript_dir: config.defaults.transcript_dir,
             live: Mutex::new(HashMap::new()),
-            reserved: Mutex::new(HashSet::new()),
+            reserved: Mutex::new(HashMap::new()),
             registry: Mutex::new(registry),
             registry_write: tokio::sync::Mutex::new(()),
             registry_path,
@@ -172,6 +175,22 @@ impl AppState {
         }?;
         persist(&self.registry_path, snapshot).await
     }
+}
+
+/// A `session/load` launch's claim on a session id.
+///
+/// Held from `launch`'s preflight until the session either goes live or
+/// fails, so a `close` or `forget` landing mid-launch is recorded
+/// instead of overtaken by the launch.
+#[derive(Debug, Default)]
+pub struct Reservation {
+    /// `close`/`forget` arrived while the launch was in flight: the
+    /// launch ends the session it just established rather than
+    /// returning it live.
+    pub closed: bool,
+    /// The in-flight end was a `forget`: the launch drops the session's
+    /// registry entry with it instead of leaving it adoptable.
+    pub forgotten: bool,
 }
 
 /// Daemon drain/restart coordination.
@@ -707,7 +726,9 @@ pub struct Launch {
 ///
 /// Returns [`Error::EmptySessionId`], [`Error::UnknownAgent`],
 /// [`Error::SessionLive`], [`Error::LoadUnsupported`],
-/// [`Error::SpawnFailed`], or [`Error::Agent`] when the ACP handshake fails.
+/// [`Error::SpawnFailed`], [`Error::ClosedWhileLaunching`] when a `close`
+/// landed while a `session/load` launch was in flight, or
+/// [`Error::Agent`] when the ACP handshake fails.
 /// The spawned process is killed on any error.
 ///
 /// # Panics
@@ -734,8 +755,14 @@ pub async fn launch(state: &Arc<AppState>, config: &Config, args: Launch) -> Res
                     Status::Exited(_)
                 )
             });
-            if (live.contains_key(session_id) && !husk) || !reserved.insert(session_id.clone()) {
+            if live.contains_key(session_id) && !husk {
                 return Err(Error::SessionLive(session_id.clone()));
+            }
+            match reserved.entry(session_id.clone()) {
+                Entry::Occupied(_) => return Err(Error::SessionLive(session_id.clone())),
+                Entry::Vacant(slot) => {
+                    slot.insert(Reservation::default());
+                }
             }
             drop(reserved);
             if husk { live.remove(session_id) } else { None }
@@ -882,11 +909,7 @@ async fn launch_inner(
     });
     go_live(state, &sub).await?;
     if let Some(session_id) = &args.load {
-        state
-            .reserved
-            .lock()
-            .expect("reserved poisoned")
-            .remove(session_id);
+        release_reservation(state, &sub, session_id).await?;
     }
     if let Some(prompt) = &args.prompt {
         // A quota gate for this agent parks the prompt instead of letting
@@ -932,6 +955,80 @@ async fn go_live(state: &Arc<AppState>, sub: &Arc<Subagent>) -> Result<()> {
         let _ = conn.await;
     }
     Err(Error::SessionLive(sub.session_id.clone()))
+}
+
+/// Release a `session/load` launch's claim on `session_id`, settling a
+/// `close`/`forget` that landed while the launch was in flight.
+///
+/// The release and the flag read sit in one critical section holding
+/// `live` then `reserved` — the lock order `launch`'s claim and
+/// `close`/`forget` both take — so the end is serialized either before
+/// `go_live` (the reservation carries its mark and the teardown is this
+/// launch's) or after it (the end took the ordinary live path and the
+/// session is already ending). Either way the result is
+/// [`Error::ClosedWhileLaunching`]; only a clean reservation and a still
+/// present live entry let the launch proceed.
+async fn release_reservation(
+    state: &Arc<AppState>,
+    sub: &Arc<Subagent>,
+    session_id: &str,
+) -> Result<()> {
+    /// What the release found.
+    enum Released {
+        /// No end landed — the session stays live.
+        Clean,
+        /// An end marked the reservation: this launch removed the
+        /// session from `live` and ends it below.
+        Marked,
+        /// An end took the ordinary live path in the gap between
+        /// `go_live` and the release — it is ending the session.
+        Taken,
+    }
+    let (released, forgotten) = {
+        let mut live = state.live.lock().expect("live poisoned");
+        // `end_target` locks `live` first, so holding it alone still
+        // serializes this section against a `close`/`forget`.
+        let reservation = state
+            .reserved
+            .lock()
+            .expect("reserved poisoned")
+            .remove(session_id)
+            .expect("reservation held until release");
+        // A second `close`/`forget` that landed after `go_live` may hold
+        // the teardown already: only whoever removed the live entry ends
+        // the session.
+        let released = if reservation.closed {
+            if live.remove(session_id).is_some() {
+                Released::Marked
+            } else {
+                Released::Taken
+            }
+        } else if live.contains_key(session_id) {
+            Released::Clean
+        } else {
+            Released::Taken
+        };
+        (released, reservation.forgotten)
+    };
+    match released {
+        Released::Clean => return Ok(()),
+        Released::Marked => end_session(state, sub).await,
+        Released::Taken => {}
+    }
+    // A `forget` takes the registry entry with the session: the
+    // handshake's `register_session` may have re-created it after
+    // `forget`'s own removal.
+    if forgotten {
+        let result = state
+            .update_registry(|registry| {
+                registry.remove(session_id);
+            })
+            .await;
+        if let Err(error) = result {
+            warn!(%session_id, %error, "registry persist failed");
+        }
+    }
+    Err(Error::ClosedWhileLaunching(session_id.to_string()))
 }
 
 /// Spawn the child process, capture its stderr, and connect the ACP client.
@@ -1380,6 +1477,52 @@ fn on_disconnect(rt: &SubRuntime) {
     // launchd orphans unless the group is swept.
     rt.kill_process_tree();
     rt.notify.notify_waiters();
+}
+
+/// Where ending a session id found it.
+#[derive(Debug)]
+pub(crate) enum SessionEnd {
+    /// A live subagent — removed from `live`; the caller tears it down.
+    Live(Arc<Subagent>),
+    /// A session id claimed by an in-flight `session/load` launch: the
+    /// reservation is marked so the launch ends the session as it lands
+    /// instead of overtaking this end.
+    Launching,
+    /// Neither live nor claimed.
+    Missing,
+}
+
+/// Find where ending `session_id` lands.
+///
+/// Removes the id from `live`, or marks its in-flight launch's
+/// reservation closed, under one `live`-then-`reserved` critical
+/// section — the lock order `launch`'s claim and [`release_reservation`]
+/// take — so the end is serialized against the release: it either marks
+/// the reservation before `go_live` or finds the session live after it,
+/// never slipping between the two.
+///
+/// `forgotten` is `forget`'s end: the launch drops the registry entry
+/// with the session instead of leaving it adoptable.
+///
+/// Shared by the `close` and `forget` tools.
+#[expect(
+    clippy::option_if_let_else,
+    reason = "the else arm mutates under the `reserved` lock — a match keeps the lock order legible"
+)]
+pub(crate) fn end_target(state: &AppState, session_id: &str, forgotten: bool) -> SessionEnd {
+    let mut live = state.live.lock().expect("live poisoned");
+    let mut reserved = state.reserved.lock().expect("reserved poisoned");
+    match live.remove(session_id) {
+        Some(sub) => SessionEnd::Live(sub),
+        None => match reserved.get_mut(session_id) {
+            Some(reservation) => {
+                reservation.closed = true;
+                reservation.forgotten |= forgotten;
+                SessionEnd::Launching
+            }
+            None => SessionEnd::Missing,
+        },
+    }
 }
 
 /// Close a subagent: drop pending requests and queues, close the client, and

@@ -23,9 +23,10 @@ use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Gate, Launch, Status, Subagent, ToolCallSummary, Turn, begin_turn, close_sub,
-    end_session, launch, next_turn_number, prompt_slot_free, record_queue_dropped, spawn_turn_task,
-    start_turn, steer_resolved, steer_turn, steer_waiter, unschedule_resume,
+    AppState, Gate, Launch, SessionEnd, Status, Subagent, ToolCallSummary, Turn, begin_turn,
+    close_sub, end_session, end_target, launch, next_turn_number, prompt_slot_free,
+    record_queue_dropped, spawn_turn_task, start_turn, steer_resolved, steer_turn, steer_waiter,
+    unschedule_resume,
 };
 use crate::transcript::{RenderOptions, render};
 
@@ -1886,30 +1887,32 @@ impl Tool for CloseTool {
     type Res = Value;
 
     async fn call(&self, args: CloseArgs, _cx: ToolContext) -> aither_core::Result<Value> {
-        let sub = {
-            self.0
-                .live
-                .lock()
-                .expect("live poisoned")
-                .remove(&args.session_id)
-        };
-        match sub {
-            Some(sub) => {
+        match end_target(&self.0, &args.session_id, false) {
+            SessionEnd::Live(sub) => {
                 end_session(&self.0, &sub).await;
                 Ok(json!({"session_id": args.session_id, "closed": true}))
             }
-            None if self
-                .0
-                .registry
-                .lock()
-                .expect("registry poisoned")
-                .get(&args.session_id)
-                .is_some() =>
+            SessionEnd::Launching => {
+                unschedule_resume(&self.0, &args.session_id).await;
+                Ok(json!({
+                    "session_id": args.session_id,
+                    "closed": true,
+                    "launch_in_flight": true,
+                }))
+            }
+            SessionEnd::Missing
+                if self
+                    .0
+                    .registry
+                    .lock()
+                    .expect("registry poisoned")
+                    .get(&args.session_id)
+                    .is_some() =>
             {
                 unschedule_resume(&self.0, &args.session_id).await;
                 Ok(json!({"session_id": args.session_id, "closed": true, "was_live": false}))
             }
-            None => Err(Error::UnknownSession(args.session_id).into()),
+            SessionEnd::Missing => Err(Error::UnknownSession(args.session_id).into()),
         }
     }
 }
@@ -1932,14 +1935,12 @@ impl Tool for ForgetTool {
     type Res = Value;
 
     async fn call(&self, args: ForgetArgs, _cx: ToolContext) -> aither_core::Result<Value> {
-        let sub = {
-            self.0
-                .live
-                .lock()
-                .expect("live poisoned")
-                .remove(&args.session_id)
-        };
-        if let Some(sub) = &sub {
+        // Same in-flight handling as `close`: a `session/load` launch
+        // holding the id gets its reservation marked closed and
+        // forgotten — `release_reservation` ends the session as it lands
+        // and drops the registry entry it may have re-created.
+        let found = end_target(&self.0, &args.session_id, true);
+        if let SessionEnd::Live(sub) = &found {
             close_sub(sub).await;
         }
         let mut registered = false;
@@ -1948,10 +1949,17 @@ impl Tool for ForgetTool {
                 registered = registry.remove(&args.session_id);
             })
             .await?;
-        if sub.is_none() && !registered {
-            return Err(Error::UnknownSession(args.session_id).into());
+        match found {
+            SessionEnd::Launching => Ok(json!({
+                "session_id": args.session_id,
+                "forgotten": true,
+                "launch_in_flight": true,
+            })),
+            SessionEnd::Missing if !registered => {
+                Err(Error::UnknownSession(args.session_id).into())
+            }
+            _ => Ok(json!({"session_id": args.session_id, "forgotten": true})),
         }
-        Ok(json!({"session_id": args.session_id, "forgotten": true}))
     }
 }
 

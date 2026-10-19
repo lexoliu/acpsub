@@ -64,6 +64,11 @@ pub enum Error {
     #[error("session '{0}' is already live; close it first")]
     SessionLive(String),
 
+    /// A `close` landed while the session's `session/load` launch was in
+    /// flight; the launch ended the session instead of returning it live.
+    #[error("session '{0}' was closed while it was launching")]
+    ClosedWhileLaunching(String),
+
     /// The agent does not advertise the `loadSession` capability.
     #[error("agent '{0}' does not support session/load; it cannot adopt sessions")]
     LoadUnsupported(String),

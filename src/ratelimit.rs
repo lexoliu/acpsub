@@ -21,6 +21,7 @@ use aither_acp::ClientError;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use crate::error::Error;
 use crate::registry::Registry;
 use crate::state::{
     AppState, Gate, Launch, Status, Subagent, begin_turn, launch, now, spawn_turn_task,
@@ -550,8 +551,15 @@ async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
     )
     .await;
     if let Err(error) = result {
-        warn!(%session_id, %error, "rate-limited resume failed");
-        clear_parked(state, session_id).await;
+        // A `close` that landed while the `session/load` was in flight
+        // ended the session on purpose and already consumed the parked
+        // flag — not a resume failure.
+        if matches!(error, Error::ClosedWhileLaunching(_)) {
+            debug!(%session_id, "rate-limited session closed while resuming");
+        } else {
+            warn!(%session_id, %error, "rate-limited resume failed");
+            clear_parked(state, session_id).await;
+        }
     }
 }
 

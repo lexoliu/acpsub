@@ -4,10 +4,12 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use acpsub::Status;
 use acpsub::config::AgentConfig;
-use aither_core::llm::tool::Tools;
+use aither_core::llm::tool::{ToolResult, Tools};
 use common::*;
 use serde_json::json;
 
@@ -1784,6 +1786,241 @@ async fn close_keeps_session_registered() {
     assert!(err.contains("unknown session"), "{err}");
 }
 
+/// The `gated` agent for ending an `adopt` mid-`session/load`: a `bash`
+/// wrapper records its pid in `pid_file` so the test can prove the
+/// process was reaped, and `FAKE_LOAD_GATE` holds its `session/load`
+/// answer until `gate` exists — the launch stays in flight
+/// deterministically.
+#[cfg(unix)]
+fn gated_agent(gate: &Path, pid_file: &Path) -> AgentConfig {
+    let mut gated = fake_agent_config();
+    gated.command = "bash".to_string();
+    gated.args = vec![
+        "-c".to_string(),
+        format!(
+            "echo $$ > \"$AGENT_PID_FILE\"; exec python3 {:?}",
+            fake_agent_script()
+        ),
+    ];
+    gated.env = BTreeMap::from([
+        (
+            "AGENT_PID_FILE".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ),
+        (
+            "FAKE_LOAD_GATE".to_string(),
+            gate.to_string_lossy().into_owned(),
+        ),
+    ]);
+    gated
+}
+
+/// A tool set over the `gated` agent, with the gate and pid-file paths
+/// the agent was given.
+#[cfg(unix)]
+fn gated_tools(dir: &Path) -> (Arc<acpsub::AppState>, Arc<Tools>, PathBuf, PathBuf) {
+    let gate = dir.join("load.gate");
+    let pid_file = dir.join("agent.pid");
+    let (state, tools) = test_state_with_agents(
+        dir,
+        &BTreeMap::from([("gated".to_string(), gated_agent(&gate, &pid_file))]),
+    );
+    (state, Arc::new(tools), gate, pid_file)
+}
+
+/// Spawn an `adopt` of `session_id` on `gated` (with a prompt) as a task.
+#[cfg(unix)]
+fn spawn_gated_adopt(
+    tools: &Arc<Tools>,
+    cwd: &Path,
+    session_id: &str,
+) -> tokio::task::JoinHandle<Result<ToolResult, String>> {
+    let args = json!({"session_id": session_id, "agent": "gated", "cwd": cwd,
+                      "prompt": "hi", "model": "b", "mode": "bypass"});
+    let tools = tools.clone();
+    tokio::spawn(async move { call(&tools, "adopt", args).await })
+}
+
+/// Wait until `session_id` is claimed in `reserved` — the signal a
+/// `session/load` launch is in flight (the claim precedes the gated
+/// `session/load` call).
+#[cfg(unix)]
+async fn await_reserved(state: &acpsub::AppState, session_id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !state
+        .reserved
+        .lock()
+        .expect("reserved")
+        .contains_key(session_id)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no launch claimed {session_id}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Unwrap the adopt task's outcome into its error message.
+#[cfg(unix)]
+fn adopt_error(outcome: Result<ToolResult, String>) -> String {
+    match outcome {
+        Err(error) => error,
+        Ok(result) if result.is_error() => {
+            result.error_message().expect("error message").to_string()
+        }
+        Ok(result) => panic!(
+            "adopt returned a session after the end: {}",
+            result.render_for_model().unwrap_or_default()
+        ),
+    }
+}
+
+/// The agent pid recorded by the `gated` wrapper.
+#[cfg(unix)]
+fn recorded_pid(pid_file: &Path) -> i32 {
+    std::fs::read_to_string(pid_file)
+        .expect("agent pid file")
+        .trim()
+        .parse()
+        .expect("pid")
+}
+
+/// A `close` landing while an `adopt`'s `session/load` is still in
+/// flight is not overtaken by the launch: `close` marks the session id's
+/// reservation, the launch ends the session it just established, and
+/// `adopt` reports the closed-while-launching error.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn close_during_in_flight_adopt() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools, gate, pid_file) = gated_tools(dir.path());
+
+    let adopt = spawn_gated_adopt(&tools, dir.path(), "ext-7");
+    await_reserved(&state, "ext-7").await;
+
+    let closed = call_json(&tools, "close", json!({"session_id": "ext-7"})).await;
+    assert_eq!(closed["closed"], true, "{closed}");
+    assert_eq!(closed["launch_in_flight"], true, "{closed}");
+
+    // Open the gate: the `session/load` answers, the launch finds the
+    // marked reservation, and ends the session it just established.
+    std::fs::write(&gate, "go").expect("open gate");
+    let err = adopt_error(adopt.await.expect("adopt task"));
+    assert!(err.contains("ext-7"), "{err}");
+    assert!(err.contains("closed while it was launching"), "{err}");
+
+    // The session never came live; the id claim was released.
+    assert!(state.get("ext-7").is_err(), "session is live after close");
+    assert!(
+        state.reserved.lock().expect("reserved").is_empty(),
+        "reservation leaked"
+    );
+    let status = call_json(&tools, "status", json!({"session_id": "ext-7"})).await;
+    assert_eq!(status["state"], "closed", "{status}");
+    assert_eq!(status["live"], false, "{status}");
+    let list = call_json(&tools, "list", json!({})).await;
+    let entry = list["subagents"]
+        .as_array()
+        .expect("subagents")
+        .iter()
+        .find(|sub| sub["session_id"] == "ext-7")
+        .expect("session still listed");
+    assert_eq!(entry["state"], "closed", "{entry}");
+    assert_eq!(entry["live"], false, "{entry}");
+
+    // The adopt's prompt never ran: no prompt record reached the
+    // transcript — only the `session/load` update.
+    let transcript =
+        std::fs::read_to_string(dir.path().join("transcripts/ext-7.jsonl")).expect("transcript");
+    assert!(!transcript.contains("\"prompt\""), "{transcript}");
+
+    // The agent process was reaped.
+    assert_dead(recorded_pid(&pid_file)).await;
+
+    // The freed id adopts cleanly.
+    let adopted = call_json(
+        &tools,
+        "adopt",
+        json!({"session_id": "ext-7", "agent": "gated", "cwd": dir.path(),
+               "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    assert_eq!(adopted["session_id"], "ext-7", "{adopted}");
+}
+
+/// `forget` during an in-flight `adopt` is the same defect as `close`:
+/// it marks the reservation closed and forgotten, the launch ends the
+/// session, and the registry entry goes with it — the launch's own
+/// `register_session` does not resurrect it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn forget_during_in_flight_adopt() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools, gate, pid_file) = gated_tools(dir.path());
+
+    // A registered session: spawn and close a `gated` subagent so the
+    // entry exists for the in-flight adopt to forget.
+    let mut args = spawn_args(dir.path(), "hi");
+    args["agent"] = json!("gated");
+    let sid = spawn_id(&tools, args).await;
+    wait(&tools, &sid, 60).await;
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+
+    let adopt = spawn_gated_adopt(&tools, dir.path(), &sid);
+    await_reserved(&state, &sid).await;
+
+    let forgotten = call_json(&tools, "forget", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(forgotten["forgotten"], true, "{forgotten}");
+    assert_eq!(forgotten["launch_in_flight"], true, "{forgotten}");
+
+    std::fs::write(&gate, "go").expect("open gate");
+    let err = adopt_error(adopt.await.expect("adopt task"));
+    assert!(err.contains(sid.as_str()), "{err}");
+    assert!(err.contains("closed while it was launching"), "{err}");
+
+    // The session never came live; the id claim was released.
+    assert!(
+        state.get(sid.as_str()).is_err(),
+        "session is live after forget"
+    );
+    assert!(
+        state.reserved.lock().expect("reserved").is_empty(),
+        "reservation leaked"
+    );
+
+    // The registry entry is gone: `forget` removed it and the launch's
+    // `register_session` — which ran after, once the gate opened — did
+    // not leave a new one behind.
+    let err = call_err(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert!(err.contains("unknown session"), "{err}");
+    let list = call_json(&tools, "list", json!({})).await;
+    assert!(
+        list["subagents"]
+            .as_array()
+            .expect("subagents")
+            .iter()
+            .all(|sub| sub["session_id"] != sid),
+        "{list}"
+    );
+    let registry: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("registry.json")).expect("registry"),
+    )
+    .expect("registry is json");
+    assert!(registry.get(sid.as_str()).is_none(), "{registry}");
+
+    // The agent process was reaped.
+    assert_dead(recorded_pid(&pid_file)).await;
+}
+
 /// `WRITE <path>` has the agent call `fs/write_text_file`: writes inside the
 /// session cwd succeed, writes outside are refused unless the agent sets
 /// `allow_outside_cwd`.
@@ -2321,8 +2558,12 @@ async fn rate_limit_parks_turn_and_resumes() {
     assert!(registry.contains(resume_at), "{registry}");
 
     // No coordinator call moves it: the scheduler fires the
-    // continuation at resume_at, in this session.
-    let text = transcript_eventually(&tools, sid.as_str(), "rate limit has lifted").await;
+    // continuation at resume_at, in this session. The `done` status is
+    // the ordering signal — the resume's turn settled — so both records
+    // are on the transcript when it is read.
+    status_becomes(&state, sid.as_str(), "done").await;
+    let text = call_text(&tools, "transcript", json!({"session_id": sid.as_str()})).await;
+    assert!(text.contains("rate limit has lifted"), "{text}");
     assert!(text.contains("END rate_limited"), "{text}");
     assert!(text.contains("END end_turn"), "{text}");
 }
