@@ -19,7 +19,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,10 +56,10 @@ fn agents() -> BTreeMap<String, acpsub::config::AgentConfig> {
     agents
 }
 
-/// A running `acpsub daemon` on a tempdir socket; killed on drop — which
-/// covers its restarted replacement too, through the pidfile.
+/// A running `acpsub daemon` on a tempdir socket; its guard stops it on
+/// drop, along with every replacement a restart auto-started.
 struct Daemon {
-    child: Child,
+    guard: DaemonGuard,
     socket: PathBuf,
     config: PathBuf,
     /// Lines the daemon writes to stderr, in order.
@@ -101,7 +101,7 @@ impl Daemon {
             }
         });
         let daemon = Self {
-            child,
+            guard: DaemonGuard::new(socket.clone(), Some(child)),
             socket,
             config,
             lines,
@@ -137,10 +137,16 @@ impl Daemon {
         self.command(args).output()
     }
 
-    /// Run a client subcommand in a thread and return its handle.
+    /// Run a client subcommand in a thread and return its handle. The
+    /// thread holds an in-flight token until the client exits, so a
+    /// teardown the test panics into waits the client out.
     fn run_thread(&self, args: &[&str]) -> std::thread::JoinHandle<std::process::Output> {
         let mut command = self.command(args);
-        std::thread::spawn(move || command.output().expect("client runs"))
+        let in_flight = self.guard.in_flight();
+        std::thread::spawn(move || {
+            let _in_flight = in_flight;
+            command.output().expect("client runs")
+        })
     }
 
     /// A client subcommand addressed to this daemon.
@@ -178,23 +184,6 @@ impl Daemon {
                 return status;
             }
             std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // A restarted daemon replaced the original child; its pid is in
-        // the pidfile. Kill it so no test daemon outlives the test.
-        if self.socket.with_extension("sock.pid").exists() {
-            let pid: i32 = std::fs::read_to_string(self.socket.with_extension("sock.pid"))
-                .expect("pidfile")
-                .trim()
-                .parse()
-                .expect("pidfile is a pid");
-            unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
 }
@@ -280,7 +269,7 @@ fn inflight_turn_hands_off() {
     // A's turn ends in the old daemon — its result is recorded — and the
     // session hands over and resumes on the new one.
     let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
     let done = daemon.call_json(&["wait", &a, "--expect", "60"]);
     assert_eq!(done["state"], "done", "{done}");
     assert!(
@@ -378,7 +367,7 @@ fn spawn_during_restart_serves_immediately() {
 
     // A's old-daemon turn still finishes and its session still follows.
     let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
     let done = daemon.call_json(&["wait", &a, "--expect", "60"]);
     assert_eq!(done["state"], "done", "{done}");
     let status = daemon.status_until(&a, |status| status["live"] == true);
@@ -427,7 +416,7 @@ fn wait_blocked_across_restart() {
     );
 
     let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
 
     let output = wait.join().expect("wait thread");
     assert!(

@@ -2,7 +2,7 @@
 name = "acpsub"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 readme = "README.md"
 description = "Any ACP agent as a resumable subagent over MCP"

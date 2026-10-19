@@ -94,7 +94,8 @@ enum SendPolicy {
     Try,
     /// Park the prompt on the subagent's FIFO queue.
     Queued,
-    /// Inject the prompt into the running turn.
+    /// Inject the prompt into the running turn; returns `submitted` at
+    /// once — `status` and `wait` report how it resolved.
     Steer,
 }
 
