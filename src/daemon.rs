@@ -171,7 +171,7 @@ struct TakeoverArgs {
 pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
     let pid = std::process::id();
     let succession = lock_succession(socket_path)?;
-    let (mut claim, prev_socket) = open_claim(socket_path)?;
+    let (mut claim, prev_socket) = open_claim(socket_path).await?;
     let private_path = private_socket_path(socket_path, pid);
     // The private listener binds first so the takeover's handoff reports
     // have somewhere to land.
@@ -280,7 +280,14 @@ pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
 /// Open the socket's claim — its pid file — and try its lock. A free
 /// lock is a fresh start (`None`); a held one names the live daemon this
 /// one supersedes, by its private socket.
-fn open_claim(socket_path: &Path) -> Result<(std::fs::File, Option<PathBuf>)> {
+///
+/// # Errors
+///
+/// Returns [`Error::DaemonRunning`] when the claim is free yet the socket
+/// still answers: a daemon that never took the claim — one built before
+/// it existed — whose socket the takeover rename would steal, stranding
+/// its sessions.
+async fn open_claim(socket_path: &Path) -> Result<(std::fs::File, Option<PathBuf>)> {
     let pid_path = socket_path.with_extension("sock.pid");
     let mut claim = std::fs::OpenOptions::new()
         .read(true)
@@ -291,7 +298,15 @@ fn open_claim(socket_path: &Path) -> Result<(std::fs::File, Option<PathBuf>)> {
         .map_err(|source| Error::io("cannot open daemon pid file", source))?;
     // A held claim names the live daemon this one supersedes.
     let prev_socket = match claim.try_lock() {
-        Ok(()) => None,
+        Ok(()) => {
+            if async_net::unix::UnixStream::connect(socket_path)
+                .await
+                .is_ok()
+            {
+                return Err(Error::DaemonRunning(socket_path.to_path_buf()));
+            }
+            None
+        }
         Err(std::fs::TryLockError::WouldBlock) => {
             let mut text = String::new();
             std::io::Read::read_to_string(&mut claim, &mut text)
