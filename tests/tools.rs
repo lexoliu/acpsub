@@ -159,7 +159,8 @@ async fn send_queued_fires_after_turn() {
         json!({"session_id": sid.as_str(), "prompt": "kick", "policy": "steer"}),
     )
     .await;
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
+    assert_eq!(steered["steer_id"], 1, "{steered}");
     assert_eq!(steered["turn"], 1);
 
     // The queued prompt runs as turn 2 with no done interlude: the state
@@ -241,8 +242,9 @@ async fn send_queued_dropped_on_cancel() {
     assert_eq!(done["state"], "done");
 }
 
-/// Queued prompts drop when the agent dies; the steer that kills it
-/// surfaces its error to the `send` caller and the session ends `exited`.
+/// Queued prompts drop when the agent dies; the steer that kills it is
+/// `submitted` like any other — `send` never reports a resolution — and
+/// the session ends `exited`.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_queued_dropped_on_failure() {
     if !python3() {
@@ -262,13 +264,13 @@ async fn send_queued_dropped_on_failure() {
     assert_eq!(queued["state"], "queued");
 
     // "die" exits the agent process; both the turn and the steer error out.
-    let err = call_err(
+    let steered = call_json(
         &tools,
         "send",
         json!({"session_id": sid.as_str(), "prompt": "die", "policy": "steer"}),
     )
     .await;
-    assert_ne!(err, "");
+    assert_eq!(steered["state"], "submitted", "{steered}");
 
     let done = wait(&tools, &sid, 60).await;
     // The turn error and the process exit race; `exited` always wins.
@@ -338,7 +340,10 @@ async fn send_steer_on_idle_starts_turn() {
     assert_eq!(done["state"], "done");
 }
 
-/// An agent that rejects a concurrent prompt surfaces the rejection.
+/// An agent that rejects a concurrent prompt still gets `submitted` —
+/// the rejection is the steer's resolution: `status` drops it from
+/// `steers` and the target turn's `steers` carries it as `rejected` with
+/// the agent's error.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_steer_rejection_errors() {
     if !python3() {
@@ -351,14 +356,187 @@ async fn send_steer_rejection_errors() {
     args["agent"] = json!("nosteer");
     let sid = spawn_id(&tools, args).await;
 
-    let err = call_err(
+    let steered = call_json(
         &tools,
         "send",
         json!({"session_id": sid.as_str(), "prompt": "hi", "policy": "steer"}),
     )
     .await;
-    assert!(err.contains("prompt in flight"), "{err}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
+    assert_eq!(steered["steer_id"], 1, "{steered}");
+    assert_eq!(steered["turn"], 1, "{steered}");
+
+    // The turn ("wait") never ends on its own: cancel it. The agent
+    // rejects the steer before it reads the cancel, and the wait — bound
+    // to turn 1 whether or not it has settled yet — returns only once the
+    // steer has resolved, so the rejection is in the result.
     call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
+    let done = wait(&tools, &sid, 60).await;
+    assert_eq!(done["state"], "cancelled", "{done}");
+    assert_eq!(done["turn"], 1, "{done}");
+    assert_eq!(
+        done["steers"].as_array().expect("steers").len(),
+        1,
+        "{done}"
+    );
+    assert_eq!(done["steers"][0]["steer_id"], 1, "{done}");
+    assert_eq!(done["steers"][0]["outcome"], "rejected", "{done}");
+    assert!(
+        done["steers"][0]["error"]
+            .as_str()
+            .expect("error")
+            .contains("prompt in flight"),
+        "{done}"
+    );
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["steers"], json!([]), "{status}");
+}
+
+/// A sink whose reports prove a blocked `wait` has bound to a running
+/// turn — the first report is the signal, so ordering never sleeps.
+struct Ping(tokio::sync::mpsc::UnboundedSender<()>);
+
+impl aither_core::llm::tool::ProgressSink for Ping {
+    async fn report(&mut self, _progress: aither_core::llm::tool::Progress) {
+        let _ = self.0.send(());
+    }
+}
+
+/// A `wait` on `sid` running in its own task, returned once its first
+/// progress report proves it has bound to the running turn. The timeout
+/// only turns a hang into a failure.
+async fn bound_wait(
+    tools: &Arc<Tools>,
+    sid: &str,
+) -> tokio::task::JoinHandle<Result<ToolResult, String>> {
+    let (tx, mut bound) = tokio::sync::mpsc::unbounded_channel();
+    let waiter = {
+        let tools = tools.clone();
+        let sid = sid.to_string();
+        tokio::spawn(async move {
+            call_with(
+                &tools,
+                "wait",
+                json!({"session_id": sid, "expect_secs": 60}),
+                aither_core::llm::tool::ToolContext::with_progress(Ping(tx)),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), bound.recv())
+        .await
+        .expect("wait never reported progress")
+        .expect("progress channel closed");
+    waiter
+}
+
+/// The JSON result a [`bound_wait`] returned.
+async fn bound_wait_result(
+    waiter: tokio::task::JoinHandle<Result<ToolResult, String>>,
+) -> serde_json::Value {
+    let result = waiter
+        .await
+        .expect("wait task panicked")
+        .expect("wait call failed");
+    assert!(!result.is_error(), "wait returned an error result");
+    serde_json::from_str(&result.render_for_model().expect("render")).expect("json")
+}
+
+/// `status` lists a steer while its `session/prompt` is in flight, and
+/// `wait` on the target turn holds until it resolves — the result lists
+/// the outcome the steer's answer carried.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_steer_pending_then_resolved_via_wait() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let tools = Arc::new(tools);
+    // "wait" never ends on its own, so the steer stays in flight until the
+    // turn is cancelled — the fake answers every steer with the turn's
+    // result.
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+
+    let steered = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "hold", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(steered["state"], "submitted", "{steered}");
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(
+        status["steers"],
+        json!([{"steer_id": 1, "turn": 1}]),
+        "{status}"
+    );
+
+    // The wait binds to turn 1 while it runs — the first progress report
+    // is the bound signal — and it can return only once the steer has
+    // resolved too: `cancel` answers both, and the steer's answer outside
+    // a turn of its own means it was folded into turn 1.
+    let waiter = bound_wait(&tools, &sid).await;
+    call_json(&tools, "cancel", json!({"session_id": sid.as_str()})).await;
+    let done = bound_wait_result(waiter).await;
+    assert_eq!(done["state"], "cancelled", "{done}");
+    assert_eq!(
+        done["steers"],
+        json!([{"steer_id": 1, "outcome": "folded"}]),
+        "{done}"
+    );
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["steers"], json!([]), "{status}");
+}
+
+/// A steer the agent never answers — a folding agent left at the default
+/// `answered` semantics — keeps the wait on its target turn holding past
+/// the turn's end, but the hold counts against `expect_secs`: the wait
+/// ends as an `overrun` listing the steer `pending`, and `status` keeps
+/// reporting it unresolved.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_steer_never_answered_overruns_wait() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let silent = AgentConfig {
+        env: BTreeMap::from([("FAKE_FOLD_STEER".to_string(), "1".to_string())]),
+        ..fake_agent_config()
+    };
+    let (_state, tools) =
+        test_state_with_agents(dir.path(), &BTreeMap::from([("fake".to_string(), silent)]));
+    // "gather" ends turn 1 once the steer arrives; the agent folds the
+    // steer and never answers its request.
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "gather")).await;
+    let steered = call_json(
+        &tools,
+        "send",
+        json!({"session_id": sid.as_str(), "prompt": "kick", "policy": "steer"}),
+    )
+    .await;
+    assert_eq!(steered["state"], "submitted", "{steered}");
+
+    // Bound to turn 1 whether it is still running or already settled
+    // with the steer in flight; either way the steer never resolves.
+    let over = wait(&tools, &sid, 1).await;
+    assert_eq!(over["state"], "overrun", "{over}");
+    assert_eq!(over["turn"], 1, "{over}");
+    assert_eq!(
+        over["steers"],
+        json!([{"steer_id": 1, "outcome": "pending"}]),
+        "{over}"
+    );
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(
+        status["steers"],
+        json!([{"steer_id": 1, "turn": 1}]),
+        "{status}"
+    );
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
 }
 
 /// On an agent that serializes a concurrent prompt instead of injecting it,
@@ -375,6 +553,7 @@ async fn send_steer_becomes_turn_on_serializing_agent() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (state, tools) = test_state(dir.path());
+    let tools = Arc::new(tools);
     let mut args = spawn_args(dir.path(), "hold");
     args["agent"] = json!("queueagent");
     let sid = spawn_id(&tools, args).await;
@@ -388,6 +567,10 @@ async fn send_steer_becomes_turn_on_serializing_agent() {
     .await;
     assert_eq!(queued["state"], "queued", "{queued}");
 
+    // Bind a wait to turn 1 before the steer exists — its first progress
+    // report is the bound signal.
+    let waiter = bound_wait(&tools, &sid).await;
+
     // The steer parks agent-side, releasing turn 1; it then runs as turn 2.
     let steered = call_json(
         &tools,
@@ -395,8 +578,21 @@ async fn send_steer_becomes_turn_on_serializing_agent() {
         json!({"session_id": sid.as_str(), "prompt": "PERMISSION", "policy": "steer"}),
     )
     .await;
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
+    assert_eq!(steered["steer_id"], 1, "{steered}");
     assert_eq!(steered["turn"], 1, "{steered}");
+
+    // Turn 1 ends before the steer resolves — the steer's own turn has to
+    // run first — so the wait returning with the steer's outcome is the
+    // hold: it outlived its turn until the steer resolved.
+    let first = bound_wait_result(waiter).await;
+    assert_eq!(first["turn"], 1, "{first}");
+    assert_eq!(first["state"], "done", "{first}");
+    assert_eq!(
+        first["steers"],
+        json!([{"steer_id": 1, "outcome": "turn", "turn": 2}]),
+        "{first}"
+    );
 
     // Wait on the real signal, not a poll deadline: `rt.notify` fires when
     // turn 1 settles, when the steered prompt materializes as its own turn,
@@ -425,6 +621,7 @@ async fn send_steer_becomes_turn_on_serializing_agent() {
     assert_eq!(status["state"], "done", "{status}");
     assert_eq!(status["turns"], 3, "{status}");
     assert_eq!(status["queued"], json!([]), "{status}");
+    assert_eq!(status["steers"], json!([]), "{status}");
 
     let second = call_json(
         &tools,
@@ -475,13 +672,20 @@ async fn send_steer_folded_settles_at_turn_end() {
         json!({"session_id": sid.as_str(), "prompt": "kick", "policy": "steer"}),
     )
     .await;
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
+    assert_eq!(steered["steer_id"], 1, "{steered}");
     assert_eq!(steered["turn"], 1, "{steered}");
 
     let done = wait(&tools, &sid, 60).await;
     assert_eq!(done["state"], "done", "{done}");
     assert!(
         done["reply"].as_str().unwrap().contains("steer:kick"),
+        "{done}"
+    );
+    // The steer folded into turn 1 is the resolution `wait` reports.
+    assert_eq!(
+        done["steers"],
+        json!([{"steer_id": 1, "outcome": "folded"}]),
         "{done}"
     );
 
@@ -532,7 +736,7 @@ async fn send_steer_folded_late_becomes_own_turn() {
         json!({"session_id": sid.as_str(), "prompt": "LATE PERMISSION go", "policy": "steer"}),
     )
     .await;
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
 
     // Turn 1 ends, the settled-folded steer's own turn materializes from
     // its updates, and the steer's response settles it — wait on the
@@ -621,7 +825,7 @@ async fn wait_returns_when_cancel_runs_concurrently() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (_state, tools) = test_state(dir.path());
-    let tools = std::sync::Arc::new(tools);
+    let tools = Arc::new(tools);
     let sid = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
 
     let waiter = {
@@ -1344,7 +1548,7 @@ async fn adopt_rejects_live_and_concurrent() {
     assert!(err.contains("already live"), "{err}");
 
     call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
-    let tools = std::sync::Arc::new(tools);
+    let tools = Arc::new(tools);
     let first = {
         let tools = tools.clone();
         let sid = sid.clone();
