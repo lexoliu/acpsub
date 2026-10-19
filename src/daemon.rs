@@ -272,6 +272,13 @@ async fn resume_one(
     let sub = match result {
         Ok(sub) => sub,
         Err(error) => {
+            // A `close` that landed while the resume's `session/load`
+            // was in flight ended the session on purpose — its mark was
+            // already consumed, so this is not a resume failure.
+            if matches!(error, Error::ClosedWhileLaunching(_)) {
+                info!(%session_id, "session closed while its resume was in flight");
+                return;
+            }
             warn!(%session_id, %error, "session resume failed");
             let message = error.to_string();
             // The mark stays — the next restart retries the load — and

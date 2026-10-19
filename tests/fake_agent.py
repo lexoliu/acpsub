@@ -53,6 +53,8 @@ of its own.
 
 session/cancel answers the pending prompt (and every steer) with
 stopReason cancelled.
+FAKE_LOAD_GATE=<path> holds the session/load response until the file
+exists, so a test can keep a launch in flight deterministically.
 FAKE_NO_LOAD=1 in the environment makes the agent not advertise loadSession.
 FAKE_NO_MODES=1 makes the agent advertise no session modes at all:
 session/new and session/load return no mode list and no `mode` config
@@ -622,6 +624,10 @@ for line in sys.stdin:
             session_result(request_id, {"sessionId": session_id})
         elif method == "session/load":
             session_id = params.get("sessionId", session_id)
+            gate = os.environ.get("FAKE_LOAD_GATE")
+            if gate:
+                while not os.path.exists(gate):
+                    time.sleep(0.02)
             update(
                 session_id,
                 {
