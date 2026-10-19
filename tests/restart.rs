@@ -233,7 +233,7 @@ fn drain_resumes_sessions() {
     // between the two calls is needed.
     let restart = daemon.run_thread(&["restart"]);
     let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
 
     let output = restart.join().expect("restart thread");
     assert!(
@@ -339,7 +339,7 @@ fn send_during_drain_retries() {
     let send = daemon.run_thread(&["send", &b, "--policy", "try", "--prompt", "after"]);
 
     let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
 
     let output = send.join().expect("send thread");
     assert!(
