@@ -387,6 +387,34 @@ impl DaemonGuard {
     }
 }
 
+impl DaemonGuard {
+    /// Terminate every superseded generation still serving the socket's
+    /// sessions — each one binds `<socket stem>.<pid>.sock` beside the
+    /// socket for as long as it runs, after giving its claim up.
+    fn stop_superseded(&self) {
+        let dir = self.socket.parent().expect("socket has a directory");
+        let stem = self
+            .socket
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("socket stem");
+        for entry in std::fs::read_dir(dir).expect("read socket directory") {
+            let name = entry.expect("directory entry").file_name();
+            let pid = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(stem))
+                .and_then(|rest| rest.strip_prefix('.'))
+                .and_then(|rest| rest.strip_suffix(".sock"))
+                .and_then(|pid| pid.parse::<i32>().ok());
+            if let Some(pid) = pid {
+                // SAFETY: kill(2) only delivers a signal; the pid is the
+                // generation's own record of itself.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+        }
+    }
+}
+
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let claim = self.claim();
@@ -400,6 +428,7 @@ impl Drop for DaemonGuard {
             }
             Ok(never) => match never {},
         }
+        self.stop_superseded();
         if let Some(child) = &mut self.child {
             // Already terminated when it held the claim; killed here when
             // it never took it.

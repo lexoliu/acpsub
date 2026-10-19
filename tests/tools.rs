@@ -3021,40 +3021,6 @@ async fn rate_limit_resume_keeps_owner() {
     status_becomes(&state, sid.as_str(), "done").await;
 }
 
-/// A draining daemon refuses new work: `spawn`, `send` and `adopt` get
-/// the `restarting` error the client retries on, read-only calls keep
-/// working, and a second drain is refused outright.
-#[tokio::test(flavor = "multi_thread")]
-async fn drain_refuses_new_work() {
-    if !python3() {
-        eprintln!("skipping: python3 not found");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (state, mut tools) = test_state(dir.path());
-    acpsub::tools::register_daemon_tools(&mut tools, state.clone()).expect("daemon tools");
-
-    let draining = call_json(&tools, "daemon/drain", json!({})).await;
-    assert_eq!(draining["draining"], true, "{draining}");
-
-    for (tool, args) in [
-        ("spawn", spawn_args(dir.path(), "hi")),
-        (
-            "send",
-            json!({"session_id": "s", "prompt": "hi", "policy": "try"}),
-        ),
-        ("adopt", json!({"session_id": "s"})),
-    ] {
-        let err = call_err(&tools, tool, args).await;
-        assert!(err.contains("restarting"), "{tool}: {err}");
-    }
-
-    call_json(&tools, "list", json!({})).await;
-
-    let again = call_err(&tools, "daemon/drain", json!({})).await;
-    assert!(again.contains("already in progress"), "{again}");
-}
-
 /// `close` on a parked session is final: the rate-limit schedule is
 /// consumed, so the scheduler's due pass resumes the parked control
 /// session but never relaunches the closed one — `list` reports it
@@ -3145,13 +3111,14 @@ async fn close_cancels_restart_resume() {
     let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
     wait(&tools, &sid, 60).await;
 
-    // The mark a drain leaves on a live session's registry entry.
+    // The mark a handing-over daemon leaves on a live session's registry entry.
     state
         .update_registry(|registry| {
             registry.get_mut(sid.as_str()).expect("registered").resume =
                 Some(acpsub::registry::Resume {
                     queued: vec!["after restart".to_string()],
                     failed: None,
+                    last_turn: None,
                 });
         })
         .await
