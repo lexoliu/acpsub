@@ -1,6 +1,10 @@
 //! Integration tests: the tool set exercised in-process against
 //! `tests/fake_agent.py`.
 
+#[expect(
+    dead_code,
+    reason = "helpers shared across test binaries; this one uses a subset"
+)]
 mod common;
 
 use std::collections::BTreeMap;

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use acpsub::config::{AgentConfig, SteerSemantics};
 use acpsub::{AppState, Config};
@@ -280,6 +280,134 @@ pub async fn wait(tools: &Tools, session_id: &str, expect_secs: u64) -> Value {
         json!({"session_id": session_id, "expect_secs": expect_secs}),
     )
     .await
+}
+
+/// How long teardown waits for a daemon to die, or for the clients a
+/// test left in flight to give up — each gives up within the client's
+/// own daemon-startup window once no daemon can serve.
+const TEARDOWN: Duration = Duration::from_secs(30);
+/// Retry interval while a signalled daemon still holds the socket's
+/// claim: its exit has no event a test can block on without risking a
+/// wait on a newer holder.
+const TEARDOWN_POLL: Duration = Duration::from_millis(10);
+
+/// Owns every daemon that serves `socket` — the one the test started
+/// and any a client auto-started behind it, during a restart or after a
+/// crash — and stops them all on drop: pass, fail or panic.
+///
+/// A daemon holds an exclusive lock on its pid file for as long as it
+/// lives, and the file names it. Teardown takes that lock itself,
+/// terminating each holder the file names, then keeps it until every
+/// client the test left in flight has exited: an auto-start one of them
+/// attempts meanwhile finds the claim taken and exits on its own.
+#[derive(Debug)]
+pub struct DaemonGuard {
+    socket: PathBuf,
+    /// The daemon the test spawned itself, reaped once the claim is held.
+    child: Option<std::process::Child>,
+    /// Cloned into each in-flight client; the channel disconnects once
+    /// every clone is gone.
+    in_flight: Option<std::sync::mpsc::Sender<std::convert::Infallible>>,
+    clients_done: std::sync::mpsc::Receiver<std::convert::Infallible>,
+}
+
+/// Held by a client the test runs off its own thread, for as long as
+/// that client runs.
+pub struct ClientInFlight {
+    _token: std::sync::mpsc::Sender<std::convert::Infallible>,
+}
+
+impl DaemonGuard {
+    /// Guard `socket`, owning `child` when the test spawned the daemon
+    /// itself.
+    pub fn new(socket: PathBuf, child: Option<std::process::Child>) -> Self {
+        let (in_flight, clients_done) = std::sync::mpsc::channel();
+        Self {
+            socket,
+            child,
+            in_flight: Some(in_flight),
+            clients_done,
+        }
+    }
+
+    /// A token a client running off the test thread holds until it
+    /// exits: a client a panic leaves running can still auto-start a
+    /// daemon, so teardown waits for it under the claim.
+    pub fn in_flight(&self) -> ClientInFlight {
+        ClientInFlight {
+            _token: self.in_flight.clone().expect("guard is live"),
+        }
+    }
+
+    /// Take the socket's claim — the lock on its pid file — terminating
+    /// each daemon that holds it. A holder that just took the lock may
+    /// not have written its pid yet, so the file is re-read until it
+    /// names one; each pid is signalled once.
+    fn claim(&self) -> std::fs::File {
+        let path = self.socket.with_extension("sock.pid");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .expect("open daemon pid file");
+        let deadline = Instant::now() + TEARDOWN;
+        let mut signalled = None;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => {
+                    panic!("cannot lock {}: {error}", path.display())
+                }
+            }
+            let holder = std::fs::read_to_string(&path)
+                .expect("read daemon pid file")
+                .trim()
+                .parse::<i32>()
+                .ok();
+            if let Some(pid) = holder
+                && signalled != Some(pid)
+            {
+                // SAFETY: kill(2) only delivers a signal; the pid is the
+                // lock holder's own record of itself.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                signalled = Some(pid);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon {holder:?} still holds {}",
+                path.display()
+            );
+            std::thread::sleep(TEARDOWN_POLL);
+        }
+        // No daemon serves the socket now: the file names none.
+        file.set_len(0).expect("clear daemon pid file");
+        file
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let claim = self.claim();
+        // Every client still in flight finds no daemon and none it
+        // starts can take the claim, so each gives up and exits.
+        self.in_flight = None;
+        match self.clients_done.recv_timeout(TEARDOWN) {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("clients still in flight on {}", self.socket.display())
+            }
+            Ok(never) => match never {},
+        }
+        if let Some(child) = &mut self.child {
+            // Already terminated when it held the claim; killed here when
+            // it never took it.
+            let _ = child.kill();
+            child.wait().expect("reap test daemon");
+        }
+        drop(claim);
+    }
 }
 
 /// Block on `rt.notify` until the live subagent's status is `want`. For

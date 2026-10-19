@@ -44,7 +44,8 @@ pub fn default_socket_path() -> Option<PathBuf> {
 /// `daemon/drain` call asks it to restart.
 ///
 /// A stale socket file left by a dead daemon is unlinked and rebound; a
-/// socket a live daemon still answers fails with [`Error::DaemonRunning`].
+/// socket another live daemon has claimed or still answers fails with
+/// [`Error::DaemonRunning`].
 ///
 /// Before accepting clients the daemon re-adopts every session the
 /// previous daemon marked for resume — a client that connects in the gap
@@ -60,14 +61,12 @@ pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
     // `kill "$(cat daemon.sock.pid)"` — and tells a restart waiter which
     // generation holds the socket. It is written before the bind so
     // "the socket accepts ⇒ the pid file names its daemon" holds, and
-    // removed again when the bind fails.
-    let pid_path = socket_path.with_extension("sock.pid");
-    std::fs::write(&pid_path, std::process::id().to_string())
-        .map_err(|source| Error::io("cannot write daemon pid file", source))?;
+    // cleared again when the bind fails.
+    let claim = claim(socket_path)?;
     let listener = match bind(socket_path).await {
         Ok(listener) => listener,
         Err(error) => {
-            let _ = std::fs::remove_file(&pid_path);
+            let _ = claim.set_len(0);
             return Err(error);
         }
     };
@@ -104,7 +103,46 @@ pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
         }
     }
     handoff(&state).await;
+    // Give the socket up: clear the pid file while the lock is still
+    // held, so it never names an exited daemon, and release the lock
+    // before the listener closes — a client the close refuses
+    // auto-starts the next daemon, which must find the claim free.
+    claim
+        .set_len(0)
+        .map_err(|source| Error::io("cannot clear daemon pid file", source))?;
+    drop(claim);
+    drop(listener);
     Ok(())
+}
+
+/// Claim `socket_path` for this process: take the exclusive lock on its
+/// pid file and record this pid in it. The lock is held for the daemon's
+/// whole life, so of two daemons auto-started at once only one can serve
+/// the socket — the other fails with [`Error::DaemonRunning`] without
+/// touching the file, and the file always names the daemon that holds
+/// it.
+fn claim(socket_path: &Path) -> Result<std::fs::File> {
+    use std::io::Write as _;
+    let pid_path = socket_path.with_extension("sock.pid");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&pid_path)
+        .map_err(|source| Error::io("cannot open daemon pid file", source))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(Error::DaemonRunning(socket_path.to_path_buf()));
+        }
+        Err(std::fs::TryLockError::Error(source)) => {
+            return Err(Error::io("cannot lock daemon pid file", source));
+        }
+    }
+    file.set_len(0)
+        .and_then(|()| file.write_all(std::process::id().to_string().as_bytes()))
+        .map_err(|source| Error::io("cannot write daemon pid file", source))?;
+    Ok(file)
 }
 
 /// The drain task the `daemon/drain` tool spawns: wait until no turn is

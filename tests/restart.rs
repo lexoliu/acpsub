@@ -21,7 +21,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,10 +58,10 @@ fn agents() -> BTreeMap<String, acpsub::config::AgentConfig> {
     agents
 }
 
-/// A running `acpsub daemon` on a tempdir socket; killed on drop — which
-/// covers its restarted replacement too, through the pidfile.
+/// A running `acpsub daemon` on a tempdir socket; its guard stops it on
+/// drop, along with every replacement a restart auto-started.
 struct Daemon {
-    child: Child,
+    guard: DaemonGuard,
     socket: PathBuf,
     config: PathBuf,
     /// Lines the daemon writes to stderr, in order.
@@ -103,7 +103,7 @@ impl Daemon {
             }
         });
         let daemon = Self {
-            child,
+            guard: DaemonGuard::new(socket.clone(), Some(child)),
             socket,
             config,
             lines,
@@ -134,15 +134,6 @@ impl Daemon {
         );
     }
 
-    /// The daemon's pid — after a restart it is the replacement's.
-    fn pid(&self) -> u32 {
-        std::fs::read_to_string(self.socket.with_extension("sock.pid"))
-            .expect("pidfile")
-            .trim()
-            .parse()
-            .expect("pidfile is a pid")
-    }
-
     /// Run a client subcommand against this daemon.
     fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
         Command::new(env!("CARGO_BIN_EXE_acpsub"))
@@ -154,13 +145,17 @@ impl Daemon {
             .output()
     }
 
-    /// Run a client subcommand in a thread and return its handle.
+    /// Run a client subcommand in a thread and return its handle. The
+    /// thread holds an in-flight token until the client exits, so a
+    /// teardown the test panics into waits the client out.
     fn run_thread(&self, args: &[&str]) -> std::thread::JoinHandle<std::process::Output> {
         let exe = PathBuf::from(env!("CARGO_BIN_EXE_acpsub"));
         let socket = self.socket.clone();
         let config = self.config.clone();
+        let in_flight = self.guard.in_flight();
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         std::thread::spawn(move || {
+            let _in_flight = in_flight;
             Command::new(exe)
                 .args(&args)
                 .arg("--socket")
@@ -181,19 +176,6 @@ impl Daemon {
             String::from_utf8_lossy(&output.stderr)
         );
         serde_json::from_slice(&output.stdout).expect("client output is json")
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // A restarted daemon replaced the original child; its pid is in
-        // the pidfile. Kill it so no test daemon outlives the test.
-        if self.socket.with_extension("sock.pid").exists() {
-            let pid = self.pid().cast_signed();
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
     }
 }
 
