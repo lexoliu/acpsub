@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aither_acp::{
@@ -49,10 +49,22 @@ impl Tail {
 pub struct Terminal {
     /// The child; `None` once reaped by `wait_for_exit`/`kill`.
     child: tokio::sync::Mutex<Option<tokio::process::Child>>,
+    /// The child's process group id — the child leads it (`process_group(0)`),
+    /// so this sweeps grandchildren the child orphaned to launchd.
+    pgid: AtomicU32,
     /// Merged stdout+stderr tail, bounded by `output_byte_limit`.
     output: Mutex<Tail>,
     /// Exit status once the process has exited.
     status: Mutex<Option<TerminalExitStatus>>,
+}
+
+#[cfg(unix)]
+impl Drop for Terminal {
+    /// The child's `kill_on_drop` only reaches the leader; sweep the group so
+    /// descendants the leader orphaned die with it.
+    fn drop(&mut self) {
+        crate::state::kill_process_group(self.pgid.load(Ordering::Relaxed));
+    }
 }
 
 impl Terminal {
@@ -116,18 +128,20 @@ impl Terminal {
         Ok(status)
     }
 
-    /// SIGKILL the process, for `terminal/kill`. Succeeds on an already-dead
-    /// terminal.
+    /// SIGKILL the process group, for `terminal/kill`. Succeeds on an
+    /// already-dead terminal.
     ///
     /// # Errors
     ///
     /// Returns an internal error if the kill signal fails.
     pub async fn kill(&self) -> Result<(), JsonRpcError> {
+        #[cfg(unix)]
+        crate::state::kill_process_group(self.pgid.load(Ordering::Relaxed));
         let mut guard = self.child.lock().await;
         if let Some(child) = guard.as_mut() {
-            child.start_kill().map_err(|source| {
-                JsonRpcError::internal_error(format!("cannot kill terminal: {source}"))
-            })?;
+            // The group kill above already reached this child; `start_kill`
+            // on it can only ESRCH, which is not a failure worth reporting.
+            let _ = child.start_kill();
         }
         drop(guard);
         Ok(())
@@ -217,11 +231,16 @@ pub async fn create(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // The terminal leads its own process group so `kill`/drop can reap
+    // grandchildren (e.g. `bash -c` background jobs) along with it.
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn().map_err(|source| {
         JsonRpcError::internal_error(format!("cannot spawn '{}': {source}", params.command))
     })?;
     let terminal = Arc::new(Terminal {
         child: tokio::sync::Mutex::new(None),
+        pgid: AtomicU32::new(child.id().unwrap_or(0)),
         output: Mutex::new(Tail {
             data: Vec::new(),
             cap: params

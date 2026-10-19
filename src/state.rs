@@ -3,6 +3,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -446,6 +448,9 @@ pub struct SubRuntime {
     /// whose owner is dead, so sessions cannot outlive their coordinator
     /// as unsupervised orphans.
     pub owner: AtomicU32,
+    /// The agent child process id — also its process group id, since the
+    /// child is spawned with `process_group(0)`. 0 until spawned.
+    pub agent_pid: AtomicU32,
 }
 
 impl SubRuntime {
@@ -486,7 +491,39 @@ impl SubRuntime {
             .session_id
             .clone()
     }
+
+    /// SIGKILL the agent's whole process group — the agent leads the group
+    /// (`process_group(0)`), so this sweeps the `bash -c` children it
+    /// exec'd, including ones already orphaned to launchd.
+    pub fn kill_process_tree(&self) {
+        kill_process_group(self.agent_pid.load(Ordering::Relaxed));
+    }
 }
+
+/// SIGKILL the process group led by `pgid`. A process group outlives its
+/// leader, so this still reaches a dead agent's leaked descendants. Probes
+/// the group first; a pgid meanwhile recycled by a foreign group leader is
+/// the accepted residual.
+///
+/// On unix; a no-op elsewhere.
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pgid: u32) {
+    if pgid == 0 {
+        return;
+    }
+    // SAFETY: kill(2) only delivers a signal; a stale pgid is narrowed by
+    // the existence probe.
+    unsafe {
+        let pgid = pgid as libc::pid_t;
+        if libc::kill(-pgid, 0) == 0 {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+/// No-op on platforms without process groups.
+#[cfg(not(unix))]
+pub(crate) fn kill_process_group(_pgid: u32) {}
 
 /// A live subagent: one agent process, one ACP session, one transcript.
 #[derive(Debug)]
@@ -752,6 +789,7 @@ fn new_runtime(args: &Launch, steer: SteerSemantics) -> Arc<SubRuntime> {
         next_term: AtomicU64::new(1),
         closing: AtomicBool::new(false),
         owner: AtomicU32::new(args.owner.unwrap_or(0)),
+        agent_pid: AtomicU32::new(0),
     })
 }
 
@@ -783,6 +821,7 @@ async fn launch_inner(
         Ok(accepted) => accepted,
         Err(error) => {
             rt.closing.store(true, Ordering::Relaxed);
+            rt.kill_process_tree();
             client.close();
             let _ = conn.await;
             return Err(error);
@@ -796,6 +835,7 @@ async fn launch_inner(
         .join(format!("{session_id}.jsonl"));
     if let Err(source) = rt.transcript.lock().await.bind(&transcript_path).await {
         rt.closing.store(true, Ordering::Relaxed);
+        rt.kill_process_tree();
         client.close();
         let _ = conn.await;
         return Err(Error::io(
@@ -885,6 +925,7 @@ async fn go_live(state: &Arc<AppState>, sub: &Arc<Subagent>) -> Result<()> {
     // A second live session with the same id (an agent reusing ids) would
     // shadow the first; refuse and kill this process.
     sub.rt.closing.store(true, Ordering::Relaxed);
+    sub.rt.kill_process_tree();
     sub.client.clone().close();
     let conn = sub.conn.lock().expect("conn poisoned").take();
     if let Some(conn) = conn {
@@ -905,11 +946,23 @@ fn connect(
     handler: SubagentHandler,
     rt: Arc<SubRuntime>,
 ) -> Result<(AcpClient<SubagentHandler>, JoinHandle<()>, JoinHandle<()>)> {
-    let mut command = async_process::Command::new(&agent_cfg.command);
-    command
+    let mut std_command = std::process::Command::new(&agent_cfg.command);
+    std_command
         .args(&agent_cfg.args)
         .envs(agent_cfg.env.clone())
         .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The agent leads its own process group so `kill_process_group` can
+    // reap every `bash -c` descendant it spawned — orphaned ones reparent
+    // to launchd but stay in the group.
+    #[cfg(unix)]
+    std_command.process_group(0);
+    // `From` resets async-process's stdio flags, so re-apply the pipes on
+    // the wrapper or `spawn` downgrades them to `inherit`.
+    let mut command = async_process::Command::from(std_command);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -918,6 +971,7 @@ fn connect(
         command: format!("{} {}", agent_cfg.command, agent_cfg.args.join(" ")),
         source,
     })?;
+    rt.agent_pid.store(child.id(), Ordering::Relaxed);
     let stderr = child.stderr.take().ok_or_else(|| {
         Error::io(
             "agent stderr pipe",
@@ -1322,6 +1376,9 @@ fn on_disconnect(rt: &SubRuntime) {
     inner.steer_owner = None;
     inner.current = None;
     drop(inner);
+    // The agent died unsupervised: its exec'd children outlive it as
+    // launchd orphans unless the group is swept.
+    rt.kill_process_tree();
     rt.notify.notify_waiters();
 }
 
@@ -1336,6 +1393,18 @@ fn on_disconnect(rt: &SubRuntime) {
 /// Panics if a state mutex is poisoned.
 pub async fn close_sub(sub: &Subagent) {
     sub.rt.closing.store(true, Ordering::Relaxed);
+    sub.rt.kill_process_tree();
+    let terminals: Vec<_> = sub
+        .rt
+        .terminals
+        .lock()
+        .await
+        .drain()
+        .map(|(_, t)| t)
+        .collect();
+    for terminal in terminals {
+        let _ = terminal.kill().await;
+    }
     {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         for pending in inner.pending.drain(..) {

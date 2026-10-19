@@ -263,8 +263,13 @@ impl ClientHandler for SubagentHandler {
         &self,
         params: TerminalReleaseParams,
     ) -> Result<TerminalReleaseResult, JsonRpcError> {
-        // Dropping the entry kills the child if still running (kill_on_drop).
-        self.rt.terminals.lock().await.remove(&params.terminal_id);
+        // Kill explicitly, not by drop: orphaned grandchildren hold the
+        // output pipes open, which keeps pump-held `Arc`s — and therefore
+        // the terminal — alive until they exit.
+        let terminal = self.rt.terminals.lock().await.remove(&params.terminal_id);
+        if let Some(terminal) = terminal {
+            let _ = terminal.kill().await;
+        }
         Ok(TerminalReleaseResult { meta: None })
     }
 }
