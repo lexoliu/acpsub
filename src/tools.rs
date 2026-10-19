@@ -23,9 +23,9 @@ use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Gate, Launch, Status, Subagent, ToolCallSummary, Turn, begin_turn, close_sub, launch,
-    next_turn_number, prompt_slot_free, record_queue_dropped, spawn_turn_task, start_turn,
-    steer_resolved, steer_turn, steer_waiter,
+    AppState, Gate, Launch, Status, Subagent, ToolCallSummary, Turn, begin_turn, close_sub,
+    end_session, launch, next_turn_number, prompt_slot_free, record_queue_dropped, spawn_turn_task,
+    start_turn, steer_resolved, steer_turn, steer_waiter, unschedule_resume,
 };
 use crate::transcript::{RenderOptions, render};
 
@@ -1846,6 +1846,8 @@ impl ListTool {
 
 /// Close a subagent: end the agent process. The registry entry (and so the
 /// session's resumability via `adopt`) is kept; use `forget` to remove it.
+/// Any scheduled resume — a rate-limit park or a restart mark — is
+/// consumed: a closed session never comes back on its own.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CloseArgs {
     /// Session id, as returned by `spawn`/`adopt`.
@@ -1871,7 +1873,7 @@ impl Tool for CloseTool {
         };
         match sub {
             Some(sub) => {
-                close_sub(&sub).await;
+                end_session(&self.0, &sub).await;
                 Ok(json!({"session_id": args.session_id, "closed": true}))
             }
             None if self
@@ -1882,6 +1884,7 @@ impl Tool for CloseTool {
                 .get(&args.session_id)
                 .is_some() =>
             {
+                unschedule_resume(&self.0, &args.session_id).await;
                 Ok(json!({"session_id": args.session_id, "closed": true, "was_live": false}))
             }
             None => Err(Error::UnknownSession(args.session_id).into()),

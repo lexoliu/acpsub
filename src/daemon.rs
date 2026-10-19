@@ -26,7 +26,8 @@ use crate::error::{Error, Result};
 use crate::ratelimit;
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Launch, ResumeFailure, ResumeReport, Status, Subagent, close_sub, launch, start_turn,
+    AppState, Launch, ResumeFailure, ResumeReport, Status, Subagent, close_sub, end_session,
+    launch, start_turn,
 };
 use crate::tools::build_tools;
 
@@ -166,7 +167,12 @@ async fn handoff(state: &Arc<AppState>) {
         let session_id = sub.session_id.clone();
         let result = state
             .update_registry(|registry| {
-                if let Some(entry) = registry.get_mut(&session_id) {
+                // The closing check runs under `registry_write`, serialized
+                // against `unschedule_resume`: a `close` mid-drain wins —
+                // the session stays unmarked and is not resumed.
+                if let Some(entry) = registry.get_mut(&session_id)
+                    && !sub.rt.closing.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     entry.resume = Some(crate::registry::Resume {
                         queued,
                         failed: None,
@@ -302,7 +308,12 @@ async fn resume_one(
         let parked = parked.clone();
         let result = state
             .update_registry(|registry| {
-                if let Some(entry) = registry.get_mut(&session_id) {
+                // The closing check runs under `registry_write`, serialized
+                // against `unschedule_resume`: a `close` that already
+                // stored the flag keeps its cleared mark.
+                if let Some(entry) = registry.get_mut(&session_id)
+                    && !sub.rt.closing.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     entry.rate_limited = Some(parked);
                 }
             })
@@ -400,7 +411,7 @@ async fn reap_orphans(state: Arc<AppState>) {
                 .lock()
                 .expect("live poisoned")
                 .remove(&session_id);
-            close_sub(&sub).await;
+            end_session(&state, &sub).await;
         }
     }
 }
