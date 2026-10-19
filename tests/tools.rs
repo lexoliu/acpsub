@@ -1655,6 +1655,97 @@ async fn terminal_kill_reports_signal_exit() {
     assert!(reply.contains("signal:9"), "{reply}");
 }
 
+/// Poll `kill -0` until the pid is gone — signal delivery plus launchd
+/// reaping is not instant.
+#[cfg(unix)]
+async fn assert_dead(pid: i32) {
+    for _ in 0..40 {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !alive {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("pid {pid} still alive");
+}
+
+/// An agent whose exec'd `bash -c` children orphan to launchd must still be
+/// reaped: `close` kills the agent's whole process group, not its pid alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn close_reaps_agent_process_group() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("grandchild.pid");
+    let mut groupy = fake_agent_config();
+    groupy.command = "bash".to_string();
+    groupy.args = vec![
+        "-c".to_string(),
+        format!(
+            "sleep 600 & echo $! > \"$GC_PID\"; exec python3 {:?}",
+            fake_agent_script()
+        ),
+    ];
+    groupy.env.insert(
+        "GC_PID".to_string(),
+        pid_file.to_string_lossy().into_owned(),
+    );
+    let mut agents = BTreeMap::new();
+    agents.insert("groupy".to_string(), groupy);
+    let (_state, tools) = test_state_with_agents(dir.path(), &agents);
+    let sid = spawn_id(
+        &tools,
+        json!({"agent": "groupy", "cwd": dir.path(), "prompt": "hi",
+               "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    wait(&tools, &sid, 60).await;
+
+    let grandchild: i32 = std::fs::read_to_string(&pid_file)
+        .expect("grandchild pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+    assert_dead(grandchild).await;
+}
+
+/// A `bash -c` terminal that backgrounds a job and exits orphans the job;
+/// `terminal/release` drops the terminal, which must reap its group.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_release_reaps_orphaned_children() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(
+        &tools,
+        spawn_args(dir.path(), "RUNLINE sleep 60 & echo gc:$!"),
+    )
+    .await;
+    let done = wait(&tools, &sid, 60).await;
+    let reply = done["reply"].as_str().unwrap();
+    let marker = reply.find("term:gc:").unwrap_or_else(|| panic!("{reply}"));
+    let pid: i32 = reply[marker + 8..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("grandchild pid");
+    assert_dead(pid).await;
+}
+
 /// `close` ends the process but keeps the registry entry: the session still
 /// lists as `closed`, and `send` to it errors.
 #[tokio::test(flavor = "multi_thread")]
