@@ -10,13 +10,17 @@
 )]
 mod common;
 
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use acpsub::config::AgentConfig;
 use aither_core::llm::tool::{Progress, ProgressSink, ToolContext, ToolResult, Tools};
 use common::*;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// The interval `tests/common` builds the tools with — small enough to
 /// observe several reports inside a test-length wait.
@@ -59,10 +63,7 @@ async fn reports_while_blocked(
     let collect = async {
         let mut seen = Vec::new();
         loop {
-            let report = tokio::time::timeout(Duration::from_secs(5), reports.recv())
-                .await
-                .expect("a progress report within 5 s")
-                .expect("sink alive while the call waits");
+            let report = next_report(&mut reports).await;
             // A report names the latest tool call as
             // "<session_id>: <title>" once the update has landed.
             let titled = report
@@ -253,8 +254,8 @@ async fn silent_short_expect_proceeds() {
 }
 
 /// A `wait` bound to turn A must return A's result when A ends — even
-/// when a queued turn B has already chained and started. Reports name A's
-/// elapsed seconds throughout, so they never drop when B takes over.
+/// when a queued turn B has already chained and started. Reports carry
+/// the wait's own elapsed seconds, so they never drop when B takes over.
 #[tokio::test]
 async fn wait_returns_the_turn_it_started_on() {
     if !python3() {
@@ -294,10 +295,7 @@ async fn wait_returns_the_turn_it_started_on() {
     // wait followed "whatever is running" instead of its own turn.
     let mut progress = Vec::new();
     for _ in 0..3 {
-        let (p, _) = tokio::time::timeout(Duration::from_secs(5), reports.recv())
-            .await
-            .expect("a progress report within 5 s")
-            .expect("sink alive while the call waits");
+        let (p, _) = next_report(&mut reports).await;
         progress.push(p.progress());
     }
     let steered = call_json(
@@ -345,7 +343,8 @@ async fn wait_returns_the_turn_it_started_on() {
     call_json(&tools, "cancel", json!({"session_id": session_id.as_str()})).await;
 }
 
-/// `wait` reports the turn's elapsed time every interval while blocked.
+/// `wait` reports its own elapsed time every interval while blocked —
+/// the message names the session and its latest tool call.
 #[tokio::test]
 async fn wait_reports_progress_at_the_interval() {
     if !python3() {
@@ -366,8 +365,8 @@ async fn wait_reports_progress_at_the_interval() {
     assert_reports(&seen, &session_id);
 }
 
-/// `wait_any` reports the longest-running watched turn's elapsed time
-/// every interval while blocked.
+/// `wait_any` reports its own elapsed time every interval while blocked
+/// — the message names the longest-running watched session.
 #[tokio::test]
 async fn wait_any_reports_progress_at_the_interval() {
     if !python3() {
@@ -386,4 +385,234 @@ async fn wait_any_reports_progress_at_the_interval() {
     )
     .await;
     assert_reports(&seen, &session_id);
+}
+/// The channel end a listening call's progress reports arrive on.
+type ReportRx = mpsc::UnboundedReceiver<(Progress, Instant)>;
+/// The task a progress-listening `wait`/`wait_any` call runs on.
+type WaitTask = JoinHandle<Result<ToolResult, String>>;
+
+/// Spawn a progress-listening `wait`/`wait_any` call on its own task:
+/// every report lands on the receiver until the call returns and the
+/// sink drops.
+fn start_wait(tools: &Arc<Tools>, name: &str, args: Value) -> (ReportRx, WaitTask) {
+    let (tx, reports) = mpsc::unbounded_channel();
+    let waiting = {
+        let tools = Arc::clone(tools);
+        let name = name.to_string();
+        tokio::spawn(async move {
+            call_with(&tools, &name, args, ToolContext::with_progress(Collect(tx))).await
+        })
+    };
+    (reports, waiting)
+}
+
+/// The next report through the sink — the timeout only turns a hang
+/// into a failure.
+async fn next_report(reports: &mut ReportRx) -> (Progress, Instant) {
+    tokio::time::timeout(Duration::from_secs(5), reports.recv())
+        .await
+        .expect("a progress report within 5 s")
+        .expect("sink alive while the call waits")
+}
+
+/// Collect the reports still arriving until `waiting` resolves,
+/// appending to `seen`, and return the call's result JSON — the sink
+/// closes with the call, so the join arm ends the loop.
+async fn collect_until_return(
+    waiting: &mut WaitTask,
+    reports: &mut ReportRx,
+    seen: &mut Vec<(Progress, Instant)>,
+) -> Value {
+    let result: ToolResult = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                res = &mut *waiting => break res.expect("wait task").expect("wait call"),
+                report = reports.recv() => {
+                    let Some(report) = report else { continue };
+                    seen.push(report);
+                }
+            }
+        }
+    })
+    .await
+    .expect("the wait returned");
+    assert!(!result.is_error(), "call returned an error result");
+    let text = result.render_for_model().expect("render");
+    serde_json::from_str(&text).expect("tool result is json")
+}
+
+/// The reports over a wait's whole life: every value strictly exceeds
+/// the previous one — the contract `report_progress` enforces — and
+/// every total is the caller's `expect_secs`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the test's small second counts are exactly representable"
+)]
+fn assert_increasing(seen: &[(Progress, Instant)]) {
+    let progress: Vec<f64> = seen.iter().map(|(p, _)| p.progress()).collect();
+    assert!(
+        progress.windows(2).all(|w| w[1] > w[0]),
+        "progress must increase: {progress:?}"
+    );
+    for (p, _) in seen {
+        assert_eq!(p.total(), Some(EXPECT_SECS as f64), "total is expect_secs");
+    }
+}
+
+/// The `ratelimit` agent whose error answer holds until `gate` exists:
+/// the test decides when the awaited turn ends, never a delay.
+fn gated_limit_agent(gate: &Path) -> AgentConfig {
+    AgentConfig {
+        env: BTreeMap::from([
+            ("FAKE_RATE_LIMIT".to_string(), "4".to_string()),
+            (
+                "FAKE_RATE_LIMIT_GATE".to_string(),
+                gate.to_string_lossy().into_owned(),
+            ),
+        ]),
+        ..fake_agent_config()
+    }
+}
+
+/// A `wait_any` whose longest-running watched session changes mid-wait
+/// keeps reporting: the leader's turn ends rate-limited and parks, the
+/// runner-up takes over — and the reported value, the wait's own
+/// elapsed time, never drops the way the runner-up's younger turn
+/// would have dropped it (#66).
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_any_reports_through_a_leader_change() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // The leader's turn stays in flight until the test opens the gate —
+    // binding never races a delay.
+    let gate = dir.path().join("rate-limit-gate");
+    let mut agents = BTreeMap::new();
+    agents.insert("fake".to_string(), fake_agent_config());
+    agents.insert("gatedlimit".to_string(), gated_limit_agent(&gate));
+    let (state, tools) = test_state_with_agents(dir.path(), &agents);
+    let tools = Arc::new(tools);
+    // The leader spawned first, so its turn is always the
+    // longest-running one while both run; the runner-up's "wait" turn
+    // outlives every phase of the call.
+    let leader = spawn_id(
+        &tools,
+        json!({"agent": "gatedlimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    let runner = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+
+    let (mut reports, mut waiting) = start_wait(
+        &tools,
+        "wait_any",
+        json!({"session_ids": [leader, runner], "expect_secs": EXPECT_SECS, "long": true}),
+    );
+    // The first report proves the wait bound with every watched turn in
+    // flight — and names the leader, the longest-running of them.
+    let first = next_report(&mut reports).await;
+    assert!(
+        first.0.message().is_some_and(|m| m.contains(&leader)),
+        "first report did not name the leader: {first:?}"
+    );
+
+    // Releasing the gate ends the leader's turn rate-limited: it parks,
+    // and the runner-up becomes the longest-running watched turn.
+    std::fs::write(&gate, b"").expect("open the rate-limit gate");
+    let gate_at = Instant::now();
+    status_becomes(&state, &leader, "rate_limited").await;
+
+    // The leader's resumed continuation turn ends the wait on its own.
+    let mut seen = vec![first];
+    let waited = collect_until_return(&mut waiting, &mut reports, &mut seen).await;
+    assert_eq!(waited["session_id"], leader, "{waited}");
+    assert_eq!(waited["state"], "done", "{waited}");
+
+    assert_increasing(&seen);
+    let names = |p: &Progress, id: &str| p.message().is_some_and(|m| m.contains(id));
+    // Every report before the gate opened names the leader; every report
+    // after the park names the runner-up — the leader change whose
+    // younger turn time used to drop the reported value.
+    let opened = seen
+        .iter()
+        .position(|(_, at)| *at >= gate_at)
+        .unwrap_or(seen.len());
+    assert!(
+        seen[..opened].iter().all(|(p, _)| names(p, &leader)),
+        "a report before the gate opened did not name the leader: {seen:?}"
+    );
+    let last_leader = seen
+        .iter()
+        .rposition(|(p, _)| names(p, &leader))
+        .expect("no report named the leader");
+    let first_runner = seen
+        .iter()
+        .position(|(p, _)| names(p, &runner))
+        .expect("no report named the runner-up after the park");
+    assert!(
+        last_leader < first_runner,
+        "the report never switched from leader to runner-up: {seen:?}"
+    );
+
+    // The runner-up's "wait" turn never ends on its own.
+    call_json(&tools, "cancel", json!({"session_id": runner})).await;
+}
+
+/// A `wait` bound to a turn that ends rate-limited reports through the
+/// park and the resume's rebind: the reported value is the wait's own
+/// elapsed time, so it keeps increasing across the resume where the
+/// rebound turn's restarted clock would have dropped it (#66).
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_reports_through_a_rate_limit_pause() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // The awaited turn stays in flight until the test opens the gate —
+    // binding never races the rate-limit answer.
+    let gate = dir.path().join("rate-limit-gate");
+    let mut agents = BTreeMap::new();
+    agents.insert("gatedlimit".to_string(), gated_limit_agent(&gate));
+    let (state, tools) = test_state_with_agents(dir.path(), &agents);
+    let tools = Arc::new(tools);
+    let session_id = spawn_id(
+        &tools,
+        json!({"agent": "gatedlimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+
+    let (mut reports, mut waiting) = start_wait(
+        &tools,
+        "wait",
+        json!({"session_id": session_id, "expect_secs": EXPECT_SECS, "long": true}),
+    );
+    // The first report proves the wait bound while the turn is in
+    // flight.
+    let first = next_report(&mut reports).await;
+    assert!(
+        first.0.message().is_some_and(|m| m.contains(&session_id)),
+        "first report did not name the session: {first:?}"
+    );
+
+    // Releasing the gate ends the turn rate-limited: the session parks,
+    // then the scheduler's resume runs the continuation turn that ends
+    // the wait.
+    std::fs::write(&gate, b"").expect("open the rate-limit gate");
+    status_becomes(&state, &session_id, "rate_limited").await;
+
+    let mut seen = vec![first];
+    let waited = collect_until_return(&mut waiting, &mut reports, &mut seen).await;
+    assert_eq!(waited["state"], "done", "{waited}");
+    assert_eq!(waited["stop_reason"], "end_turn", "{waited}");
+    assert!(waited["turn"].as_u64().unwrap() >= 2, "{waited}");
+
+    assert_increasing(&seen);
+    for (p, _) in &seen {
+        assert!(
+            p.message().is_some_and(|m| m.contains(&session_id)),
+            "report does not name the session: {p:?}"
+        );
+    }
 }
