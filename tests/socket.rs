@@ -9,15 +9,16 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::*;
 use serde_json::Value;
 
-/// A running `acpsub daemon` on a tempdir socket; killed on drop.
+/// A running `acpsub daemon` on a tempdir socket; its guard stops it on
+/// drop, along with any daemon a client auto-started behind it.
 struct Daemon {
-    child: Child,
+    _guard: DaemonGuard,
     socket: PathBuf,
     config: PathBuf,
 }
@@ -44,7 +45,7 @@ impl Daemon {
             .spawn()
             .expect("spawn acpsub daemon");
         let daemon = Self {
-            child,
+            _guard: DaemonGuard::new(socket.clone(), Some(child)),
             socket,
             config,
         };
@@ -84,13 +85,6 @@ impl Daemon {
             String::from_utf8_lossy(&output.stderr)
         );
         serde_json::from_slice(&output.stdout).expect("client output is json")
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -219,6 +213,9 @@ fn client_starts_daemon_when_absent() {
     agents.insert("fake".to_string(), fake_agent_config());
     let config = write_config(dir.path(), Some("fake"), &agents);
     let socket = dir.path().join("daemon.sock");
+    // The auto-started daemon is detached: the guard stops it through
+    // its pid file, whatever the assertions below do.
+    let _guard = DaemonGuard::new(socket.clone(), None);
     // No daemon running: `list` must spawn one and still succeed.
     let output = Command::new(env!("CARGO_BIN_EXE_acpsub"))
         .args(["list", "--socket"])
@@ -234,11 +231,4 @@ fn client_starts_daemon_when_absent() {
     );
     let list: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert!(list["subagents"].is_array(), "{list}");
-    // The auto-started daemon is detached: stop exactly it via its pidfile.
-    let pid: i32 = std::fs::read_to_string(socket.with_extension("sock.pid"))
-        .expect("pidfile")
-        .trim()
-        .parse()
-        .expect("pidfile is a pid");
-    unsafe { libc::kill(pid, libc::SIGTERM) };
 }
