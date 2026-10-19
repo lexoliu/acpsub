@@ -35,6 +35,9 @@ limit with. The reset is named in the message's `(at HH:MM:SS UTC)`
 clause; FAKE_RATE_LIMIT_VAGUE=1 strips the clause, so no readable reset
 exists at all. FAKE_RATE_LIMIT_DELAY=<secs> answers the error after a
 beat, keeping the turn in flight for a bound `wait`.
+FAKE_RATE_LIMIT_GATE=<path> answers the error only once that file
+exists — the test holds the turn in flight itself, releasing it with a
+file in its own tempdir.
 
 A session/prompt that arrives while a prompt is pending is a steer: its
 request resolves with the same result as the turn's own prompt, and its
@@ -62,6 +65,9 @@ FAKE_NO_OPTIONS=1 makes the advertised `model` config option carry no
 selectable values.
 FAKE_RATE_LIMIT=<secs> makes "ratelimit" prompts — then every prompt
 until the window lifts — answer the Devin rate-limit shape.
+FAKE_RATE_LIMIT_GATE=<path> holds a rate-limited prompt's error answer
+until the file exists (polled — it is another process's signal), so the
+turn ends when the test says, not when a delay runs out.
 FAKE_MODE_IGNORED=1 makes session/set_mode a no-op: the call succeeds but
 the session's mode — reported by the `mode` config option — never changes.
 Session ids are `sess-<pid>-<n>` so concurrently spawned agents never
@@ -458,8 +464,15 @@ def on_prompt(request_id, params):
         rate_limited_until = time.time() + limit_secs
     if rate_limited_until is not None:
         if time.time() < rate_limited_until:
-            delay = float(os.environ.get("FAKE_RATE_LIMIT_DELAY", "0.35") or 0.35)
-            time.sleep(delay)
+            gate = os.environ.get("FAKE_RATE_LIMIT_GATE")
+            if gate:
+                # The error waits on the gate file: the test holds the
+                # turn in flight itself instead of a fixed delay.
+                while not os.path.exists(gate):
+                    time.sleep(0.02)
+            else:
+                delay = float(os.environ.get("FAKE_RATE_LIMIT_DELAY", "0.35") or 0.35)
+                time.sleep(delay)
             rate_limit_error(request_id)
             return
         rate_limited_until = None

@@ -277,9 +277,11 @@ fn awaited_elapsed(sub: &Subagent, n: u64) -> Result<Awaited> {
 }
 
 /// The progress report a blocked wait sends for `sub`: `progress` is the
-/// turn's elapsed seconds against `total = expect_secs`, and the message
-/// names the session and its latest tool call title.
-fn wait_progress(sub: &Subagent, elapsed: f64, expect_secs: u64) -> Progress {
+/// wait's own elapsed seconds since `started` — monotonic for the call's
+/// life, whatever the watched turn does — against `total = expect_secs`.
+/// The message still names the session and its latest tool call title,
+/// and carries the awaited turn's elapsed seconds.
+fn wait_progress(sub: &Subagent, started: Instant, elapsed: f64, expect_secs: u64) -> Progress {
     let title = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
         inner.current.as_ref().and_then(|turn| {
@@ -290,11 +292,11 @@ fn wait_progress(sub: &Subagent, elapsed: f64, expect_secs: u64) -> Progress {
         })
     };
     let message = title.map_or_else(
-        || sub.session_id.clone(),
-        |title| format!("{}: {title}", sub.session_id),
+        || format!("{} (turn {elapsed:.1}s)", sub.session_id),
+        |title| format!("{}: {title} (turn {elapsed:.1}s)", sub.session_id),
     );
     #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
-    Progress::new(elapsed)
+    Progress::new(started.elapsed().as_secs_f64())
         .with_total(expect_secs as f64)
         .with_message(message)
 }
@@ -1139,7 +1141,7 @@ impl Tool for WaitTool {
                         break WaitOutcome::MaxWait;
                     }
                     if now >= next_report {
-                        cx.report_progress(wait_progress(&sub, elapsed, args.expect_secs))
+                        cx.report_progress(wait_progress(&sub, started, elapsed, args.expect_secs))
                             .await?;
                         next_report = now + interval;
                     }
@@ -1319,11 +1321,8 @@ impl Tool for WaitAnyTool {
                     parked_secs[index],
                 ));
             }
-            if now >= next_report
-                && let Some((elapsed, index)) = longest
-            {
-                cx.report_progress(wait_progress(&subs[index], elapsed, args.expect_secs))
-                    .await?;
+            if now >= next_report {
+                report_longest(&mut cx, &subs, longest, started, args.expect_secs).await?;
                 next_report = now + interval;
             }
             tokio::time::sleep(poll.min(next_report.saturating_duration_since(now)).min(
@@ -1343,6 +1342,29 @@ fn max_wait_index(longest: Option<(f64, usize)>, awaited: &[Option<u64>]) -> Opt
     longest
         .map(|(_, index)| index)
         .or_else(|| awaited.iter().position(Option::is_some))
+}
+
+/// Send a `wait_any` interval report for the longest-running watched
+/// turn — the message names that session. `None` while every watched
+/// session is parked rate-limited: nothing running, nothing to report.
+///
+/// # Errors
+///
+/// Propagates a [`ToolContext::report_progress`] rejection — a non-finite
+/// or non-increasing report.
+async fn report_longest(
+    cx: &mut ToolContext,
+    subs: &[Arc<Subagent>],
+    longest: Option<(f64, usize)>,
+    started: Instant,
+    expect_secs: u64,
+) -> aither_core::Result<()> {
+    let Some((elapsed, index)) = longest else {
+        return Ok(());
+    };
+    cx.report_progress(wait_progress(&subs[index], started, elapsed, expect_secs))
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
