@@ -22,7 +22,9 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::registry::Registry;
-use crate::state::{AppState, Launch, Status, Subagent, launch, now, start_turn};
+use crate::state::{
+    AppState, Gate, Launch, Status, Subagent, begin_turn, launch, now, spawn_turn_task,
+};
 
 /// The JSON-RPC code a provider rate-limit rejection carries — inside
 /// the spec's implementation-defined server-error range.
@@ -294,7 +296,12 @@ async fn record_park(
     let session_id = sub.session_id.clone();
     let result = state
         .update_registry(|registry| {
-            if let Some(entry) = registry.get_mut(&session_id) {
+            // The closing check runs under `registry_write`, serialized
+            // against `unschedule_resume`: a `close` that already stored
+            // the flag must not see its cleared mark rewritten.
+            if let Some(entry) = registry.get_mut(&session_id)
+                && !sub.rt.closing.load(Ordering::Relaxed)
+            {
                 entry.rate_limited = Some(crate::registry::RateLimited { resume_at, reason });
             }
         })
@@ -452,8 +459,17 @@ async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
     if let Ok(sub) = state.get(session_id) {
         let parked = {
             let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-            if matches!(inner.status, Status::RateLimited { .. }) {
-                inner.status = Status::Idle;
+            // A session being closed resumes for no one — `close` has the
+            // flag set before it clears the schedule.
+            if matches!(inner.status, Status::RateLimited { .. })
+                && !sub.rt.closing.load(Ordering::Relaxed)
+            {
+                // Reserve the continuation's turn slot — `running` with
+                // no `current` yet, the same shape the queued-turn handoff
+                // leaves — so the status never passes through an `idle`
+                // gap a bound `wait` would end on or a `send` could claim.
+                inner.status = Status::Running;
+                inner.pending_turn_start = Some(jiff::Timestamp::now());
                 true
             } else {
                 false
@@ -462,11 +478,22 @@ async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
         if parked {
             clear_parked(state, session_id).await;
             debug!(%session_id, "resuming rate-limited session");
-            if let Err(error) = start_turn(state.clone(), &sub, RESUME_PROMPT.to_string()).await {
-                warn!(%session_id, %error, "rate-limited resume failed");
-                sub.rt.transition(Status::Failed(format!(
-                    "resume after rate limit failed: {error}"
-                )));
+            let _wire = sub.rt.prompt_send.lock().await;
+            match begin_turn(state, &sub, RESUME_PROMPT.to_string(), Gate::Chained, false).await {
+                Ok((turn_n, fut)) => spawn_turn_task(state.clone(), &sub, fut, turn_n),
+                Err(error) => {
+                    warn!(%session_id, %error, "rate-limited resume failed");
+                    let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+                    inner.pending_turn_start = None;
+                    if !matches!(inner.status, Status::Exited(_))
+                        && !sub.rt.closing.load(Ordering::Relaxed)
+                    {
+                        inner.status =
+                            Status::Failed(format!("resume after rate limit failed: {error}"));
+                    }
+                    drop(inner);
+                    sub.rt.notify.notify_waiters();
+                }
             }
         } else if !matches!(
             sub.rt.inner.lock().expect("inner poisoned").status,
@@ -489,6 +516,12 @@ async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
     let Some(entry) = entry else {
         return;
     };
+    // The parked flag this resume was enumerated from is already gone —
+    // a `close` or a reaping consumed it between the scan and now. The
+    // session must not be relaunched.
+    if entry.rate_limited.is_none() {
+        return;
+    }
     let config = match state.load_config() {
         Ok(config) => config,
         Err(error) => {

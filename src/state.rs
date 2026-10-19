@@ -1434,6 +1434,49 @@ pub async fn close_sub(sub: &Subagent) {
     }
 }
 
+/// Consume every registry mark that would bring `session_id` back on its
+/// own.
+///
+/// Both schedules go: the rate-limit park the resume scheduler fires at
+/// `resume_at`, and the restart `resume` mark the next daemon re-adopts
+/// on. A session ended on purpose is done — the entry stays registered
+/// for a manual `adopt`, but no schedule may relaunch it.
+///
+/// Shared by every path that ends a session deliberately: the `close`
+/// tool and the daemon's orphan reaper.
+pub async fn unschedule_resume(state: &Arc<AppState>, session_id: &str) {
+    let result = state
+        .update_registry(|registry| {
+            if let Some(entry) = registry.get_mut(session_id) {
+                entry.rate_limited = None;
+                entry.resume = None;
+            }
+        })
+        .await;
+    if let Err(error) = result {
+        warn!(%session_id, %error, "registry persist failed");
+    }
+}
+
+/// End `sub`'s session for good: flag it closing, consume every registry
+/// mark that would bring the session back, then tear the agent process
+/// down.
+///
+/// `closing` is stored before the marks clear so a mark write serialized
+/// after this update sees the flag and skips; one serialized before it is
+/// consumed by `unschedule_resume`. `close_sub` stores the flag again —
+/// idempotent — as part of teardown.
+///
+/// Shared by the paths that end a live session on purpose: the `close`
+/// tool and the daemon's orphan reaper. `close` on a registry-only
+/// session — no `Subagent`, nothing to flag or tear down — calls
+/// `unschedule_resume` alone.
+pub async fn end_session(state: &Arc<AppState>, sub: &Subagent) {
+    sub.rt.closing.store(true, Ordering::Relaxed);
+    unschedule_resume(state, &sub.session_id).await;
+    close_sub(sub).await;
+}
+
 /// Pump agent stderr into the tail buffer and tracing.
 async fn pump_stderr(stderr: async_process::ChildStderr, rt: Arc<SubRuntime>) {
     use futures_lite::{AsyncBufReadExt, StreamExt};
@@ -2078,7 +2121,12 @@ async fn finish_turn(
                 entry.turns = turns;
                 entry.last_turn = Some(now());
                 entry.turn_started = None;
-                if let Some(parked) = parked {
+                // The closing check runs under `registry_write`, serialized
+                // against `unschedule_resume`: a `close` that already
+                // stored the flag must not see its cleared mark rewritten.
+                if let Some(parked) = parked
+                    && !rt.closing.load(Ordering::Relaxed)
+                {
                     entry.rate_limited = Some(parked);
                 }
             }

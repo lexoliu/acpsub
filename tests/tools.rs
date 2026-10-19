@@ -2466,7 +2466,14 @@ async fn rate_limit_resumes_after_restart() {
     )
     .await;
     status_becomes(&state, sid.as_str(), "rate_limited").await;
-    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+    // The agent dies without a `close`: the parked schedule stays on the
+    // registry entry — that is what the rebuilt state resumes on.
+    state
+        .get(sid.as_str())
+        .expect("live subagent")
+        .rt
+        .kill_process_tree();
+    status_becomes(&state, sid.as_str(), "exited").await;
 
     // Down and back up: the registry file is all that survives.
     drop(tools);
@@ -2538,7 +2545,12 @@ async fn rate_limit_resume_keeps_owner() {
     )
     .await;
     status_becomes(&state, sid.as_str(), "rate_limited").await;
-    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+    state
+        .get(sid.as_str())
+        .expect("live subagent")
+        .rt
+        .kill_process_tree();
+    status_becomes(&state, sid.as_str(), "exited").await;
 
     drop(tools);
     drop(state);
@@ -2592,4 +2604,174 @@ async fn drain_refuses_new_work() {
 
     let again = call_err(&tools, "daemon/drain", json!({})).await;
     assert!(again.contains("already in progress"), "{again}");
+}
+
+/// `close` on a parked session is final: the rate-limit schedule is
+/// consumed, so the scheduler's due pass resumes the parked control
+/// session but never relaunches the closed one — `list` reports it
+/// `closed`, not `rate_limited`.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_cancels_rate_limit_resume() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let first = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    status_becomes(&state, first.as_str(), "rate_limited").await;
+
+    // A second session parked on the same quota gate — it shares the
+    // scope's `resume_at`, so the scheduler's due pass covers both. The
+    // pass runs in session-id order, so the one that sorts first is
+    // closed and the other is the control: the control's resume proves
+    // the closed session's slot was already processed.
+    let parked = call_json(
+        &tools,
+        "spawn",
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "hi", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    assert_eq!(parked["state"], "rate_limited", "{parked}");
+    let second = parked["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    let (sid_a, sid_b) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    call_json(&tools, "close", json!({"session_id": sid_a.as_str()})).await;
+
+    // The schedule is consumed, on disk too: the entry still lists but
+    // reports `closed`, with no reset time.
+    let list = call_json(&tools, "list", json!({})).await;
+    let entry = list["subagents"]
+        .as_array()
+        .expect("subagents")
+        .iter()
+        .find(|sub| sub["session_id"] == sid_a)
+        .expect("session still listed");
+    assert_eq!(entry["state"], "closed", "{entry}");
+    assert!(entry.get("resume_at").is_none(), "{entry}");
+    let registry: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("registry.json")).expect("registry"),
+    )
+    .expect("registry is json");
+    assert!(
+        registry[sid_a.as_str()].get("rate_limited").is_none(),
+        "{registry}"
+    );
+
+    // The control's continuation turn starting is the event: the due pass
+    // ran, and the closed session's earlier slot produced nothing.
+    status_becomes(&state, sid_b.as_str(), "running").await;
+    assert!(
+        state.get(sid_a.as_str()).is_err(),
+        "closed session came back live"
+    );
+    let text = call_text(&tools, "transcript", json!({"session_id": sid_a.as_str()})).await;
+    assert!(!text.contains("rate limit has lifted"), "{text}");
+    let status = call_json(&tools, "status", json!({"session_id": sid_a.as_str()})).await;
+    assert_eq!(status["state"], "closed", "{status}");
+}
+
+/// `close` on a session marked for the next daemon's `session/load`
+/// resume consumes the mark: the next daemon's startup resume pass skips
+/// it — the session stays closed instead of being reloaded.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_cancels_restart_resume() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &sid, 60).await;
+
+    // The mark a drain leaves on a live session's registry entry.
+    state
+        .update_registry(|registry| {
+            registry.get_mut(sid.as_str()).expect("registered").resume =
+                Some(acpsub::registry::Resume {
+                    queued: vec!["after restart".to_string()],
+                    failed: None,
+                });
+        })
+        .await
+        .expect("registry write");
+    let registry: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("registry.json")).expect("registry"),
+    )
+    .expect("registry is json");
+    assert!(registry[sid.as_str()]["resume"].is_object(), "{registry}");
+
+    call_json(&tools, "close", json!({"session_id": sid.as_str()})).await;
+
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["state"], "closed", "{status}");
+    let registry: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("registry.json")).expect("registry"),
+    )
+    .expect("registry is json");
+    assert!(registry[sid.as_str()].get("resume").is_none(), "{registry}");
+
+    drop(tools);
+    drop(state);
+
+    // The next daemon over the same registry: its startup resume pass
+    // reloads every marked session — with the mark consumed this one
+    // stays closed. A served call is the ordering signal: the accept
+    // loop runs only after the resume pass completes.
+    let (state, tools) = test_state(dir.path());
+    let socket = dir.path().join("daemon.sock");
+    let daemon = tokio::spawn({
+        let state = state.clone();
+        let socket = socket.clone();
+        async move { acpsub::daemon::run(state, &socket).await }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never bound {}",
+            socket.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let report = acpsub::client::call(&socket, "daemon/resumed", json!({}), None)
+        .await
+        .expect("daemon/resumed call");
+    assert!(!report.is_error, "daemon/resumed failed");
+    let text: String = report
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            aither_mcp::protocol::Content::Text(item) => Some(item.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let report: serde_json::Value = serde_json::from_str(&text).expect("report is json");
+    assert!(
+        !report["resumed"]
+            .as_array()
+            .expect("resumed")
+            .iter()
+            .any(|resumed| resumed == &sid),
+        "{report}"
+    );
+    assert!(
+        state.get(sid.as_str()).is_err(),
+        "a closed session was reloaded"
+    );
+    let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
+    assert_eq!(status["state"], "closed", "{status}");
+    daemon.abort();
 }
