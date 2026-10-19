@@ -49,6 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes `long` (`--long`) — a local subagent is meant for short
   execution, so a longer expectation is a planning error the caller must
   own ([#61](https://github.com/lexoliu/acpsub/issues/61))
+- *(tools)* [**breaking**] `send` with `policy: "steer"` returns
+  `{state: "submitted", steer_id, turn}` at once instead of waiting out
+  a 250 ms acknowledgement window for `steered` — ACP has no positive
+  acknowledgement for a folded steer, so `send` reports only the
+  submission. `status` now lists the session's unresolved steers (id and
+  target turn) in `steers`, and a `wait`/`wait_any` bound to a turn holds
+  until every steer that targeted it has resolved, reporting each in
+  `steers` with its outcome — `folded`, `rejected` with the agent's
+  error, or `turn` when it ran as a turn of its own
+  ([#71](https://github.com/lexoliu/acpsub/issues/71))
 
 ## [0.2.0](https://github.com/lexoliu/acpsub/compare/v0.1.0...v0.2.0) - 2026-09-16
 

@@ -25,8 +25,7 @@ use crate::registry::RegistryEntry;
 use crate::state::{
     AppState, Gate, Launch, SessionEnd, Status, Subagent, ToolCallSummary, Turn, begin_turn,
     close_sub, end_session, end_target, launch, next_turn_number, prompt_slot_free,
-    record_queue_dropped, spawn_turn_task, start_turn, steer_resolved, steer_turn, steer_waiter,
-    unschedule_resume,
+    record_queue_dropped, spawn_turn_task, start_turn, steer_turn, steer_waiter, unschedule_resume,
 };
 use crate::transcript::{RenderOptions, render};
 
@@ -41,10 +40,6 @@ const WAIT_ANY_POLL: Duration = Duration::from_millis(50);
 /// never anywhere near idle, sparse enough that the notifications stay
 /// noise.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
-/// How long `send` waits for a synchronous rejection of a steer before
-/// reporting `steered`; an accepted steer resolves only at turn end, so a
-/// longer wait would just stall the caller.
-const STEER_ACK: Duration = Duration::from_millis(250);
 /// Largest `expect_secs` a `wait`/`wait_any` accepts when the call has no
 /// progress channel — [`ToolContext::is_listening`] is false.
 ///
@@ -156,9 +151,11 @@ fn spawned_view(sub: &Subagent) -> Value {
 /// The turn `wait`/`wait_any` binds to at call time: the number of the
 /// turn in flight, or — during the chained-turn gap, when the queue pop
 /// already reserved the slot but `begin_turn` has not stamped `current`
-/// yet — of the turn that is about to start. `None` when the subagent is
-/// not `running`: the call returns at once, unchanged. A queued turn that
-/// starts afterwards does not extend the wait.
+/// yet — of the turn that is about to start. A settled session whose
+/// steers are still in flight binds to the newest one's target turn: the
+/// wait on it is not over until they resolve. Otherwise `None` when the
+/// subagent is not `running`: the call returns at once, unchanged. A
+/// queued turn that starts afterwards does not extend the wait.
 ///
 /// # Errors
 ///
@@ -167,8 +164,16 @@ fn spawned_view(sub: &Subagent) -> Value {
 /// unbounded.
 fn awaited_turn(sub: &Subagent) -> Result<Option<u64>> {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
-    if !matches!(inner.status, Status::Running) {
-        return Ok(None);
+    match inner.status {
+        Status::Running => {}
+        // A permission request or a park is reported at once; a dead
+        // agent has no steers left.
+        Status::NeedsPermission | Status::RateLimited { .. } | Status::Exited(_) => {
+            return Ok(None);
+        }
+        Status::Idle | Status::Done(_) | Status::Cancelled | Status::Failed(_) => {
+            return Ok(inner.steer_pending.back().map(|steer| steer.target));
+        }
     }
     if let Some(turn) = &inner.current {
         return Ok(Some(turn.n));
@@ -202,6 +207,12 @@ enum Awaited {
     /// rate-limited: the wait freezes — it must not end, and the pause
     /// does not count against `expect_secs`.
     Paused,
+    /// The awaited turn ended but a steer targeting it is still in
+    /// flight: the wait holds — a steer resolves only once the agent
+    /// answers or rejects its `session/prompt` — with the seconds since
+    /// the turn's own start counting against `expect_secs`, so a steer
+    /// the agent never answers ends the wait as an `overrun`.
+    Steers(f64),
     /// No longer the in-flight turn — settled into `turns`, superseded by
     /// a chained or materialized turn, parked on a permission request
     /// (the wait returns to report it), or gone with the session.
@@ -272,6 +283,24 @@ fn awaited_elapsed(sub: &Subagent, n: u64) -> Result<Awaited> {
     // The awaited turn is a resume the session is still parked for.
     if matches!(inner.status, Status::RateLimited { .. }) {
         return Ok(Awaited::Paused);
+    }
+    // The turn is settled, but a wait on it also owns the steers that
+    // targeted it: it returns only once each has resolved — an answered
+    // or rejected `session/prompt`, or a fold settled at the turn's end.
+    // Their resolution is part of the awaited work, so its time counts
+    // from the turn's own start.
+    if inner.steer_pending.iter().any(|steer| steer.target == n) {
+        let Some(started) = inner
+            .turns
+            .iter()
+            .find(|turn| turn.n == n)
+            .and_then(|turn| turn.started_at)
+        else {
+            return Err(missing_start());
+        };
+        return Ok(Awaited::Steers(
+            jiff::Timestamp::now().duration_since(started).as_secs_f64(),
+        ));
     }
     drop(inner);
     Ok(Awaited::Ended)
@@ -486,6 +515,38 @@ fn activity_digest(turn: Option<&Turn>, window_start: jiff::Timestamp) -> Activi
     }
 }
 
+/// The `steers` list of a wait result for the reported turn: the recorded
+/// resolutions, plus `"pending"` for any steer still in flight — on an
+/// `Ended` outcome there are none, since the wait held for them.
+fn turn_steer_view(
+    inner: &crate::state::Inner,
+    turn: Option<&Turn>,
+    turn_n: Option<u64>,
+) -> Vec<Value> {
+    let mut steers: Vec<Value> = turn.map_or_else(Vec::new, |turn| {
+        turn.steers
+            .iter()
+            .map(|end| {
+                serde_json::to_value(end)
+                    .expect("SteerEnd holds only owned primitives; serialization cannot fail")
+            })
+            .collect()
+    });
+    steers.extend(
+        inner
+            .steer_pending
+            .iter()
+            .filter(|steer| Some(steer.target) == turn_n)
+            .map(|steer| json!({"steer_id": steer.id, "outcome": "pending"})),
+    );
+    steers.sort_by_key(|end| {
+        end["steer_id"]
+            .as_u64()
+            .expect("every steer view carries its id")
+    });
+    steers
+}
+
 /// The `pending_permission` field of a wait result, for the first queued
 /// permission request.
 fn pending_view(perm: &crate::state::PendingPermission) -> Value {
@@ -535,71 +596,27 @@ fn wait_view(
     window_start: jiff::Timestamp,
     parked_secs: f64,
 ) -> Value {
-    let (status, reply, tool_calls, pending, turn_n, queued, elapsed, latest, ended_reason, digest) = {
-        let inner = sub.rt.inner.lock().expect("inner poisoned");
-        // The awaited turn's own record — the same lookup `result` uses
-        // for an explicit turn number: `turns` once settled, `current`
-        // while it is still in flight. A queued turn that already chained
-        // into `current` must not shadow it.
-        let turn = awaited.map_or_else(
-            || inner.current.as_ref().or_else(|| inner.turns.last()),
-            |n| {
-                inner
-                    .turns
-                    .iter()
-                    .find(|turn| turn.n == n)
-                    .or_else(|| inner.current.as_ref().filter(|turn| turn.n == n))
-            },
-        );
-        let digest = match outcome {
-            WaitOutcome::Ended => None,
-            WaitOutcome::Overrun | WaitOutcome::MaxWait => {
-                Some(activity_digest(turn, window_start))
-            }
-        };
-        let pending = inner.pending.first().map(pending_view);
-        (
-            inner.status.clone(),
-            turn.map_or_else(String::new, |turn| turn.reply.clone()),
-            turn.map_or_else(Vec::new, |turn| {
-                turn.tool_calls.values().cloned().collect::<Vec<_>>()
-            }),
-            pending,
-            turn.map(|turn| turn.n).or(awaited),
-            inner.queue.len(),
-            turn.and_then(|turn| turn.started_at).map(|started| {
-                parked_secs + jiff::Timestamp::now().duration_since(started).as_secs_f64()
-            }),
-            turn.and_then(|turn| {
-                turn.latest_tool_call
-                    .as_ref()
-                    .and_then(|id| turn.tool_calls.get(id))
-                    .cloned()
-            }),
-            turn.and_then(|turn| turn.stop_reason)
-                .filter(|_| awaited.is_some()),
-            digest,
-        )
-    };
+    let snap = wait_snapshot(sub, outcome, awaited, window_start, parked_secs);
     let mut view = json!({
         "session_id": sub.session_id,
-        "state": status.name(),
-        "turn": turn_n,
-        "reply": reply,
-        "tool_calls": tool_calls,
-        "queued": queued,
+        "state": snap.status.name(),
+        "turn": snap.turn_n,
+        "reply": snap.reply,
+        "tool_calls": snap.tool_calls,
+        "queued": snap.queued,
         "elapsed_secs": started.elapsed().as_secs_f64(),
+        "steers": snap.steers,
     });
     if outcome == WaitOutcome::Overrun {
         view["state"] = json!("overrun");
-        if let Some(elapsed) = elapsed {
+        if let Some(elapsed) = snap.elapsed {
             view["elapsed_secs"] = json!(elapsed);
         }
-        if let Some(latest) = latest {
+        if let Some(latest) = snap.latest {
             view["latest_tool_call"] = serde_json::to_value(latest)
                 .expect("ToolCallSummary holds only owned primitives; serialization cannot fail");
         }
-    } else if let Some(reason) = ended_reason {
+    } else if let Some(reason) = snap.ended_reason {
         // The awaited turn's own end: its stop reason wins over the
         // session status, which may already show the turn that chained
         // after it.
@@ -610,7 +627,7 @@ fn wait_view(
         });
         view["stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
     } else {
-        match &status {
+        match &snap.status {
             Status::Done(reason) => {
                 view["stop_reason"] = serde_json::to_value(reason).unwrap_or_default();
             }
@@ -626,18 +643,98 @@ fn wait_view(
     // A parked session reports where the wait stands regardless of how
     // the wait ended: `rate_limited`, the reset time, and the provider's
     // own reason.
-    if let Status::RateLimited { resume_at, reason } = &status {
+    if let Status::RateLimited { resume_at, reason } = &snap.status {
         view["resume_at"] = json!(resume_at.to_string());
         view["reason"] = json!(reason);
     }
-    if let Some(pending) = pending {
+    if let Some(pending) = snap.pending {
         view["pending_permission"] = pending;
     }
-    if let Some(digest) = digest {
+    if let Some(digest) = snap.digest {
         view["digest"] = serde_json::to_value(digest)
             .expect("ActivityDigest holds only owned primitives; serialization cannot fail");
     }
     view
+}
+
+/// The shared-state snapshot [`wait_view`] renders into its result.
+struct WaitSnapshot {
+    /// Live session status.
+    status: Status,
+    /// The reported turn's concatenated reply text.
+    reply: String,
+    /// The reported turn's tool calls.
+    tool_calls: Vec<ToolCallSummary>,
+    /// The first queued permission request's view, when any wait.
+    pending: Option<Value>,
+    /// The reported turn's number — the awaited turn's when it is bound.
+    turn_n: Option<u64>,
+    /// Client-side queued prompt count.
+    queued: usize,
+    /// The reported turn's elapsed seconds, including banked pre-park time.
+    elapsed: Option<f64>,
+    /// The reported turn's latest tool call summary.
+    latest: Option<ToolCallSummary>,
+    /// The awaited turn's stop reason — `None` on the latest-turn view.
+    ended_reason: Option<StopReason>,
+    /// The activity digest an `Overrun`/`MaxWait` outcome carries.
+    digest: Option<ActivityDigest>,
+    /// The reported turn's steer resolutions (`turn_steer_view`).
+    steers: Vec<Value>,
+}
+
+/// Read the state [`wait_view`] reports under one `inner` lock.
+fn wait_snapshot(
+    sub: &Subagent,
+    outcome: WaitOutcome,
+    awaited: Option<u64>,
+    window_start: jiff::Timestamp,
+    parked_secs: f64,
+) -> WaitSnapshot {
+    let inner = sub.rt.inner.lock().expect("inner poisoned");
+    // The awaited turn's own record — the same lookup `result` uses
+    // for an explicit turn number: `turns` once settled, `current`
+    // while it is still in flight. A queued turn that already chained
+    // into `current` must not shadow it.
+    let turn = awaited.map_or_else(
+        || inner.current.as_ref().or_else(|| inner.turns.last()),
+        |n| {
+            inner
+                .turns
+                .iter()
+                .find(|turn| turn.n == n)
+                .or_else(|| inner.current.as_ref().filter(|turn| turn.n == n))
+        },
+    );
+    let digest = match outcome {
+        WaitOutcome::Ended => None,
+        WaitOutcome::Overrun | WaitOutcome::MaxWait => Some(activity_digest(turn, window_start)),
+    };
+    let turn_n = turn.map(|turn| turn.n).or(awaited);
+    WaitSnapshot {
+        status: inner.status.clone(),
+        reply: turn.map_or_else(String::new, |turn| turn.reply.clone()),
+        tool_calls: turn.map_or_else(Vec::new, |turn| {
+            turn.tool_calls.values().cloned().collect::<Vec<_>>()
+        }),
+        pending: inner.pending.first().map(pending_view),
+        turn_n,
+        queued: inner.queue.len(),
+        elapsed: turn.and_then(|turn| turn.started_at).map(|started| {
+            parked_secs + jiff::Timestamp::now().duration_since(started).as_secs_f64()
+        }),
+        latest: turn.and_then(|turn| {
+            turn.latest_tool_call
+                .as_ref()
+                .and_then(|id| turn.tool_calls.get(id))
+                .cloned()
+        }),
+        ended_reason: turn
+            .and_then(|turn| turn.stop_reason)
+            .filter(|_| awaited.is_some()),
+        digest,
+        steers: turn_steer_view(&inner, turn, turn_n),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -873,12 +970,18 @@ struct SendArgs {
     /// `steer` — inject the prompt into the running turn (a second
     /// `session/prompt` while it is in flight); agents that support
     /// mid-turn injection fold it into the active task, agents that do not
-    /// surface an error. How the request resolves depends on the agent's
-    /// configured `steer` semantics: an `answered` agent (the default)
-    /// answers every steered prompt, while a `folded` agent (codex-acp)
-    /// never answers one it folded into a turn — acpsub settles such a
-    /// steer when its target turn ends. On either, a steer that landed
-    /// behind the turn's end still runs and resolves as a turn of its own.
+    /// reject the request. `send` returns `{state: "submitted", steer_id,
+    /// turn}` at once — a folded steer has no acknowledgement to wait
+    /// for — and its resolution lands in `status`'s `steers` list (while
+    /// still in flight) and in `wait`'s `steers` on the target turn
+    /// (`folded`, `rejected` with the agent's error, or `turn` when it
+    /// ran as a turn of its own). How the request resolves
+    /// depends on the agent's configured `steer` semantics: an `answered`
+    /// agent (the default) answers every steered prompt, while a `folded`
+    /// agent (codex-acp) never answers one it folded into a turn — acpsub
+    /// settles such a steer when its target turn ends. On either, a steer
+    /// that landed behind the turn's end still runs and resolves as a
+    /// turn of its own.
     policy: SendPolicy,
 }
 
@@ -978,6 +1081,9 @@ impl Tool for SendTool {
 /// parked or dead one is [`Error::NotPromptable`] (`park_prompt` in the
 /// caller has already parked prompts while a limit holds, so the
 /// `rate_limited` arm is unreachable but kept for completeness).
+///
+/// A steer into a running turn returns `submitted` at once: its
+/// resolution is reported by `status`/`wait`, never by this call.
 async fn steer_send(
     state: &Arc<AppState>,
     sub: &Arc<Subagent>,
@@ -997,33 +1103,25 @@ async fn steer_send(
             Ok(json!({"session_id": args.session_id, "state": "running"}))
         }
         Status::Running | Status::NeedsPermission => {
-            let (steer_id, turn_n, mut fut) = steer_turn(sub, args.prompt.clone()).await?;
+            let (steer_id, turn_n, fut) = steer_turn(sub, args.prompt.clone()).await?;
             drop(wire);
-            // An accepted steer resolves only at turn end; a rejection
-            // lands almost at once. Give the agent a beat to reject
-            // before reporting `steered`.
-            if let Ok(outcome) = tokio::time::timeout(STEER_ACK, &mut fut).await {
-                if let Err(source) =
-                    steer_resolved(state.clone(), sub, steer_id, turn_n, outcome).await
-                {
-                    return Err(Error::Agent {
-                        agent: sub.agent.clone(),
-                        source,
-                    }
-                    .into());
-                }
-            } else {
-                tokio::spawn(steer_waiter(
-                    state.clone(),
-                    sub.clone(),
-                    steer_id,
-                    turn_n,
-                    fut,
-                ));
-            }
+            // ACP has no positive acknowledgement for a steer: the agent
+            // answers the concurrent `session/prompt` only at the end of
+            // the turn it folded into, or rejects it. `send` reports only
+            // what it knows — the submission — and the resolution lands on
+            // the target turn's `steers` list via `steer_resolved`, where
+            // `status` and `wait` see it.
+            tokio::spawn(steer_waiter(
+                state.clone(),
+                sub.clone(),
+                steer_id,
+                turn_n,
+                fut,
+            ));
             Ok(json!({
                 "session_id": args.session_id,
-                "state": "steered",
+                "state": "submitted",
+                "steer_id": steer_id,
                 "turn": turn_n,
             }))
         }
@@ -1042,10 +1140,18 @@ async fn steer_send(
 // wait / wait_any
 // ---------------------------------------------------------------------------
 
-/// Block until the turn that was running when the call began ends, a
-/// permission request needs an answer, or the turn has run past
-/// `expect_secs`. The wait binds to that turn's number: a queued or
-/// steered turn that starts afterwards does not extend it.
+/// Block until the turn that was running when the call began ends — and
+/// every steer that targeted it has resolved — a permission request
+/// needs an answer, or the turn has run past `expect_secs`. The wait
+/// binds to that turn's number: a queued or steered turn that starts
+/// afterwards does not extend it. Called on a settled session whose
+/// steers are still in flight, it binds to their target turn. The hold
+/// counts against `expect_secs` from the turn's start, so a steer the
+/// agent never answers ends the wait as an `overrun`. The
+/// result's `steers` lists each steer that targeted the awaited turn with
+/// its outcome — `folded`, `rejected` with the agent's `error`, or
+/// `turn` with the number of the turn it ran as when it landed behind the
+/// target's end (`pending` while still in flight on an early return).
 ///
 /// Returns the subagent state (`done`/`cancelled`/`failed`/`exited`/
 /// `needs_permission`), the turn's `reply` (concatenated agent message
@@ -1126,13 +1232,29 @@ impl Tool for WaitTool {
         // they count once against `expect_secs`; the pause never does.
         let mut parked_secs = 0.0;
         let outcome = loop {
-            match awaited_elapsed(&sub, awaited)? {
+            // Armed before the state is read, so a wake that lands between
+            // the read and the await is not lost.
+            let notified = sub.rt.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let state = awaited_elapsed(&sub, awaited)?;
+            // A running turn is re-sampled every 0.25 s. A steer hold
+            // makes no turn progress: it wakes on the notify every steer
+            // resolution sends — `steer_resolved` (a closed connection
+            // fails the steer's request, so `close` lands there too), a
+            // fold at a turn's end, agent exit — or on a deadline.
+            let resample = if matches!(state, Awaited::Running(_)) {
+                0.25
+            } else {
+                f64::MAX
+            };
+            match state {
                 Awaited::Ended => break WaitOutcome::Ended,
                 Awaited::Parked { active, next } => {
                     parked_secs += active;
                     awaited = next;
                 }
-                Awaited::Running(elapsed) => {
+                Awaited::Running(elapsed) | Awaited::Steers(elapsed) => {
                     let elapsed = parked_secs + elapsed;
                     if elapsed >= expect {
                         break WaitOutcome::Overrun;
@@ -1147,13 +1269,13 @@ impl Tool for WaitTool {
                         next_report = now + interval;
                     }
                     let wake = (expect - elapsed)
-                        .min(0.25)
+                        .min(resample)
                         .min(next_report.saturating_duration_since(now).as_secs_f64())
                         .min(deadline.map_or(f64::MAX, |deadline| {
                             deadline.saturating_duration_since(now).as_secs_f64()
                         }));
                     tokio::select! {
-                        () = sub.rt.notify.notified() => {},
+                        () = notified => {},
                         () = tokio::time::sleep(Duration::from_secs_f64(wake)) => {},
                     }
                 }
@@ -1170,7 +1292,7 @@ impl Tool for WaitTool {
                         deadline.saturating_duration_since(now).as_secs_f64()
                     }));
                     tokio::select! {
-                        () = sub.rt.notify.notified() => {},
+                        () = notified => {},
                         () = tokio::time::sleep(Duration::from_secs_f64(wake)) => {},
                     }
                 }
@@ -1290,7 +1412,8 @@ impl Tool for WaitAnyTool {
                     }
                     // Parked rate-limited: nothing running to compare.
                     Awaited::Paused => {}
-                    Awaited::Running(elapsed) => {
+                    // A steer hold counts like the turn it extends.
+                    Awaited::Running(elapsed) | Awaited::Steers(elapsed) => {
                         let elapsed = parked_secs[index] + elapsed;
                         if elapsed >= expect {
                             return Ok(wait_view(
@@ -1373,7 +1496,9 @@ async fn report_longest(
 // ---------------------------------------------------------------------------
 
 /// Report a subagent's state: live status, turn count, last stop reason,
-/// transcript path; or its registry entry when closed.
+/// transcript path; or its registry entry when closed. `steers` lists the
+/// session's unresolved steers — id and target turn — while their
+/// `session/prompt` is still in flight; `wait` reports their outcomes.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct StatusArgs {
     /// Session id, as returned by `spawn`/`adopt`.
@@ -1409,7 +1534,7 @@ impl StatusTool {
             .get(&args.session_id)
             .cloned();
         if let Some(sub) = sub {
-            let (status, turns, last_stop, pending, queued) = {
+            let (status, turns, last_stop, pending, queued, steers) = {
                 let inner = sub.rt.inner.lock().expect("inner poisoned");
                 (
                     inner.status.clone(),
@@ -1421,6 +1546,11 @@ impl StatusTool {
                         .map(|p| p.request_id.clone())
                         .collect::<Vec<_>>(),
                     inner.queue.iter().cloned().collect::<Vec<_>>(),
+                    inner
+                        .steer_pending
+                        .iter()
+                        .map(|steer| json!({"steer_id": steer.id, "turn": steer.target}))
+                        .collect::<Vec<_>>(),
                 )
             };
             let mut view = json!({
@@ -1433,6 +1563,7 @@ impl StatusTool {
                 "cwd": sub.cwd,
                 "turns": turns,
                 "queued": queued,
+                "steers": steers,
                 "transcript": sub.transcript_path,
                 "permission": serde_json::to_value(sub.permission).unwrap_or_default(),
                 "pending_permissions": pending,

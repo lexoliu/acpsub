@@ -304,7 +304,7 @@ async fn wait_returns_the_turn_it_started_on() {
         json!({"session_id": session_id.as_str(), "prompt": "go", "policy": "steer"}),
     )
     .await;
-    assert_eq!(steered["state"], "steered", "{steered}");
+    assert_eq!(steered["state"], "submitted", "{steered}");
 
     let result: ToolResult = tokio::time::timeout(Duration::from_secs(10), async {
         let mut waiting = waiting;
