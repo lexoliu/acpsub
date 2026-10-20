@@ -987,8 +987,8 @@ fn partition(state: &AppState, own_socket: &Path) -> Result<Partition> {
         // record's persisted copy can lag a `repark` that already
         // requeued the prompt, so the shipped record mirrors the queue
         // as it stands.
-        let parked_queue = matches!(inner.status, Status::RateLimited { .. })
-            .then(|| mark.queued.clone());
+        let parked_queue =
+            matches!(inner.status, Status::RateLimited { .. }).then(|| mark.queued.clone());
         drop(inner);
         let entry = registry.get(id).cloned();
         if in_flight {
@@ -1002,8 +1002,7 @@ fn partition(state: &AppState, own_socket: &Path) -> Result<Partition> {
                 session_id: id.clone(),
                 detail: "live session is not registered".to_string(),
             })?;
-            if let (Some(queued), Some(parked)) = (parked_queue, entry.rate_limited.as_mut())
-            {
+            if let (Some(queued), Some(parked)) = (parked_queue, entry.rate_limited.as_mut()) {
                 parked.queued = queued;
             }
             entry.resume = Some(mark);
