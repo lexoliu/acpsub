@@ -221,7 +221,9 @@ enum Command {
         conn: DaemonConn,
     },
     /// Block until the subagent's turn ends, a permission needs an answer,
-    /// or the turn outlives --expect. Designed to run in the background:
+    /// or the turn outlives --expect. A rate-limited (parked) session does
+    /// not end the wait: it blocks until the resumed turn ends, and --expect
+    /// counts from that turn's start. Designed to run in the background:
     /// exit means "check the result".
     Wait {
         /// Session id.

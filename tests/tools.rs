@@ -2842,9 +2842,10 @@ async fn rate_limit_parks_send_and_spawn() {
     assert!(spawned["resume_at"].is_string(), "{spawned}");
     let sid_b = spawned["session_id"].as_str().unwrap().to_string();
 
-    // Both sessions resume on their own and run the continuation
-    // first, then their parked prompts — under the session ids they
-    // started with.
+    // Both sessions resume on their own under the session ids they
+    // started with. A's turn was interrupted by the limit, so it runs the
+    // continuation first and its parked prompt after; B never started a
+    // turn, so its parked prompt is its first and no continuation is sent.
     let text = transcript_eventually(&tools, sid_a.as_str(), "USER (queued)\nqueued one").await;
     let continuation = text.find("rate limit has lifted").expect("continuation");
     let queued = text
@@ -2853,12 +2854,121 @@ async fn rate_limit_parks_send_and_spawn() {
     assert!(continuation < queued, "continuation ran late: {text}");
     assert!(text.contains("END end_turn"), "{text}");
 
-    let text = transcript_eventually(&tools, sid_b.as_str(), "USER (queued)\nhi").await;
-    let continuation = text.find("rate limit has lifted").expect("continuation");
-    let queued = text.find("USER (queued)\nhi").expect("queued prompt");
-    assert!(continuation < queued, "continuation ran late: {text}");
-    assert!(text.contains("END end_turn"), "{text}");
+    let text = transcript_eventually(&tools, sid_b.as_str(), "END end_turn").await;
+    assert!(text.contains("USER (queued)\nhi"), "{text}");
+    assert!(!text.contains("rate limit has lifted"), "{text}");
     assert_eq!(state.get(sid_b.as_str()).expect("live").agent, "ratelimit");
+}
+
+/// A prompt given to `spawn`, or to `send` on an idle session, while the
+/// scope is limited runs as the session's next turn once the limit lifts:
+/// no turn was interrupted, so no continuation is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_parked_prompt_runs_without_continuation() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    // An idle session in the scope before the limit opens.
+    let idle = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "first", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    status_becomes(&state, idle.as_str(), "done").await;
+    let trigger = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    status_becomes(&state, trigger.as_str(), "rate_limited").await;
+
+    let spawned = call_json(
+        &tools,
+        "spawn",
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "from spawn", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    assert_eq!(spawned["state"], "rate_limited", "{spawned}");
+    let spawn_sid = spawned["session_id"].as_str().unwrap().to_string();
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": idle.as_str(), "prompt": "from send", "policy": "try"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "rate_limited", "{sent}");
+
+    // The parked prompt is the first turn after the lift.
+    let text = transcript_eventually(&tools, spawn_sid.as_str(), "END end_turn").await;
+    assert!(text.contains("USER (queued)\nfrom spawn"), "{text}");
+    assert!(!text.contains("rate limit has lifted"), "{text}");
+    let status = call_json(&tools, "status", json!({"session_id": spawn_sid})).await;
+    assert_eq!(status["turns"], 1, "{status}");
+
+    // The idle session's second turn is the parked prompt — nothing in
+    // between.
+    let text = transcript_eventually(&tools, idle.as_str(), "from send").await;
+    assert!(!text.contains("rate limit has lifted"), "{text}");
+    status_becomes(&state, idle.as_str(), "done").await;
+    let status = call_json(&tools, "status", json!({"session_id": idle.as_str()})).await;
+    assert_eq!(status["turns"], 2, "{status}");
+}
+
+/// `wait` armed on a session parked before its turn started blocks until
+/// the resumed turn ends: it neither returns at once nor counts the
+/// parked seconds against `expect_secs`. A `max_wait_secs` shorter than
+/// the park returns its activity digest with the session still
+/// `rate_limited`.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_on_parked_session_blocks_until_resumed_turn_ends() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let trigger = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    status_becomes(&state, trigger.as_str(), "rate_limited").await;
+    let parked = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "hi", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    status_becomes(&state, parked.as_str(), "rate_limited").await;
+
+    let bounded = call_json(
+        &tools,
+        "wait",
+        json!({"session_id": parked.as_str(), "expect_secs": 2, "max_wait_secs": 1}),
+    )
+    .await;
+    assert_eq!(bounded["state"], "rate_limited", "{bounded}");
+    assert!(bounded["resume_at"].is_string(), "{bounded}");
+    assert!(bounded["digest"].is_object(), "{bounded}");
+
+    let started = std::time::Instant::now();
+    let out = call_json(
+        &tools,
+        "wait",
+        json!({"session_id": parked.as_str(), "expect_secs": 2, "max_wait_secs": 30}),
+    )
+    .await;
+    assert_eq!(out["state"], "done", "{out}");
+    assert_eq!(out["turn"], 1, "{out}");
+    assert!(out.get("overrun").is_none(), "{out}");
+    // The ~4 s window opened before this wait was armed: returning at
+    // once would mean the wait ended on the parked state.
+    assert!(
+        started.elapsed().as_secs_f64() >= 1.0,
+        "wait returned at once: {out}"
+    );
 }
 
 /// A `wait` bound to a turn that ends rate-limited stays bound through
@@ -3019,6 +3129,114 @@ async fn rate_limit_resume_keeps_owner() {
     };
     assert_eq!(owner, 424_242);
     status_becomes(&state, sid.as_str(), "done").await;
+}
+
+/// A parked session whose agent process dies keeps its prompts: the
+/// parked queue rides the registry entry, so the scheduler's
+/// `session/load` resume replays it — a queue-parked session's prompts
+/// run in order with no continuation, and a continuation-parked session
+/// runs its continuation then the prompt parked behind it, each exactly
+/// once.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_parked_prompts_survive_agent_death() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+
+    // The interrupted turn parks `continue`; a queued prompt joins
+    // behind the continuation.
+    let continued = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    status_becomes(&state, continued.as_str(), "rate_limited").await;
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": continued.as_str(), "prompt": "behind continuation", "policy": "queued"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "rate_limited", "{sent}");
+
+    // Parked before its turn started — `queue` — two prompts deep.
+    let queued_sid = spawn_id(
+        &tools,
+        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "first queued", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    status_becomes(&state, queued_sid.as_str(), "rate_limited").await;
+    let sent = call_json(
+        &tools,
+        "send",
+        json!({"session_id": queued_sid.as_str(), "prompt": "second queued", "policy": "queued"}),
+    )
+    .await;
+    assert_eq!(sent["state"], "rate_limited", "{sent}");
+
+    // Both agent processes die while parked: the session is a husk — the
+    // registry's parked queue is the only copy of the prompts left.
+    for sid in [&continued, &queued_sid] {
+        state
+            .get(sid)
+            .expect("live subagent")
+            .rt
+            .kill_process_tree();
+        status_becomes(&state, sid, "exited").await;
+    }
+
+    // `status_becomes` pins the `Subagent` it found — a husk's
+    // `session/load` replacement is a new `Arc` it would miss — so the
+    // live map is polled for the fresh session's settle instead.
+    for sid in [&continued, &queued_sid] {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Ok(sub) = state.get(sid)
+                && matches!(
+                    sub.rt.inner.lock().expect("inner poisoned").status,
+                    Status::Done(_)
+                )
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session {sid} never resumed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    // The same ACP session came back — `session/load` replayed its
+    // history — and the continuation ran ahead of the parked prompt,
+    // each exactly once.
+    let text = transcript_eventually(&tools, continued.as_str(), "behind continuation").await;
+    assert!(text.contains("loaded user message"), "{text}");
+    assert_eq!(text.matches("rate limit has lifted").count(), 1, "{text}");
+    // Turn prompts render at column 0 — the `PARKED` record's echo is
+    // indented — so a newline-anchored count sees each run exactly once.
+    assert_eq!(text.matches("\nbehind continuation").count(), 1, "{text}");
+    assert!(
+        text.find("rate limit has lifted").expect("continuation")
+            < text.find("\nbehind continuation").expect("parked prompt"),
+        "{text}"
+    );
+
+    // The queue-parked session ran its parked prompts in order — its own
+    // turns, no continuation.
+    let text = transcript_eventually(&tools, queued_sid.as_str(), "second queued").await;
+    assert!(text.contains("loaded user message"), "{text}");
+    assert!(!text.contains("rate limit has lifted"), "{text}");
+    assert_eq!(text.matches("\nfirst queued").count(), 1, "{text}");
+    assert_eq!(text.matches("\nsecond queued").count(), 1, "{text}");
+    assert!(
+        text.find("\nfirst queued").expect("first queued")
+            < text.find("\nsecond queued").expect("second queued"),
+        "{text}"
+    );
 }
 
 /// `close` on a parked session is final: the rate-limit schedule is

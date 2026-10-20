@@ -124,7 +124,9 @@ pub fn register_daemon_tools(tools: &mut Tools, state: Arc<AppState>) -> aither_
 fn spawned_view(sub: &Subagent) -> Value {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
     let (state, parked) = match &inner.status {
-        Status::RateLimited { resume_at, reason } => (
+        Status::RateLimited {
+            resume_at, reason, ..
+        } => (
             inner.status.name(),
             Some((resume_at.to_string(), reason.clone())),
         ),
@@ -165,11 +167,12 @@ fn awaited_turn(sub: &Subagent) -> Result<Option<u64>> {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
     match inner.status {
         Status::Running => {}
-        // A permission request or a park is reported at once; a dead
-        // agent has no steers left.
-        Status::NeedsPermission | Status::RateLimited { .. } | Status::Exited(_) => {
-            return Ok(None);
-        }
+        // A permission request is reported at once; a dead agent has no
+        // steers left.
+        Status::NeedsPermission | Status::Exited(_) => return Ok(None),
+        // A parked session is not settled: the wait binds to the turn the
+        // resume starts and blocks until it ends.
+        Status::RateLimited { .. } => return Ok(Some(next_turn_number(&inner))),
         Status::Idle | Status::Done(_) | Status::Cancelled | Status::Failed(_) => {
             return Ok(inner.steer_pending.back().map(|steer| steer.target));
         }
@@ -202,9 +205,10 @@ enum Awaited {
         /// The turn number the resume's continuation takes.
         next: u64,
     },
-    /// The awaited turn has not materialized and the session is parked
+    /// The awaited turn has not started and the session is parked
     /// rate-limited: the wait freezes — it must not end, and the pause
-    /// does not count against `expect_secs`.
+    /// does not count against `expect_secs`, which runs from the resumed
+    /// turn's start.
     Paused,
     /// The awaited turn ended but a steer targeting it is still in
     /// flight: the wait holds — a steer resolves only once the agent
@@ -642,7 +646,10 @@ fn wait_view(
     // A parked session reports where the wait stands regardless of how
     // the wait ended: `rate_limited`, the reset time, and the provider's
     // own reason.
-    if let Status::RateLimited { resume_at, reason } = &snap.status {
+    if let Status::RateLimited {
+        resume_at, reason, ..
+    } = &snap.status
+    {
         view["resume_at"] = json!(resume_at.to_string());
         view["reason"] = json!(reason);
     }
@@ -1561,7 +1568,10 @@ impl StatusTool {
             if let Status::Failed(reason) | Status::Exited(reason) = &status {
                 view["error"] = json!(reason);
             }
-            if let Status::RateLimited { resume_at, reason } = &status {
+            if let Status::RateLimited {
+                resume_at, reason, ..
+            } = &status
+            {
                 view["resume_at"] = json!(resume_at.to_string());
                 view["reason"] = json!(reason);
             }
@@ -1884,9 +1894,9 @@ fn live_view(sub: &Subagent) -> Value {
             inner.status.name(),
             inner.turn_offset + inner.turns.len() as u64,
             match &inner.status {
-                Status::RateLimited { resume_at, reason } => {
-                    Some((resume_at.to_string(), reason.clone()))
-                }
+                Status::RateLimited {
+                    resume_at, reason, ..
+                } => Some((resume_at.to_string(), reason.clone())),
                 _ => None,
             },
         )

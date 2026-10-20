@@ -107,6 +107,25 @@ pub struct RateLimited {
     pub resume_at: String,
     /// The provider's own message — the parked reason.
     pub reason: String,
+    /// What the resume sends first.
+    pub plan: ResumePlan,
+    /// The session's send-queue at park time — a parked session's queue
+    /// lives here so a dead agent process cannot take it: a
+    /// `session/load` resume replays it, `continue`'s behind the
+    /// continuation and `queue`'s as the turns themselves.
+    pub queued: Vec<String>,
+}
+
+/// What a parked session's resume sends first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumePlan {
+    /// A turn was interrupted by the limit: the resume sends the
+    /// continuation prompt.
+    Continue,
+    /// No turn was interrupted — the session parked before its turn
+    /// started: the resume runs the first queued prompt.
+    Queue,
 }
 
 /// The session id → entry map backed by `registry.json`.
