@@ -791,7 +791,7 @@ async fn bind(path: &Path) -> Result<async_net::unix::UnixListener> {
                 .map_err(|source| Error::io(format!("cannot chmod {}", path.display()), source))?;
             Ok(listener)
         }
-        Err(bind_error) => {
+        Err(bind_error) if bind_error.kind() == std::io::ErrorKind::AddrInUse => {
             // A leftover socket file: probe it — if nothing answers, it is
             // stale and safe to replace.
             if async_net::unix::UnixStream::connect(path).await.is_ok() {
@@ -806,6 +806,7 @@ async fn bind(path: &Path) -> Result<async_net::unix::UnixListener> {
             async_net::unix::UnixListener::bind(path)
                 .map_err(|_| Error::io(format!("cannot bind {}", path.display()), bind_error))
         }
+        Err(source) => Err(Error::io(format!("cannot bind {}", path.display()), source)),
     }
 }
 
@@ -1675,6 +1676,27 @@ async fn peer_call(
             }
             Some(_) => {}
             None => return Err(disconnected(aither_mcp::McpError::ConnectionClosed)),
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A socket path over the platform's `sun_path` limit fails `bind`
+    /// with a non-`AddrInUse` error: the error must report the bind
+    /// failure, not a stale-socket removal.
+    #[tokio::test]
+    async fn bind_reports_overlong_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s".repeat(256));
+        let error = bind(&path).await.expect_err("overlong path bound");
+        match error {
+            Error::Io { context, source } => {
+                assert!(context.starts_with("cannot bind"), "{context}");
+                assert_ne!(source.kind(), std::io::ErrorKind::AddrInUse);
+            }
+            other => panic!("expected io error, got {other}"),
         }
     }
 }
