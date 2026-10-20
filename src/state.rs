@@ -304,14 +304,17 @@ pub enum Status {
     /// session takes another prompt. Carries the reason.
     Failed(String),
     /// The agent's provider rate-limited the last turn; the session parks
-    /// until `resume_at` and the daemon resumes it on its own — queued
-    /// prompts run after the resume's continuation. Carries the resume
-    /// time and the provider's reason.
+    /// until `resume_at` and the daemon resumes it on its own — with a
+    /// continuation when a turn was interrupted, else with its first
+    /// queued prompt. Carries the resume time, the provider's reason and
+    /// what the resume sends.
     RateLimited {
         /// When the provider says the quota resets.
         resume_at: jiff::Timestamp,
         /// The provider's own message.
         reason: String,
+        /// What the resume sends first.
+        plan: crate::registry::ResumePlan,
     },
     /// The agent process exited; the session is a husk `adopt` reaps (or
     /// `close`/`forget` removes). Carries the reason.
@@ -2276,6 +2279,7 @@ fn park_turn(rt: &SubRuntime, hit: &crate::ratelimit::RateLimit) -> Vec<u64> {
         inner.status = Status::RateLimited {
             resume_at: hit.resume_at,
             reason: hit.reason.clone(),
+            plan: crate::registry::ResumePlan::Continue,
         };
     }
     folded
@@ -2430,16 +2434,35 @@ async fn finish_turn(
             }
         }
     }
-    // Update the registry: turn count and last_turn — and the parked flag
-    // that keeps a rate-limited session's schedule across a daemon
-    // restart.
-    let turns = {
+    record_turn_end(&state, rt, session_id, hit).await;
+    rt.notify.notify_waiters();
+    state.handover.progressed.notify_waiters();
+}
+
+/// Persist a turn's end: the count and `last_turn` stamp — and the
+/// parked flag that keeps a rate-limited session's schedule across a
+/// daemon restart, carrying the send-queue it leaves behind. A turn
+/// that settles unparked disarms the flag: a parked queue chained into
+/// turns while the limit held would otherwise rerun prompts that
+/// already ran.
+async fn record_turn_end(
+    state: &Arc<AppState>,
+    rt: &SubRuntime,
+    session_id: &str,
+    hit: Option<crate::ratelimit::RateLimit>,
+) {
+    let (turns, queue) = {
         let inner = rt.inner.lock().expect("inner poisoned");
-        inner.turn_offset + inner.turns.len() as u64
+        (
+            inner.turn_offset + inner.turns.len() as u64,
+            inner.queue.clone(),
+        )
     };
     let parked = hit.map(|hit| crate::registry::RateLimited {
         resume_at: hit.resume_at.to_string(),
         reason: hit.reason,
+        plan: crate::registry::ResumePlan::Continue,
+        queued: queue.into_iter().collect(),
     });
     let result = state
         .update_registry(|registry| {
@@ -2454,6 +2477,16 @@ async fn finish_turn(
                     && !rt.closing.load(Ordering::Relaxed)
                 {
                     entry.rate_limited = Some(parked);
+                } else if !matches!(
+                    rt.inner.lock().expect("inner poisoned").status,
+                    Status::RateLimited { .. } | Status::Exited(_)
+                ) {
+                    // The armed schedule is spent once a turn settles
+                    // unparked. `rate_limited` keeps its own record —
+                    // a re-park can land between the settle and this
+                    // write — and `exited` keeps the flag for the
+                    // fresh-process resume.
+                    entry.rate_limited = None;
                 }
             }
         })
@@ -2461,8 +2494,6 @@ async fn finish_turn(
     if let Err(error) = result {
         warn!(%error, "registry persist failed");
     }
-    rt.notify.notify_waiters();
-    state.handover.progressed.notify_waiters();
 }
 
 /// Best-effort `cwd` discovery for `adopt`.

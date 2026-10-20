@@ -538,12 +538,67 @@ fn parked_session_follows_restart() {
         "{report}"
     );
 
-    // The schedule's own resume has no client signal (a `wait` returns
-    // the park rather than blocking to it), so the assertion stops at
-    // the carried-over state.
     let status = daemon.status_until(&a, |status| status["live"] == true);
     assert_eq!(status["state"], "rate_limited", "{status}");
     assert!(status["resume_at"].is_string(), "{status}");
+}
+
+/// A prompt parked before its turn started stays marked as the resume's
+/// first turn across a daemon restart: the new daemon runs it without a
+/// continuation, and `wait` blocks until that turn ends.
+#[test]
+fn parked_prompt_resumes_without_continuation_after_restart() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    let spawn = |prompt: &str| {
+        let spawned = daemon.call_json(&[
+            "spawn",
+            "--cwd",
+            &dir.path().to_string_lossy(),
+            "--agent",
+            "slowlimit",
+            "--model",
+            "b",
+            "--mode",
+            "bypass",
+            "--prompt",
+            prompt,
+        ]);
+        spawned["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_string()
+    };
+    let trigger = spawn("ratelimit");
+    let parked = daemon.status_until(&trigger, |status| status["state"] == "rate_limited");
+    assert_eq!(parked["state"], "rate_limited", "{parked}");
+
+    // No turn of this session ever started: its prompt is parked.
+    let b = spawn("hi");
+    let status = daemon.status_until(&b, |status| status["state"] == "rate_limited");
+    assert_eq!(status["state"], "rate_limited", "{status}");
+
+    let output = daemon.run(&["restart"]).expect("restart runs");
+    assert!(
+        output.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = daemon.status_until(&b, |status| status["live"] == true);
+    assert_eq!(status["state"], "rate_limited", "{status}");
+
+    let ended = daemon.call_json(&["wait", &b, "--expect", "60"]);
+    assert_eq!(ended["state"], "done", "{ended}");
+    assert_eq!(ended["turn"], 1, "{ended}");
+    let status = daemon.call_json(&["status", &b]);
+    let path = status["transcript"].as_str().expect("transcript path");
+    let text = std::fs::read_to_string(path).expect("transcript file");
+    assert!(text.contains("\"prompt\":\"hi\""), "{text}");
+    assert!(!text.contains("rate limit has lifted"), "{text}");
 }
 
 /// A session whose `session/load` fails is reported in the resume report

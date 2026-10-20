@@ -502,7 +502,19 @@ async fn handoff_one(state: &Arc<AppState>, next: &Path, sub: Arc<Subagent>) {
         let mut registry = state.registry.lock().expect("registry poisoned");
         registry.get_mut(&session_id).map(|entry| {
             let mut entry = entry.clone();
-            entry.resume = Some(resume_mark(&sub.rt.inner.lock().expect("inner poisoned")));
+            let inner = sub.rt.inner.lock().expect("inner poisoned");
+            let mark = resume_mark(&inner);
+            // A live parked session's queue is the truth: the parked
+            // record's persisted copy can lag a `repark` that already
+            // requeued the prompt, so the shipped record mirrors the
+            // queue as it stands.
+            if matches!(inner.status, Status::RateLimited { .. })
+                && let Some(parked) = entry.rate_limited.as_mut()
+            {
+                parked.queued.clone_from(&mark.queued);
+            }
+            entry.resume = Some(mark);
+            drop(inner);
             entry
         })
     };
@@ -648,10 +660,17 @@ async fn resume_one(
     entry: RegistryEntry,
     report: &mut ResumeReport,
 ) {
-    let queued = entry
-        .resume
-        .as_ref()
-        .map_or_else(Vec::new, |resume| resume.queued.clone());
+    // A parked session's queue lives in its parked record — a dead
+    // process took the send-queue with it, so the registry copy is the
+    // only one there. An unparked session's queued sends ride the
+    // resume mark.
+    let queued = match &entry.rate_limited {
+        Some(parked) => parked.queued.clone(),
+        None => entry
+            .resume
+            .as_ref()
+            .map_or_else(Vec::new, |resume| resume.queued.clone()),
+    };
     let result = launch(
         state,
         config,
@@ -721,6 +740,7 @@ async fn resume_one(
         sub.rt.inner.lock().expect("inner poisoned").status = Status::RateLimited {
             resume_at,
             reason: parked.reason.clone(),
+            plan: parked.plan,
         };
         let parked = parked.clone();
         let result = state
@@ -963,6 +983,12 @@ fn partition(state: &AppState, own_socket: &Path) -> Result<Partition> {
             sub.rt.closing.store(true, Ordering::Relaxed);
         }
         let mark = resume_mark(&inner);
+        // A live parked session's queue is the truth: the parked
+        // record's persisted copy can lag a `repark` that already
+        // requeued the prompt, so the shipped record mirrors the queue
+        // as it stands.
+        let parked_queue =
+            matches!(inner.status, Status::RateLimited { .. }).then(|| mark.queued.clone());
         drop(inner);
         let entry = registry.get(id).cloned();
         if in_flight {
@@ -976,6 +1002,9 @@ fn partition(state: &AppState, own_socket: &Path) -> Result<Partition> {
                 session_id: id.clone(),
                 detail: "live session is not registered".to_string(),
             })?;
+            if let (Some(queued), Some(parked)) = (parked_queue, entry.rate_limited.as_mut()) {
+                parked.queued = queued;
+            }
             entry.resume = Some(mark);
             handed.push(HandedSession {
                 session_id: id.clone(),

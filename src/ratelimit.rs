@@ -7,12 +7,14 @@
 //! every new prompt to every session in the scope parks instead of
 //! burning a request. The resume scheduler wakes at each limit, then
 //! resumes every parked session once its `resume_at` passes — the same
-//! ACP session, `session/load` when the process is gone — with one fixed
-//! continuation prompt, staggered so the first post-limit prompts do not
-//! hit the freshly lifted quota in a single burst. Prompts parked while
-//! the limit held run after the continuation.
+//! ACP session, `session/load` when the process is gone — staggered so
+//! the first post-limit prompts do not hit the freshly lifted quota in a
+//! single burst. The parked state records what the resume sends: a turn
+//! the limit interrupted resumes with one fixed continuation prompt, and
+//! prompts parked behind it run after it; a session parked before its
+//! turn started resumes by running its first queued prompt.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -22,9 +24,9 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::error::Error;
-use crate::registry::Registry;
+use crate::registry::{Registry, ResumePlan};
 use crate::state::{
-    AppState, Gate, Launch, Status, Subagent, begin_turn, launch, now, spawn_turn_task,
+    AppState, Gate, Launch, Status, Subagent, begin_turn, launch, now, spawn_turn_task, start_turn,
 };
 
 /// The JSON-RPC code a provider rate-limit rejection carries — inside
@@ -207,6 +209,8 @@ pub(crate) struct Parked {
     pub(crate) resume_at: jiff::Timestamp,
     /// The provider's own message — the parked reason.
     pub(crate) reason: String,
+    /// What the resume sends first.
+    pub(crate) plan: ResumePlan,
     /// The prompt's position in the parked queue — the resume's
     /// continuation runs ahead of all of them.
     pub(crate) position: usize,
@@ -228,26 +232,50 @@ pub(crate) async fn park_prompt(
     prompt: &str,
 ) -> Option<Parked> {
     let gate = active_limit(state, &sub.agent);
-    let parked = {
+    let (parked, queued) = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-        let (resume_at, reason) = match &inner.status {
-            Status::RateLimited { resume_at, reason } => (*resume_at, reason.clone()),
-            _ => gate.map(|limit| (limit.resume_at, limit.reason))?,
+        // A session already parked keeps its mark: a prompt joining the
+        // queue neither interrupts a turn nor drops the continuation.
+        let (resume_at, reason, plan) = if let Status::RateLimited {
+            resume_at,
+            reason,
+            plan,
+        } = &inner.status
+        {
+            (*resume_at, reason.clone(), *plan)
+        } else {
+            let limit = gate?;
+            (limit.resume_at, limit.reason, ResumePlan::Queue)
         };
         inner.queue.push_back(prompt.to_string());
         if inner.status.accepts_prompt() {
             inner.status = Status::RateLimited {
                 resume_at,
                 reason: reason.clone(),
+                plan,
             };
         }
-        Parked {
-            resume_at,
-            reason,
-            position: inner.queue.len(),
-        }
+        let queued = inner.queue.iter().cloned().collect();
+        (
+            Parked {
+                resume_at,
+                reason,
+                plan,
+                position: inner.queue.len(),
+            },
+            queued,
+        )
     };
-    record_park(state, sub, prompt, parked.resume_at, &parked.reason).await;
+    record_park(
+        state,
+        sub,
+        prompt,
+        parked.resume_at,
+        &parked.reason,
+        parked.plan,
+        queued,
+    )
+    .await;
     ensure_scheduler(state);
     Some(parked)
 }
@@ -266,27 +294,42 @@ pub(crate) async fn repark_prompt(
     prompt: &str,
     limit: &Limit,
 ) {
-    {
+    let queued = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         inner.pending_turn_start = None;
         inner.status = Status::RateLimited {
             resume_at: limit.resume_at,
             reason: limit.reason.clone(),
+            plan: ResumePlan::Queue,
         };
         inner.queue.push_front(prompt.to_string());
-    }
-    record_park(state, sub, prompt, limit.resume_at, &limit.reason).await;
+        inner.queue.iter().cloned().collect()
+    };
+    record_park(
+        state,
+        sub,
+        prompt,
+        limit.resume_at,
+        &limit.reason,
+        ResumePlan::Queue,
+        queued,
+    )
+    .await;
     ensure_scheduler(state);
 }
 
 /// The park's records and wake-ups: the transcript's `park` record, the
-/// registry's `rate_limited` flag, and a `notify` for `wait` callers.
+/// registry's `rate_limited` flag — with the session's queue, so a dead
+/// agent process cannot take the parked prompts with it — and a `notify`
+/// for `wait` callers.
 async fn record_park(
     state: &Arc<AppState>,
     sub: &Subagent,
     prompt: &str,
     resume_at: jiff::Timestamp,
     reason: &str,
+    plan: ResumePlan,
+    queued: Vec<String>,
 ) {
     let record = json!({"ts": now(), "park": prompt, "resume_at": resume_at.to_string()});
     if let Err(error) = sub.rt.transcript.lock().await.append(&record).await {
@@ -303,7 +346,12 @@ async fn record_park(
             if let Some(entry) = registry.get_mut(&session_id)
                 && !sub.rt.closing.load(Ordering::Relaxed)
             {
-                entry.rate_limited = Some(crate::registry::RateLimited { resume_at, reason });
+                entry.rate_limited = Some(crate::registry::RateLimited {
+                    resume_at,
+                    reason,
+                    plan,
+                    queued,
+                });
             }
         })
         .await;
@@ -453,7 +501,9 @@ fn parked_next(state: &AppState) -> Option<jiff::Timestamp> {
 /// cannot resume reports `failed`, a dead one stays registered for a
 /// manual `adopt`. A superseded daemon leaves parked sessions alone: they
 /// hand off to the next generation, whose scheduler owns the resume — and
-/// that scheduler skips any session an older generation still owns.
+/// that scheduler skips any session an older generation still owns, one
+/// whose own handoff-resume or `session/load` launch is already in
+/// flight.
 async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
     if state.handover.superseded.load(Ordering::Relaxed)
         || state
@@ -462,60 +512,103 @@ async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
             .lock()
             .expect("foreign poisoned")
             .contains_key(session_id)
+        || state
+            .handover
+            .resuming
+            .lock()
+            .expect("resuming poisoned")
+            .contains(session_id)
+        || state
+            .reserved
+            .lock()
+            .expect("reserved poisoned")
+            .contains_key(session_id)
     {
         return;
     }
     if let Ok(sub) = state.get(session_id) {
-        let parked = {
-            let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-            // A session being closed resumes for no one — `close` has the
-            // flag set before it clears the schedule.
-            if matches!(inner.status, Status::RateLimited { .. })
-                && !sub.rt.closing.load(Ordering::Relaxed)
-            {
-                // Reserve the continuation's turn slot — `running` with
-                // no `current` yet, the same shape the queued-turn handoff
-                // leaves — so the status never passes through an `idle`
-                // gap a bound `wait` would end on or a `send` could claim.
-                inner.status = Status::Running;
-                inner.pending_turn_start = Some(jiff::Timestamp::now());
-                true
-            } else {
-                false
-            }
-        };
-        if parked {
-            clear_parked(state, session_id).await;
-            debug!(%session_id, "resuming rate-limited session");
-            let _wire = sub.rt.prompt_send.lock().await;
-            match begin_turn(state, &sub, RESUME_PROMPT.to_string(), Gate::Chained, false).await {
-                Ok((turn_n, fut)) => spawn_turn_task(state.clone(), &sub, fut, turn_n),
-                Err(error) => {
-                    warn!(%session_id, %error, "rate-limited resume failed");
-                    let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-                    inner.pending_turn_start = None;
-                    if !matches!(inner.status, Status::Exited(_))
-                        && !sub.rt.closing.load(Ordering::Relaxed)
-                    {
-                        inner.status =
-                            Status::Failed(format!("resume after rate limit failed: {error}"));
-                    }
-                    drop(inner);
-                    sub.rt.notify.notify_waiters();
-                }
-            }
-        } else if !matches!(
-            sub.rt.inner.lock().expect("inner poisoned").status,
-            Status::Exited(_)
-        ) {
-            // A live session that is neither parked nor a dead husk: the
-            // flag is stale — the session moved on without the schedule.
-            clear_parked(state, session_id).await;
-        }
-        return;
+        resume_live(state, &sub).await;
+    } else {
+        resume_loaded(state, session_id).await;
     }
-    // The process is gone — resume the same ACP session on a fresh one
-    // with `session/load`.
+}
+
+/// Reserve the turn slot of a parked live session and name the turn its
+/// resume starts: the continuation of an interrupted turn, else the
+/// queue's first prompt. `None` when the session is not parked, or is
+/// being closed — `close` has the flag set before it clears the
+/// schedule. The reserved slot is `running` with no `current` yet, the
+/// same shape the queued-turn handoff leaves, so the status never passes
+/// through an `idle` gap a bound `wait` would end on or a `send` could
+/// claim.
+///
+/// # Panics
+///
+/// Panics when the session is parked for its queue and the queue is
+/// empty — the park recorded a prompt that is gone.
+fn reserve_resume_turn(sub: &Subagent) -> Option<(String, bool)> {
+    let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+    let Status::RateLimited { plan, .. } = inner.status else {
+        return None;
+    };
+    if sub.rt.closing.load(Ordering::Relaxed) {
+        return None;
+    }
+    let prompt = match plan {
+        ResumePlan::Continue => RESUME_PROMPT.to_string(),
+        ResumePlan::Queue => inner.queue.pop_front().unwrap_or_else(|| {
+            panic!(
+                "session {} parked for its queue with an empty queue",
+                sub.session_id
+            )
+        }),
+    };
+    inner.status = Status::Running;
+    inner.pending_turn_start = Some(jiff::Timestamp::now());
+    drop(inner);
+    Some((prompt, plan == ResumePlan::Queue))
+}
+
+/// Resume a parked session whose process lives, in its own ACP session.
+async fn resume_live(state: &Arc<AppState>, sub: &Arc<Subagent>) {
+    let session_id = sub.session_id.as_str();
+    if let Some((prompt, queued)) = reserve_resume_turn(sub) {
+        clear_parked(state, session_id).await;
+        debug!(%session_id, "resuming rate-limited session");
+        let _wire = sub.rt.prompt_send.lock().await;
+        match begin_turn(state, sub, prompt, Gate::Chained, queued).await {
+            Ok((turn_n, fut)) => spawn_turn_task(state.clone(), sub, fut, turn_n),
+            Err(error) => {
+                warn!(%session_id, %error, "rate-limited resume failed");
+                let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+                inner.pending_turn_start = None;
+                if !matches!(inner.status, Status::Exited(_))
+                    && !sub.rt.closing.load(Ordering::Relaxed)
+                {
+                    inner.status =
+                        Status::Failed(format!("resume after rate limit failed: {error}"));
+                }
+                drop(inner);
+                sub.rt.notify.notify_waiters();
+            }
+        }
+    } else if matches!(
+        sub.rt.inner.lock().expect("inner poisoned").status,
+        Status::Exited(_)
+    ) {
+        // The agent died while parked: `launch` reaps the husk and the
+        // same ACP session resumes on a fresh process.
+        resume_loaded(state, session_id).await;
+    } else {
+        // A live session that is neither parked nor a dead husk: the
+        // flag is stale — the session moved on without the schedule.
+        clear_parked(state, session_id).await;
+    }
+}
+
+/// The process is gone — resume the same ACP session on a fresh one with
+/// `session/load`.
+async fn resume_loaded(state: &Arc<AppState>, session_id: &str) {
     let entry = state
         .registry
         .lock()
@@ -528,9 +621,9 @@ async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
     // The parked flag this resume was enumerated from is already gone —
     // a `close` or a reaping consumed it between the scan and now. The
     // session must not be relaunched.
-    if entry.rate_limited.is_none() {
+    let Some(parked) = entry.rate_limited else {
         return;
-    }
+    };
     let config = match state.load_config() {
         Ok(config) => config,
         Err(error) => {
@@ -540,13 +633,27 @@ async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
         }
     };
     debug!(%session_id, agent = %entry.agent, "resuming rate-limited session via session/load");
+    // The parked queue is the resume's turn list: a continuation rides
+    // the launch and the queued prompts run after it; a queue-parked
+    // session's first entry opens the first turn and the rest queue
+    // behind it.
+    let mut queued = VecDeque::from(parked.queued);
+    let (first, launch_prompt) = match parked.plan {
+        ResumePlan::Continue => (None, Some(RESUME_PROMPT.to_string())),
+        ResumePlan::Queue => (
+            Some(queued.pop_front().unwrap_or_else(|| {
+                panic!("session {session_id} parked for its queue with an empty queue")
+            })),
+            None,
+        ),
+    };
     let result = launch(
         state,
         &config,
         Launch {
             agent: entry.agent,
             cwd: entry.cwd,
-            prompt: Some(RESUME_PROMPT.to_string()),
+            prompt: launch_prompt,
             mode: entry.mode,
             model: entry.model,
             config: BTreeMap::new(),
@@ -558,16 +665,31 @@ async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
         },
     )
     .await;
-    if let Err(error) = result {
-        // A `close` that landed while the `session/load` was in flight
-        // ended the session on purpose and already consumed the parked
-        // flag — not a resume failure.
-        if matches!(error, Error::ClosedWhileLaunching(_)) {
-            debug!(%session_id, "rate-limited session closed while resuming");
-        } else {
-            warn!(%session_id, %error, "rate-limited resume failed");
-            clear_parked(state, session_id).await;
+    let sub = match result {
+        Ok(sub) => sub,
+        Err(error) => {
+            // A `close` that landed while the `session/load` was in
+            // flight ended the session on purpose and already consumed
+            // the parked flag — not a resume failure.
+            if matches!(error, Error::ClosedWhileLaunching(_)) {
+                debug!(%session_id, "rate-limited session closed while resuming");
+            } else {
+                warn!(%session_id, %error, "rate-limited resume failed");
+                clear_parked(state, session_id).await;
+            }
+            return;
         }
+    };
+    sub.rt
+        .inner
+        .lock()
+        .expect("inner poisoned")
+        .queue
+        .extend(queued);
+    if let Some(first) = first
+        && let Err(error) = start_turn(state.clone(), &sub, first).await
+    {
+        warn!(%session_id, %error, "queued prompt failed to start after resume");
     }
 }
 
