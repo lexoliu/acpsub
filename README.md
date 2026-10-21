@@ -103,7 +103,7 @@ file that fails to parse is a tool error, never a stale fallback.
 | `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
 | `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
 | `permit` | `session_id, request_id, option_id` | Answer a queued `ask`-policy permission request. |
-| `transcript` | `session_id, from?, tail?, full?, thinking?` | Rendered transcript (same output as the CLI). |
+| `transcript` | `session_id, from?, tail?, full?, thinking?, meta?` | Rendered transcript (same output as the CLI). |
 | `list` | — | Live and registered subagents with state. |
 | `close` | `session_id` | End the process; keep the registry entry (still adoptable). |
 | `forget` | `session_id` | Remove the registry entry (and the process if live). |
@@ -260,6 +260,7 @@ acpsub daemon [--socket PATH] [--config PATH] [--log-file PATH]
                                                 # MCP over a Unix socket
 acpsub agents [--config PATH]                    # list configured agents
 acpsub transcript <session_id> [--from N] [--tail N] [--full] [--thinking]
+              [--meta]
 ```
 
 Every tool in the table above is also a client subcommand that talks to the
@@ -314,9 +315,12 @@ pong
 === [turn 1] END end_turn
 ```
 
-Long values are clipped to 400 chars unless `--full`; `--tail N` shows the
-last N records, `--from N` skips the first N, `--thinking` includes
-`agent_thought_chunk` records.
+Long values are clipped to 400 chars unless `--full`. `--tail N` shows the
+last N rendered sections and `--from N` skips the first N — a section is a
+merged run of message chunks, a tool call, a result, a prompt, or a turn
+end. `--thinking` includes `agent_thought_chunk` records; `--meta` includes
+session-state updates (session info, config options, available commands,
+usage), which are hidden by default.
 
 ## Development
 

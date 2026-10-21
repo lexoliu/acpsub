@@ -353,10 +353,10 @@ enum Command {
     Transcript {
         /// Session id.
         session_id: String,
-        /// Start at record N (skip the first N records).
+        /// Start at section N (skip the first N rendered sections).
         #[arg(long)]
         from: Option<usize>,
-        /// Show only the last N records.
+        /// Show only the last N rendered sections.
         #[arg(long)]
         tail: Option<usize>,
         /// Do not clip long values.
@@ -365,6 +365,10 @@ enum Command {
         /// Include thinking chunks.
         #[arg(long)]
         thinking: bool,
+        /// Include session-state updates (session info, config options,
+        /// available commands, usage), which are hidden by default.
+        #[arg(long)]
+        meta: bool,
         /// Config file path (default ~/.config/acpsub/config.toml).
         #[arg(long)]
         config: Option<PathBuf>,
@@ -406,9 +410,10 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             tail,
             full,
             thinking,
+            meta,
             config,
         } => {
-            transcript(&session_id, config, from, tail, full, thinking)?;
+            transcript(&session_id, config, from, tail, full, thinking, meta)?;
             Ok(ExitCode::SUCCESS)
         }
         command => call(command).await,
@@ -806,6 +811,7 @@ fn transcript(
     tail: Option<usize>,
     full: bool,
     thinking: bool,
+    meta: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(config)?;
     let path = config
@@ -821,6 +827,7 @@ fn transcript(
             tail,
             full,
             thinking,
+            meta,
         },
     );
     std::io::stdout().write_all(rendered.as_bytes())?;
