@@ -981,6 +981,100 @@ fn send_during_handoff_waits_for_the_ship() {
     daemon.wait_marker("session handed off to the next daemon");
 }
 
+/// A successor that dies after the takeover strands nothing: the
+/// superseded daemon sees its connection to the successor close, takes
+/// the public socket back, and the session it kept finishes its turn and
+/// keeps running behind that socket, with no fresh daemon started.
+#[test]
+fn dead_successor_returns_the_socket() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    let old_private = dir.path().join(format!("daemon.{}.sock", daemon.pid));
+
+    let running = daemon.call_json(&[
+        "spawn",
+        "--cwd",
+        &dir.path().to_string_lossy(),
+        "--model",
+        "b",
+        "--mode",
+        "bypass",
+        "--prompt",
+        "gather",
+    ]);
+    let a = running["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // A successor's side of the takeover, by hand: its private listener,
+    // and the public socket renamed onto a listener of its own.
+    let next_socket = dir.path().join("next.sock");
+    let next = UnixListener::bind(&next_socket).expect("bind successor");
+    let public = dir.path().join("next-public.sock");
+    let public_listener = UnixListener::bind(&public).expect("bind successor public");
+    std::fs::rename(&public, &daemon.socket).expect("take the public socket");
+    let report = private_call(
+        &old_private,
+        "daemon/takeover",
+        &serde_json::json!({"socket": next_socket}),
+    );
+    let report: Value = serde_json::from_str(&report).expect("takeover report is json");
+    assert!(
+        report["kept"]
+            .as_array()
+            .expect("kept")
+            .iter()
+            .filter_map(|kept| kept["session_id"].as_str())
+            .any(|id| id == a),
+        "{report}"
+    );
+
+    // The successor dies. Its listeners close without removing their
+    // files, as after a crash, and the connection waiting in its backlog
+    // closes with them.
+    drop(next);
+    drop(public_listener);
+    daemon.wait_marker("successor died; daemon listening again");
+    let pid = std::fs::read_to_string(daemon.socket.with_extension("sock.pid")).expect("pid file");
+    assert_eq!(
+        pid.trim(),
+        daemon.pid.to_string(),
+        "the old daemon leads again"
+    );
+
+    // The kept turn ends where it ran, and the session is live behind the
+    // public socket again.
+    let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
+    assert_eq!(steered["state"], "submitted", "{steered}");
+    let done = daemon.call_json(&["wait", &a, "--expect", "60"]);
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(
+        done["reply"].as_str().expect("reply").contains("steer:go"),
+        "{done}"
+    );
+    let status = daemon.call_json(&["status", &a]);
+    assert_eq!(status["live"], true, "{status}");
+    let sent = daemon.call_json(&["send", &a, "--policy", "try", "--prompt", "again"]);
+    assert_eq!(sent["state"], "running", "{sent}");
+    let done = daemon.call_json(&["wait", &a, "--expect", "60"]);
+    assert_eq!(done["state"], "done", "{done}");
+
+    // It writes the registry again: both turns are recorded.
+    let registry: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("registry.json")).unwrap())
+            .expect("registry is json");
+    assert_eq!(
+        registry[&a]["turns"].as_u64().expect("turns"),
+        2,
+        "{registry}"
+    );
+}
+
 /// Whether `handle` finished within `dur`: the bounded check that a call
 /// is still in flight — asserting a hold, never ordering two events.
 fn finished_within(handle: &std::thread::JoinHandle<std::process::Output>, dur: Duration) -> bool {

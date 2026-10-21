@@ -51,10 +51,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{Error, Result};
 use crate::ratelimit;
-use crate::registry::{RegistryEntry, Resume};
+use crate::registry::{Registry, RegistryEntry, Resume};
 use crate::state::{
-    AppState, Closing, Inner, Launch, ResumeFailure, ResumeReport, Status, Subagent, close_sub,
-    launch, start_turn,
+    AppState, Closing, HeldLock, Inner, Launch, ResumeFailure, ResumeReport, Status, Subagent,
+    close_sub, launch, start_turn,
 };
 use crate::tools::build_tools;
 
@@ -167,10 +167,8 @@ struct TakeoverArgs {
 ///
 /// Panics if a state mutex is poisoned.
 pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
-    let pid = std::process::id();
     let succession = lock_succession(socket_path)?;
-    let (mut claim, prev_socket) = open_claim(socket_path).await?;
-    let private_path = private_socket_path(socket_path, pid);
+    let private_path = private_socket_path(socket_path, std::process::id());
     // The private listener binds first so the takeover's handoff reports
     // have somewhere to land.
     let private_listener = bind(&private_path).await?;
@@ -179,50 +177,26 @@ pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
         .private_socket
         .lock()
         .expect("private socket poisoned") = Some(private_path.clone());
-    // Take the public socket over atomically: bind a temp sibling and
-    // rename it onto `socket_path`. Connections the previous daemon
-    // already holds keep working on its bound socket; every new connect
-    // reaches this daemon, which accepts once the takeover and resume
-    // pass are done.
-    let tmp = socket_path.with_file_name(format!(".acpsub-{pid}.tmp"));
-    let listener = match bind(&tmp).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            let _ = std::fs::remove_file(&private_path);
-            return Err(error);
-        }
-    };
-    if let Err(source) = std::fs::rename(&tmp, socket_path) {
-        let _ = std::fs::remove_file(&private_path);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(Error::io(
-            format!("cannot take over {}", socket_path.display()),
-            source,
-        ));
-    }
-    if let Some(prev) = &prev_socket {
-        if let Err(error) = supersede(&state, prev).await {
-            let _ = std::fs::remove_file(&private_path);
-            return Err(error);
-        }
-        // The predecessor released its claim inside the takeover; the
-        // succession lock keeps every other start away from it.
-        claim.try_lock().map_err(|error| Error::Internal {
-            session_id: String::new(),
-            detail: format!("the superseded daemon kept its claim: {error}"),
-        })?;
-    }
-    // The public socket accepts ⇒ the pid file names its daemon.
-    claim
-        .set_len(0)
-        // Reading the predecessor's pid moved the cursor.
-        .and_then(|()| std::io::Seek::rewind(&mut claim))
-        .and_then(|()| std::io::Write::write_all(&mut claim, pid.to_string().as_bytes()))
-        .map_err(|source| Error::io("cannot write daemon pid file", source))?;
-    *state.handover.claim.lock().expect("claim poisoned") = Some(claim);
-    drop(succession);
+    // Any failure from here on exits this daemon. A predecessor this
+    // daemon already superseded sees its successor gone and takes the
+    // socket back.
+    let served = serve(&state, socket_path, succession, &private_listener).await;
+    let _ = std::fs::remove_file(&private_path);
+    served
+}
+
+/// Lead the socket, then accept on it and on the private listener until
+/// this daemon is superseded and owns nothing. A successor that dies
+/// while this daemon still owns sessions makes it lead again.
+async fn serve(
+    state: &Arc<AppState>,
+    socket_path: &Path,
+    succession: HeldLock,
+    private_listener: &async_net::unix::UnixListener,
+) -> Result<()> {
+    let mut listener = lead(state, socket_path, succession).await?;
     info!(socket = %socket_path.display(), "daemon listening");
-    resume_marked(&state).await;
+    resume_marked(state).await;
     let mut finished = state.handover.finished.subscribe();
     loop {
         if *finished.borrow() {
@@ -266,17 +240,143 @@ pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
                     break;
                 }
             }
+            () = state.handover.orphaned.notified() => {
+                // Another start may be mid-succession (a client found the
+                // dead socket and started a daemon): wait for its lock,
+                // then lead past it.
+                let succession = wait_succession(socket_path).await?;
+                listener = reclaim(state, socket_path, succession).await?;
+                info!(socket = %socket_path.display(), "successor died; daemon listening again");
+            }
         }
     }
     // Superseded: the claim and the pid file are the successor's now.
-    let _ = std::fs::remove_file(&private_path);
     drop(listener);
     Ok(())
 }
 
+/// Become the daemon behind `socket_path`. Take the public socket over
+/// atomically: bind a temp sibling and rename it onto `socket_path`.
+/// Connections the previous daemon already holds keep working on its
+/// bound socket. Every new connect reaches this daemon, which accepts
+/// once the takeover and the resume pass are done. If a live daemon holds
+/// the claim, supersede it. Then hold the claim, name this daemon in the
+/// pid file, and release `succession`.
+async fn lead(
+    state: &Arc<AppState>,
+    socket_path: &Path,
+    succession: HeldLock,
+) -> Result<async_net::unix::UnixListener> {
+    let pid = std::process::id();
+    let claim = open_claim(socket_path).await?;
+    let tmp = socket_path.with_file_name(format!(".acpsub-{pid}.tmp"));
+    let listener = bind(&tmp).await?;
+    if let Err(source) = std::fs::rename(&tmp, socket_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::io(
+            format!("cannot take over {}", socket_path.display()),
+            source,
+        ));
+    }
+    let mut claim = match claim {
+        Claim::Free(claim) => claim,
+        Claim::Held { file, prev } => {
+            supersede(state, &prev).await?;
+            // The predecessor released its claim (`LOCK_UN`) before it
+            // answered; the succession lock keeps every other start away
+            // from it.
+            HeldLock::try_new(file).map_err(|(_, error)| Error::Internal {
+                session_id: String::new(),
+                detail: format!("the superseded daemon kept its claim: {error}"),
+            })?
+        }
+    };
+    // The public socket accepts ⇒ the pid file names its daemon.
+    let file = claim.file();
+    file.set_len(0)
+        // Reading the predecessor's pid moved the cursor.
+        .and_then(|()| std::io::Seek::rewind(file))
+        .and_then(|()| std::io::Write::write_all(file, pid.to_string().as_bytes()))
+        .map_err(|source| Error::io("cannot write daemon pid file", source))?;
+    *state.handover.claim.lock().expect("claim poisoned") = Some(claim);
+    drop(succession);
+    Ok(listener)
+}
+
+/// A superseded daemon whose successor died leads the socket again, as
+/// the newest generation. It stops relaying to the dead successor and
+/// writes the registry again, taking the dead successor's
+/// `registry.json` as the record of every session it does not own
+/// itself. Then it takes the socket back: it holds the claim if the claim
+/// is free, or supersedes whichever daemon took it meanwhile. Sends that
+/// queued while it was superseded start now.
+async fn reclaim(
+    state: &Arc<AppState>,
+    socket_path: &Path,
+    succession: HeldLock,
+) -> Result<async_net::unix::UnixListener> {
+    let path = state.registry_path.clone();
+    let recorded = tokio::task::spawn_blocking(move || Registry::load(&path))
+        .await
+        .expect("registry load task panicked")?;
+    let owned: HashSet<String> = {
+        let live = state.live.lock().expect("live poisoned");
+        let reserved = state.reserved.lock().expect("reserved poisoned");
+        let foreign = state.handover.foreign.lock().expect("foreign poisoned");
+        live.keys()
+            .chain(reserved.keys())
+            .chain(foreign.keys())
+            .cloned()
+            .collect()
+    };
+    *state.handover.next.lock().expect("next poisoned") = None;
+    state
+        .update_registry(|registry| {
+            let ours = std::mem::replace(registry, recorded);
+            for (session_id, entry) in ours.iter() {
+                if owned.contains(session_id) {
+                    registry.insert(session_id.clone(), entry.clone());
+                }
+            }
+            // Cleared under `registry_write`, before `update_registry`
+            // reads the flag: this merge is the first write persisted
+            // again, and no mutation serialized after it is dropped.
+            state.handover.superseded.store(false, Ordering::Relaxed);
+        })
+        .await?;
+    let listener = lead(state, socket_path, succession).await?;
+    // Parked sessions were left to the dead successor's scheduler.
+    state.limits_notify.notify_waiters();
+    let subs: Vec<Arc<Subagent>> = state
+        .live
+        .lock()
+        .expect("live poisoned")
+        .values()
+        .cloned()
+        .collect();
+    for sub in subs {
+        kick_queue(state, &sub).await;
+    }
+    Ok(listener)
+}
+
+/// The socket's claim as this start found it.
+enum Claim {
+    /// Free: a fresh start, now holding it.
+    Free(HeldLock),
+    /// Held by the live daemon this start supersedes, named by its
+    /// private socket. The file is the claim to take once it lets go.
+    Held {
+        /// The opened, unlocked pid file.
+        file: std::fs::File,
+        /// The holder's private socket.
+        prev: PathBuf,
+    },
+}
+
 /// Open the socket's claim — its pid file — and try its lock. A free
-/// lock is a fresh start (`None`); a held one names the live daemon this
-/// one supersedes, by its private socket.
+/// lock is a fresh start; a held one names the live daemon this one
+/// supersedes, by its private socket.
 ///
 /// # Errors
 ///
@@ -284,62 +384,79 @@ pub async fn run(state: Arc<AppState>, socket_path: &Path) -> Result<()> {
 /// still answers: a daemon that never took the claim — one built before
 /// it existed — whose socket the takeover rename would steal, stranding
 /// its sessions.
-async fn open_claim(socket_path: &Path) -> Result<(std::fs::File, Option<PathBuf>)> {
+async fn open_claim(socket_path: &Path) -> Result<Claim> {
     let pid_path = socket_path.with_extension("sock.pid");
-    let mut claim = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&pid_path)
         .map_err(|source| Error::io("cannot open daemon pid file", source))?;
-    // A held claim names the live daemon this one supersedes.
-    let prev_socket = match claim.try_lock() {
-        Ok(()) => {
+    match HeldLock::try_new(file) {
+        Ok(claim) => {
             if async_net::unix::UnixStream::connect(socket_path)
                 .await
                 .is_ok()
             {
                 return Err(Error::DaemonRunning(socket_path.to_path_buf()));
             }
-            None
+            Ok(Claim::Free(claim))
         }
-        Err(std::fs::TryLockError::WouldBlock) => {
+        // A held claim names the live daemon this one supersedes.
+        Err((mut file, std::fs::TryLockError::WouldBlock)) => {
             let mut text = String::new();
-            std::io::Read::read_to_string(&mut claim, &mut text)
+            std::io::Read::read_to_string(&mut file, &mut text)
                 .map_err(|source| Error::io("cannot read daemon pid file", source))?;
             let prev = text
                 .trim()
                 .parse::<u32>()
                 .map_err(|_| Error::DaemonRunning(socket_path.to_path_buf()))?;
-            Some(private_socket_path(socket_path, prev))
+            Ok(Claim::Held {
+                file,
+                prev: private_socket_path(socket_path, prev),
+            })
         }
-        Err(std::fs::TryLockError::Error(source)) => {
-            return Err(Error::io("cannot lock daemon pid file", source));
+        Err((_, std::fs::TryLockError::Error(source))) => {
+            Err(Error::io("cannot lock daemon pid file", source))
         }
-    };
-    Ok((claim, prev_socket))
+    }
 }
 
-/// Hold the succession lock for `socket_path` — `daemon.sock.next` —
-/// while this daemon starts: of two starts at once only one proceeds, the
-/// other fails with [`Error::DaemonRunning`].
-fn lock_succession(socket_path: &Path) -> Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
+/// Open the succession lock file for `socket_path`: `daemon.sock.next`.
+fn succession_file(socket_path: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .open(socket_path.with_extension("sock.next"))
-        .map_err(|source| Error::io("cannot open daemon succession lock", source))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => {
+        .map_err(|source| Error::io("cannot open daemon succession lock", source))
+}
+
+/// Hold the succession lock for `socket_path` while this daemon starts:
+/// of two starts at once only one proceeds, the other fails with
+/// [`Error::DaemonRunning`].
+fn lock_succession(socket_path: &Path) -> Result<HeldLock> {
+    match HeldLock::try_new(succession_file(socket_path)?) {
+        Ok(lock) => Ok(lock),
+        Err((_, std::fs::TryLockError::WouldBlock)) => {
             Err(Error::DaemonRunning(socket_path.to_path_buf()))
         }
-        Err(std::fs::TryLockError::Error(source)) => {
+        Err((_, std::fs::TryLockError::Error(source))) => {
             Err(Error::io("cannot lock daemon succession lock", source))
         }
     }
+}
+
+/// Take the succession lock for a running daemon that must lead again.
+/// A start that holds the lock gives it up once it leads the socket, or
+/// when it exits.
+async fn wait_succession(socket_path: &Path) -> Result<HeldLock> {
+    let file = succession_file(socket_path)?;
+    tokio::task::spawn_blocking(move || HeldLock::new(file))
+        .await
+        .expect("succession lock task panicked")
+        .map_err(|source| Error::io("cannot lock daemon succession lock", source))
 }
 
 /// The new daemon's side of the takeover: call `daemon/takeover` on the
@@ -403,15 +520,25 @@ async fn supersede(state: &Arc<AppState>, prev_socket: &Path) -> Result<()> {
 /// they are closed here. `owned` starts as the sessions the report named
 /// as kept by this daemon, so one that ends before the first scan is
 /// still reported as released.
+///
+/// `successor` is a connection held open to the successor's private
+/// socket, which closes when the successor's process ends. The successor
+/// cannot finish cleanly while it still has sessions of this daemon
+/// listed as foreign. So if the connection closes while this daemon
+/// still owns anything, the successor died. The watcher then wakes the
+/// accept loop through `orphaned` to lead the socket again, and returns.
 async fn handover_watch(
     state: Arc<AppState>,
     next: PathBuf,
+    successor: async_net::unix::UnixStream,
     handed: Vec<Arc<Subagent>>,
     mut owned: HashSet<String>,
 ) {
     for sub in &handed {
         close_sub(sub).await;
     }
+    let gone = closed(successor);
+    tokio::pin!(gone);
     loop {
         // Register the waiter BEFORE the scan: a settle between the scan
         // and the await still wakes us.
@@ -474,7 +601,28 @@ async fn handover_watch(
             let _ = state.handover.finished.send(true);
             return;
         }
-        notified.await;
+        // Death first: a report the dead successor refused wakes
+        // `progressed` too, and must not spin the scan.
+        tokio::select! {
+            biased;
+            () = &mut gone => {
+                warn!(successor = %next.display(), "the next daemon died; leading again");
+                state.handover.orphaned.notify_one();
+                return;
+            }
+            () = notified => {}
+        }
+    }
+}
+
+/// Resolve once `stream` reaches EOF or fails: its peer's end closed. The
+/// peer never writes on a liveness connection, so any bytes are drained.
+async fn closed(mut stream: async_net::unix::UnixStream) {
+    let mut buf = [0u8; 64];
+    while let Ok(n) = futures_lite::AsyncReadExt::read(&mut stream, &mut buf).await {
+        if n == 0 {
+            return;
+        }
     }
 }
 
@@ -768,10 +916,27 @@ async fn resume_one(
             warn!(%session_id, %error, "registry persist failed");
         }
     }
+    sub.rt
+        .inner
+        .lock()
+        .expect("inner poisoned")
+        .queue
+        .extend(queued);
+    kick_queue(state, &sub).await;
+    report.resumed.push(session_id);
+}
+
+/// Start a settled session's first queued send, with the same gate a
+/// fresh prompt sees: a still-active limit re-parks it in order instead
+/// of burning a request.
+async fn kick_queue(state: &Arc<AppState>, sub: &Arc<Subagent>) {
     let first = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-        inner.queue.extend(queued);
-        if inner.status.accepts_prompt() {
+        if inner.status.accepts_prompt()
+            && inner.current.is_none()
+            && inner.steer_pending.is_empty()
+            && sub.rt.closing.get().is_none()
+        {
             inner.queue.pop_front()
         } else {
             None
@@ -779,12 +944,11 @@ async fn resume_one(
     };
     if let Some(prompt) = first {
         if let Some(limit) = ratelimit::active_limit(state, &sub.agent) {
-            ratelimit::repark_prompt(state, &sub, &prompt, &limit).await;
-        } else if let Err(error) = start_turn(state.clone(), &sub, prompt).await {
-            warn!(%session_id, %error, "queued prompt failed to start after resume");
+            ratelimit::repark_prompt(state, sub, &prompt, &limit).await;
+        } else if let Err(error) = start_turn(state.clone(), sub, prompt).await {
+            warn!(session_id = %sub.session_id, %error, "queued prompt failed to start");
         }
     }
-    report.resumed.push(session_id);
 }
 
 /// Bind the socket, reclaiming a stale one left by a dead daemon.
@@ -886,6 +1050,16 @@ impl Tool for TakeoverTool {
 
     async fn call(&self, args: TakeoverArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let state = &self.0;
+        // The liveness connection to the successor: its private listener
+        // is bound before it calls this, and the connection closes when
+        // the successor's process ends. A successor that cannot be reached
+        // is refused before anything commits to it.
+        let successor = async_net::unix::UnixStream::connect(&args.socket)
+            .await
+            .map_err(|source| Error::DaemonConnect {
+                path: args.socket.clone(),
+                source,
+            })?;
         // `registry_write` serializes the flag against in-flight
         // persists: a mutation serialized after this point stops writing
         // and rides the handoff or release report instead.
@@ -923,11 +1097,13 @@ impl Tool for TakeoverTool {
         tokio::spawn(handover_watch(
             state.clone(),
             args.socket,
+            successor,
             handed_subs,
             owned,
         ));
         // The successor takes the socket's claim the moment this answer
-        // lands: release it first.
+        // lands: release it first. The `HeldLock` drop unlocks the
+        // description, so a child mid-spawn cannot keep the claim held.
         drop(state.handover.claim.lock().expect("claim poisoned").take());
         // Wake the turn watchdogs and resuming-call waiters: a kept
         // turn's grace clock restarts now — the restart is not waiter
@@ -1671,6 +1847,31 @@ async fn peer_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A released claim is free at once, even while another copy of its
+    /// descriptor lives on, as it does in a child mid-spawn. Closing a
+    /// locked descriptor alone would leave the lock held until every
+    /// copy closed.
+    #[test]
+    fn released_lock_is_free_while_a_descriptor_copy_lives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.sock.pid");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("open claim")
+        };
+        let mut claim = HeldLock::try_new(open()).expect("take claim");
+        let copy = claim.file().try_clone().expect("copy descriptor");
+        drop(claim);
+        let next = HeldLock::try_new(open());
+        assert!(next.is_ok(), "released claim still held");
+        drop(copy);
+    }
 
     /// A socket path over the platform's `sun_path` limit fails `bind`
     /// with a non-`AddrInUse` error: the error must report the bind

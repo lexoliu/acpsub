@@ -245,13 +245,69 @@ pub struct Handover {
     /// `true` once a superseded daemon owns nothing — the accept loop
     /// exits.
     pub finished: tokio::sync::watch::Sender<bool>,
+    /// The successor died while this superseded daemon still owned
+    /// sessions: the accept loop takes the socket back. Fired with
+    /// `notify_one`, so the permit is kept until the loop polls it.
+    pub orphaned: Notify,
     /// This daemon's private socket path — set by `daemon::run` once
     /// bound; `daemon/takeover` names it for the sessions it keeps.
     pub private_socket: Mutex<Option<PathBuf>>,
     /// The locked pid file: this daemon's claim on the socket, held while
     /// it owns the socket and released to its successor by
     /// `daemon/takeover`.
-    pub claim: Mutex<Option<std::fs::File>>,
+    pub claim: Mutex<Option<HeldLock>>,
+}
+
+/// An exclusive `flock` this process holds, released on drop with
+/// `LOCK_UN`.
+///
+/// Closing the descriptor does not release the lock. The lock belongs to
+/// the open file description, and a child this process is spawning
+/// holds a copy of every descriptor until its exec closes the
+/// close-on-exec ones, so the lock outlives the close until then.
+/// `LOCK_UN` removes the lock from the description whatever copies
+/// exist, so the next holder can take it as soon as this one lets go.
+#[derive(Debug)]
+pub struct HeldLock(std::fs::File);
+
+impl HeldLock {
+    /// Take the lock on `file` without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the file back with the lock error — `WouldBlock` while
+    /// another description holds it.
+    pub fn try_new(
+        file: std::fs::File,
+    ) -> std::result::Result<Self, (std::fs::File, std::fs::TryLockError)> {
+        match file.try_lock() {
+            Ok(()) => Ok(Self(file)),
+            Err(error) => Err((file, error)),
+        }
+    }
+
+    /// Take the lock on `file`, blocking until its holder releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `flock` error.
+    pub fn new(file: std::fs::File) -> std::io::Result<Self> {
+        file.lock()?;
+        Ok(Self(file))
+    }
+
+    /// The locked file.
+    pub const fn file(&mut self) -> &mut std::fs::File {
+        &mut self.0
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::error!(%error, "cannot release a file lock");
+        }
+    }
 }
 
 impl Default for Handover {
@@ -264,6 +320,7 @@ impl Default for Handover {
             resuming: Mutex::new(HashSet::new()),
             progressed: Notify::new(),
             finished: tokio::sync::watch::channel(false).0,
+            orphaned: Notify::new(),
             private_socket: Mutex::new(None),
             claim: Mutex::new(None),
         }
