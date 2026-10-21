@@ -56,6 +56,11 @@ pub enum Error {
     #[error("unknown session '{0}'")]
     UnknownSession(String),
 
+    /// This daemon handed the session off to the next daemon generation,
+    /// which owns it now: the call belongs there.
+    #[error("session '{0}' is handing off to the next daemon")]
+    HandedOff(String),
+
     /// The session id is empty.
     #[error("session id must not be empty")]
     EmptySessionId,
