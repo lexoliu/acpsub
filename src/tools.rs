@@ -1822,19 +1822,23 @@ impl PermitTool {
 
 /// Render a subagent's transcript: every prompt, streamed message, thinking
 /// chunk (with `thinking`), tool call and result, plan, and mode change, in
-/// order.
+/// order. Session-state updates are hidden unless `meta`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TranscriptArgs {
     /// Session id, as returned by `spawn`/`adopt`.
     session_id: String,
-    /// Start rendering at record N (skip the first N records).
+    /// Start rendering at section N (skip the first N rendered sections).
     from: Option<usize>,
-    /// Show only the last N records.
+    /// Show only the last N rendered sections.
     tail: Option<usize>,
     /// Do not clip long values (default clips at 400 chars).
     full: Option<bool>,
     /// Include `agent_thought_chunk` records.
     thinking: Option<bool>,
+    /// Include session-state updates (`session_info_update`,
+    /// `config_option_update`, `available_commands_update`,
+    /// `usage_update`), which are hidden by default.
+    meta: Option<bool>,
 }
 
 struct TranscriptTool(Arc<AppState>);
@@ -1874,6 +1878,7 @@ impl Tool for TranscriptTool {
                 tail: args.tail,
                 full: args.full.unwrap_or(false),
                 thinking: args.thinking.unwrap_or(false),
+                meta: args.meta.unwrap_or(false),
             },
         ))
     }

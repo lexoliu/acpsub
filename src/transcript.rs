@@ -100,61 +100,95 @@ impl TranscriptWriter {
 /// Options controlling [`render`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderOptions {
-    /// Skip the first `from` records.
+    /// Skip the first `from` rendered sections.
     pub from: usize,
-    /// Show only the last `tail` records.
+    /// Show only the last `tail` rendered sections.
     pub tail: Option<usize>,
     /// Do not clip long values.
     pub full: bool,
     /// Include `agent_thought_chunk` records.
     pub thinking: bool,
+    /// Include session-state updates (`session_info_update`,
+    /// `config_option_update`, `available_commands_update`,
+    /// `usage_update`), which are hidden by default.
+    pub meta: bool,
 }
 
 /// Render a JSONL transcript as human-readable text.
 ///
-/// Unparsable lines render as `--- UPDATE unparsable` rather than failing the
-/// whole render: a transcript is evidence, and a partial view beats none.
+/// Records first fold into sections — a merged run of message chunks, a tool
+/// call, a result, a prompt, a turn end — then `from`/`tail` slice the
+/// section list, never the raw records. Unparsable lines render as
+/// `--- UPDATE unparsable` rather than failing the whole render: a
+/// transcript is evidence, and a partial view beats none.
 #[must_use]
 pub fn render(text: &str, options: &RenderOptions) -> String {
-    let records: Vec<Value> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).unwrap_or_else(|_| Value::String(line.to_string())))
-        .collect();
-    let records = &records[options.from.min(records.len())..];
-    let records = options.tail.map_or(records, |tail| {
-        &records[records.len().saturating_sub(tail)..]
-    });
-
-    let mut out = String::new();
+    let mut sections: Vec<String> = Vec::new();
     // Consecutive chunk updates of one kind merge into a single section.
     let mut pending: Option<(&'static str, String)> = None;
-    for record in records {
-        let chunk = record
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record: Value =
+            serde_json::from_str(line).unwrap_or_else(|_| Value::String(line.to_string()));
+        let update = record
             .get("update")
             .and_then(|u| serde_json::from_value::<SessionUpdate>(u.clone()).ok());
-        // Thought chunks are hidden entirely unless `thinking` is set.
-        if matches!(chunk, Some(SessionUpdate::AgentThoughtChunk(_))) && !options.thinking {
-            flush(&mut pending, &mut out, options.full);
-            continue;
+        match hidden(update.as_ref(), options) {
+            // A hidden thought still ends the message run around it.
+            Some(Hidden::Boundary) => {
+                flush(&mut pending, &mut sections, options.full);
+                continue;
+            }
+            // Session state streams between the chunks of one message.
+            Some(Hidden::Transparent) => continue,
+            None => {}
         }
-        let label = match &chunk {
+        let label = match &update {
             Some(SessionUpdate::AgentMessageChunk(_)) => Some("--- ASSISTANT"),
             Some(SessionUpdate::AgentThoughtChunk(_)) => Some("--- THINKING"),
             Some(SessionUpdate::UserMessageChunk(_)) => Some("--- USER"),
             _ => None,
         };
-        if let (Some(label), Some(update)) = (label, &chunk)
+        if let (Some(label), Some(update)) = (label, &update)
             && let Some(text) = chunk_text(update)
         {
-            merge_chunk(label, text, &mut pending, &mut out, options.full);
+            merge_chunk(label, text, &mut pending, &mut sections, options.full);
             continue;
         }
-        flush(&mut pending, &mut out, options.full);
-        render_record(record, chunk.as_ref(), &mut out, options);
+        flush(&mut pending, &mut sections, options.full);
+        let mut section = String::new();
+        render_record(&record, update.as_ref(), &mut section, options);
+        sections.push(section);
     }
-    flush(&mut pending, &mut out, options.full);
-    out
+    flush(&mut pending, &mut sections, options.full);
+
+    let sections = &sections[options.from.min(sections.len())..];
+    let sections = options.tail.map_or(sections, |tail| {
+        &sections[sections.len().saturating_sub(tail)..]
+    });
+    sections.concat()
+}
+
+/// How a hidden record affects chunk merging.
+enum Hidden {
+    /// Ends the pending merged run, as the record would if shown.
+    Boundary,
+    /// Leaves the pending merged run open.
+    Transparent,
+}
+
+/// Whether `update` is hidden under `options`: thought chunks need
+/// `thinking`, session-state updates need `meta`.
+const fn hidden(update: Option<&SessionUpdate>, options: &RenderOptions) -> Option<Hidden> {
+    match update {
+        Some(SessionUpdate::AgentThoughtChunk(_)) if !options.thinking => Some(Hidden::Boundary),
+        Some(
+            SessionUpdate::SessionInfoUpdate(_)
+            | SessionUpdate::ConfigOptionUpdate(_)
+            | SessionUpdate::AvailableCommandsUpdate(_)
+            | SessionUpdate::UsageUpdate(_),
+        ) if !options.meta => Some(Hidden::Transparent),
+        _ => None,
+    }
 }
 
 /// Merge one chunk's text into the pending merged section, starting a new
@@ -163,23 +197,25 @@ fn merge_chunk(
     label: &'static str,
     text: String,
     pending: &mut Option<(&'static str, String)>,
-    out: &mut String,
+    sections: &mut Vec<String>,
     full: bool,
 ) {
     match pending {
         Some((pending_label, buf)) if *pending_label == label => buf.push_str(&text),
         _ => {
-            flush(pending, out, full);
+            flush(pending, sections, full);
             *pending = Some((label, text));
         }
     }
 }
 
 /// Emit a pending merged chunk section.
-fn flush(pending: &mut Option<(&'static str, String)>, out: &mut String, full: bool) {
+fn flush(pending: &mut Option<(&'static str, String)>, sections: &mut Vec<String>, full: bool) {
     if let Some((label, text)) = pending.take() {
-        let _ = writeln!(out, "{label}");
-        let _ = writeln!(out, "{}", clip(&text, full));
+        let mut section = String::new();
+        let _ = writeln!(section, "{label}");
+        let _ = writeln!(section, "{}", clip(&text, full));
+        sections.push(section);
     }
 }
 
@@ -515,6 +551,23 @@ mod tests {
     }
 
     #[test]
+    fn hidden_thought_separates_messages() {
+        let text = concat!(
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"one"}}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"hmm"}}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"two"}}}"#,
+            "\n"
+        );
+        let rendered = render(text, &RenderOptions::default());
+        assert!(
+            rendered.contains("--- ASSISTANT\none\n--- ASSISTANT\ntwo\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn clips_long_values_unless_full() {
         let long = "x".repeat(500);
         let text = format!(
@@ -531,7 +584,47 @@ mod tests {
     }
 
     #[test]
-    fn from_and_tail_slice_records() {
+    fn meta_updates_hidden_unless_requested() {
+        let text = concat!(
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"session_info_update","title":"t"}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"config_option_update","configOptions":[]}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hel"}}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"usage_update","used":1,"size":100}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"lo"}}}"#,
+            "\n"
+        );
+        let rendered = render(text, &RenderOptions::default());
+        assert!(!rendered.contains("UPDATE"), "{rendered}");
+        // Hidden records do not break a chunk merge.
+        assert!(rendered.contains("--- ASSISTANT\nHello\n"), "{rendered}");
+        let opts = RenderOptions {
+            meta: true,
+            ..RenderOptions::default()
+        };
+        let rendered = render(text, &opts);
+        assert!(
+            rendered.contains("--- UPDATE session_info_update"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("--- UPDATE config_option_update"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("--- UPDATE available_commands_update"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("--- UPDATE usage_update"), "{rendered}");
+    }
+
+    #[test]
+    fn from_and_tail_slice_sections() {
         let mut text = String::new();
         for i in 0..5 {
             text.push_str(&record(&format!(
@@ -569,5 +662,38 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn tail_counts_merged_sections() {
+        // USER, one merged ASSISTANT run, CALL, END: four sections.
+        let text = concat!(
+            r#"{"ts":"t","turn":1,"prompt":"do it"}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hel"}}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"lo"}}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"fake-tool","kind":"execute","status":"pending"}}"#,
+            "\n",
+            r#"{"ts":"t","turn":1,"stop_reason":"end_turn"}"#,
+            "\n"
+        );
+        let opts = RenderOptions {
+            tail: Some(2),
+            ..RenderOptions::default()
+        };
+        let rendered = render(text, &opts);
+        assert!(rendered.contains("--- CALL"), "{rendered}");
+        assert!(rendered.contains("END end_turn"), "{rendered}");
+        assert!(!rendered.contains("Hello"), "{rendered}");
+        assert!(!rendered.contains("USER"), "{rendered}");
+        let opts = RenderOptions {
+            tail: Some(3),
+            ..RenderOptions::default()
+        };
+        let rendered = render(text, &opts);
+        assert!(rendered.contains("--- ASSISTANT\nHello\n"), "{rendered}");
+        assert!(!rendered.contains("USER"), "{rendered}");
     }
 }
