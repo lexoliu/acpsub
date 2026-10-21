@@ -17,10 +17,11 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,9 @@ struct Daemon {
     guard: DaemonGuard,
     socket: PathBuf,
     config: PathBuf,
+    /// The started daemon's pid — its private socket is
+    /// `daemon.<pid>.sock` beside the public one.
+    pid: u32,
     /// Lines the daemon writes to stderr, in order.
     lines: Receiver<String>,
     /// Every line seen so far — dumped when a wait times out.
@@ -69,12 +73,16 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// Write the test config into `dir` and start the daemon, waiting for
-    /// its "listening" log line — the real readiness signal, never a
-    /// client call (a client would auto-start a daemon and hide a startup
-    /// failure).
+    /// Write the test config into `dir` and start the daemon.
     fn start(dir: &Path) -> Self {
-        let config = write_config(dir, Some("fake"), &agents(), None);
+        Self::start_with(dir, &agents())
+    }
+
+    /// `start` over an explicit agent map, waiting for the "listening"
+    /// log line — the real readiness signal, never a client call (a
+    /// client would auto-start a daemon and hide a startup failure).
+    fn start_with(dir: &Path, agents: &BTreeMap<String, acpsub::config::AgentConfig>) -> Self {
+        let config = write_config(dir, Some("fake"), agents, None);
         let socket = dir.join("daemon.sock");
         let mut child = Command::new(env!("CARGO_BIN_EXE_acpsub"))
             .arg("daemon")
@@ -87,6 +95,7 @@ impl Daemon {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn acpsub daemon");
+        let pid = child.id();
         let stderr = child.stderr.take().expect("stderr piped");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (tx, lines) = std::sync::mpsc::channel();
@@ -104,6 +113,7 @@ impl Daemon {
             guard: DaemonGuard::new(socket.clone(), Some(child)),
             socket,
             config,
+            pid,
             lines,
             seen,
         };
@@ -149,13 +159,34 @@ impl Daemon {
         })
     }
 
+    /// `run_thread` against `socket` instead of the public one — the
+    /// daemon's private generation socket serves the same local tools
+    /// without the forwarding dispatch.
+    fn run_thread_on(
+        &self,
+        socket: &Path,
+        args: &[&str],
+    ) -> std::thread::JoinHandle<std::process::Output> {
+        let mut command = self.command_on(socket, args);
+        let in_flight = self.guard.in_flight();
+        std::thread::spawn(move || {
+            let _in_flight = in_flight;
+            command.output().expect("client runs")
+        })
+    }
+
     /// A client subcommand addressed to this daemon.
     fn command(&self, args: &[&str]) -> Command {
+        self.command_on(&self.socket.clone(), args)
+    }
+
+    /// `command` against an explicit socket path.
+    fn command_on(&self, socket: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_acpsub"));
         command
             .args(args)
             .arg("--socket")
-            .arg(&self.socket)
+            .arg(socket)
             .arg("--config")
             .arg(&self.config);
         command
@@ -272,8 +303,10 @@ fn inflight_turn_hands_off() {
         "{done}"
     );
 
-    // The handoff itself has no client signal; `status` going live on
-    // the new daemon is the observable arrival.
+    // A `status` for the session answers `live: true` from the old owner
+    // while the handoff is still in flight, so the ship is observed on
+    // the old daemon's own log line — the handoff's real signal.
+    daemon.wait_marker("session handed off to the next daemon");
     let status = daemon.status_until(&a, |status| status["live"] == true);
     assert_eq!(status["state"], "done", "{status}");
     assert_eq!(status["turns"], 1, "{status}");
@@ -673,4 +706,374 @@ fn failed_resume_is_reported() {
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("registry.json")).unwrap())
             .expect("registry is json");
     assert!(registry[&c]["resume"]["failed"].is_string(), "{registry}");
+}
+
+/// A steer that resolves after its turn settled still frees the session:
+/// the handover watcher must wake on the resolution, or the session
+/// stays on the old daemon forever. `FAKE_LATE_STEER` holds the steer's
+/// answer past the turn's end until the gate file exists — the ordering
+/// is the agent's, not a delay's.
+#[test]
+fn late_steer_resolution_still_hands_off() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("steer-gate");
+    let mut agents = agents();
+    agents.insert(
+        "latesteer".to_string(),
+        acpsub::config::AgentConfig {
+            env: BTreeMap::from([(
+                "FAKE_LATE_STEER".to_string(),
+                gate.to_string_lossy().into_owned(),
+            )]),
+            ..fake_agent_config()
+        },
+    );
+    let daemon = Daemon::start_with(dir.path(), &agents);
+
+    let spawned = daemon.call_json(&[
+        "spawn",
+        "--cwd",
+        &dir.path().to_string_lossy(),
+        "--agent",
+        "latesteer",
+        "--model",
+        "b",
+        "--mode",
+        "bypass",
+        "--prompt",
+        "gather",
+    ]);
+    let a = spawned["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let output = daemon.run(&["restart"]).expect("restart runs");
+    assert!(
+        output.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The steer ends the "gather" turn; its own request answer waits on
+    // the gate — the turn settles with the steer still in flight, which
+    // keeps the session on the old daemon.
+    let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
+    assert_eq!(steered["state"], "submitted", "{steered}");
+    let status = daemon.status_until(&a, |status| status["state"] == "done");
+    assert_eq!(status["state"], "done", "{status}");
+
+    // The resolution frees the session: the ship follows on its own.
+    std::fs::write(&gate, "").expect("release the steer");
+    daemon.wait_marker("session handed off to the next daemon");
+    let status = daemon.status_until(&a, |status| status["live"] == true);
+    assert_eq!(status["state"], "done", "{status}");
+}
+
+/// A `send` that reaches the old owner while its `daemon/handoff` report
+/// is still unanswered holds rather than failing: the refusal lands only
+/// once the ship resolves — `still_owned == false` on the successor by
+/// then — or the ship fails and the send proceeds on the session's real
+/// owner. Both refuse with the true reason, never "steer in flight".
+///
+/// The test stands in for the successor: `daemon/takeover` on the old
+/// daemon's private socket names a socket this test serves, so the
+/// `daemon/handoff` report waits on the test's answer — the window a
+/// forwarded send falls into, held open deterministically. Session `b`
+/// keeps a turn in flight forever so the old daemon still owns something
+/// (and keeps serving) after `a` ships.
+#[test]
+fn send_during_handoff_waits_for_the_ship() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    let old_private = dir.path().join(format!("daemon.{}.sock", daemon.pid));
+
+    // The fake successor: a socket the test answers generation-protocol
+    // calls on, each answer gated by the test.
+    let next_socket = dir.path().join("next.sock");
+    let calls = serve_fake_successor(&next_socket);
+
+    let spawn = |prompt: &str| {
+        let spawned = daemon.call_json(&[
+            "spawn",
+            "--cwd",
+            &dir.path().to_string_lossy(),
+            "--model",
+            "b",
+            "--mode",
+            "bypass",
+            "--prompt",
+            prompt,
+        ]);
+        spawned["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_string()
+    };
+    let a = spawn("gather");
+    let _b = spawn("wait");
+
+    // Supersede the old daemon, naming the fake successor: both running
+    // sessions stay owned.
+    let report = private_call(
+        &old_private,
+        "daemon/takeover",
+        &serde_json::json!({"socket": next_socket}),
+    );
+    let report: Value = serde_json::from_str(&report).expect("takeover report is json");
+    assert!(
+        report["kept"]
+            .as_array()
+            .expect("kept")
+            .iter()
+            .filter_map(|kept| kept["session_id"].as_str())
+            .any(|id| id == a),
+        "{report}"
+    );
+
+    // A's turn ends in the old daemon and the watcher ships it: the
+    // `daemon/handoff` report reaching the fake successor proves the
+    // session's `HandingOff` mark is already set.
+    let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
+    assert_eq!(steered["state"], "submitted", "{steered}");
+    let call = next_call(&calls);
+    assert_eq!(call.tool, "daemon/handoff");
+    assert_eq!(call.arguments["session_id"], a, "{:?}", call.arguments);
+
+    // A send landing in the window holds instead of erroring at once.
+    let send = daemon.run_thread_on(
+        &old_private,
+        &["send", &a, "--policy", "try", "--prompt", "again"],
+    );
+    if finished_within(&send, Duration::from_millis(500)) {
+        let output = send.join().expect("send thread");
+        panic!("send returned before the handoff resolved: {output:?}");
+    }
+
+    // The ship resolves; the held send answers with the true reason.
+    call.answer(r#"{"content":[{"type":"text","text":"{}"}]}"#);
+    let output = send.join().expect("send thread");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("handing off"), "{stderr}");
+    assert!(!stderr.contains("steer in flight"), "{stderr}");
+    // `a` ships for real — consume its marker so the one waited on below
+    // is `c`'s.
+    daemon.wait_marker("session handed off to the next daemon");
+
+    // A refused ship clears the mark and the watcher retries: `c`
+    // settles, its first report is refused, and the rescan's second
+    // `daemon/handoff` is the deterministic proof the mark cleared. A
+    // queued send landing in that retry's window holds the same way.
+    let c = spawn("hi");
+    let ended = daemon.call_json(&["wait", &c, "--expect", "60"]);
+    assert_eq!(ended["state"], "done", "{ended}");
+    let call = next_call(&calls);
+    assert_eq!(call.tool, "daemon/handoff");
+    assert_eq!(call.arguments["session_id"], c, "{:?}", call.arguments);
+    call.answer(r#"{"content":[{"type":"text","text":"refused for the test"}],"isError":true}"#);
+    let call = next_call(&calls);
+    assert_eq!(call.tool, "daemon/handoff");
+    assert_eq!(call.arguments["session_id"], c, "{:?}", call.arguments);
+
+    let send = daemon.run_thread_on(
+        &old_private,
+        &["send", &c, "--policy", "queued", "--prompt", "again"],
+    );
+    if finished_within(&send, Duration::from_millis(500)) {
+        let output = send.join().expect("send thread");
+        panic!("send returned before the handoff resolved: {output:?}");
+    }
+    call.answer(r#"{"content":[{"type":"text","text":"{}"}]}"#);
+    let output = send.join().expect("send thread");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("handing off"), "{stderr}");
+    assert!(!stderr.contains("steer in flight"), "{stderr}");
+    daemon.wait_marker("session handed off to the next daemon");
+}
+
+/// Whether `handle` finished within `dur`: the bounded check that a call
+/// is still in flight — asserting a hold, never ordering two events.
+fn finished_within(handle: &std::thread::JoinHandle<std::process::Output>, dur: Duration) -> bool {
+    let deadline = Instant::now() + dur;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// One generation-protocol call the fake successor received; the test
+/// answers it through `answer`.
+struct NextCall {
+    /// The tool the daemon called (`daemon/handoff`, `daemon/release`).
+    tool: String,
+    /// The call's `arguments`.
+    arguments: Value,
+    /// Where the answer goes.
+    answer: SyncSender<Value>,
+}
+
+impl NextCall {
+    /// Answer the call with a `CallToolResult` JSON document.
+    fn answer(self, result: &str) {
+        self.answer
+            .send(serde_json::from_str(result).expect("result is json"))
+            .expect("fake successor still serving");
+    }
+}
+
+/// Take the next generation-protocol call the fake successor received.
+fn next_call(calls: &Receiver<NextCall>) -> NextCall {
+    calls
+        .recv_timeout(Duration::from_secs(15))
+        .expect("generation-protocol call never arrived")
+}
+
+/// Bind `socket` and serve the daemon's generation protocol on it: every
+/// `tools/call` arrives on the returned channel and waits for the test's
+/// answer — the handoff window, held open as long as the test wants.
+fn serve_fake_successor(socket: &Path) -> Receiver<NextCall> {
+    let listener = UnixListener::bind(socket).expect("bind fake successor");
+    let (tx, calls) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let tx = tx.clone();
+            std::thread::spawn(move || serve_successor_conn(stream, &tx));
+        }
+    });
+    calls
+}
+
+/// One fake-successor connection: the MCP handshake, then each
+/// `tools/call` forwarded to the test and answered with what it sends
+/// back.
+fn serve_successor_conn(stream: UnixStream, calls: &std::sync::mpsc::Sender<NextCall>) {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+    let mut respond = |id: &Value, result: Value| {
+        let mut line =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+        line.push('\n');
+        writer
+            .write_all(line.as_bytes())
+            .expect("write fake successor response");
+    };
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_line(&mut line) else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = msg.get("id").cloned() else {
+            continue;
+        };
+        match msg["method"].as_str() {
+            Some("initialize") => respond(
+                &id,
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "fake-successor", "version": "0"},
+                }),
+            ),
+            Some("tools/call") => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(0);
+                if calls
+                    .send(NextCall {
+                        tool: msg["params"]["name"].as_str().unwrap_or("?").to_string(),
+                        arguments: msg["params"]["arguments"].clone(),
+                        answer: tx,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                let Ok(result) = rx.recv() else {
+                    return;
+                };
+                respond(&id, result);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One newline-delimited JSON-RPC `tools/call` on a daemon's private
+/// socket — the generation protocol's client side, against the local
+/// tool set the private listener serves.
+fn private_call(socket: &Path, tool: &str, arguments: &Value) -> String {
+    let mut stream = UnixStream::connect(socket).expect("connect private socket");
+    let mut line = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "restart-test", "version": "0"},
+        },
+    })
+    .to_string();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).expect("write initialize");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut read = String::new();
+    reader.read_line(&mut read).expect("initialize response");
+    let mut line = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    })
+    .to_string();
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .expect("write initialized");
+    let mut line = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    })
+    .to_string();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).expect("write tools/call");
+    loop {
+        read.clear();
+        let n = reader.read_line(&mut read).expect("call response");
+        assert!(n > 0, "daemon closed the private connection");
+        let msg: Value = serde_json::from_str(&read).expect("response is json");
+        if msg.get("id") != Some(&Value::from(1)) {
+            continue;
+        }
+        assert!(msg["error"].is_null(), "{tool} refused: {}", msg["error"]);
+        let text = msg["result"]["content"]
+            .as_array()
+            .and_then(|content| content.first())
+            .and_then(|item| item["text"].as_str())
+            .expect("call result text");
+        assert!(
+            !msg["result"]["isError"].as_bool().unwrap_or(false),
+            "{tool} errored: {text}"
+        );
+        return text.to_string();
+    }
 }

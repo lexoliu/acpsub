@@ -23,9 +23,10 @@ use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Gate, Launch, SessionEnd, Status, Subagent, ToolCallSummary, Turn, begin_turn,
-    close_sub, end_session, end_target, launch, next_turn_number, prompt_slot_free,
+    AppState, Closing, Gate, Launch, SessionEnd, Status, Subagent, ToolCallSummary, Turn,
+    begin_turn, close_sub, end_session, end_target, launch, next_turn_number, prompt_slot_free,
     record_queue_dropped, spawn_turn_task, start_turn, steer_turn, steer_waiter, unschedule_resume,
+    wait_out_handoff,
 };
 use crate::transcript::{RenderOptions, render};
 
@@ -1018,24 +1019,55 @@ impl Tool for SendTool {
                 enum Action {
                     Fresh,
                     Queued(usize),
+                    /// `HandingOff` is set: hold until `handoff_one`
+                    /// resolves, like `begin_turn`'s own hold.
+                    HoldHandoff,
                 }
                 loop {
                     let action = {
                         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-                        if prompt_slot_free(&inner) && inner.queue.is_empty() {
-                            Action::Fresh
-                        } else if matches!(inner.status, Status::Exited(_)) {
-                            return Err(Error::NotPromptable {
-                                session_id: args.session_id.clone(),
-                                status: inner.status.name().to_string(),
+                        // The closing check comes first: `prompt_slot_free`
+                        // ignores it, so without these arms a `HandingOff`
+                        // session's still-promptable status would spin the
+                        // retry on the refusal `start_turn` returns.
+                        match sub.rt.closing.get() {
+                            // A queue push could miss the shipped resume
+                            // mark; the hold lets the send follow the
+                            // session instead.
+                            Some(Closing::HandingOff) => Action::HoldHandoff,
+                            Some(Closing::Ending) => {
+                                return Err(Error::NotPromptable {
+                                    session_id: args.session_id.clone(),
+                                    status: Closing::Ending.name().to_string(),
+                                }
+                                .into());
                             }
-                            .into());
-                        } else {
-                            inner.queue.push_back(args.prompt.clone());
-                            Action::Queued(inner.queue.len())
+                            None if prompt_slot_free(&inner) && inner.queue.is_empty() => {
+                                Action::Fresh
+                            }
+                            None if matches!(inner.status, Status::Exited(_)) => {
+                                return Err(Error::NotPromptable {
+                                    session_id: args.session_id.clone(),
+                                    status: inner.status.name().to_string(),
+                                }
+                                .into());
+                            }
+                            None => {
+                                inner.queue.push_back(args.prompt.clone());
+                                Action::Queued(inner.queue.len())
+                            }
                         }
                     };
                     match action {
+                        Action::HoldHandoff => {
+                            if !wait_out_handoff(&self.0, &sub).await {
+                                return Err(Error::NotPromptable {
+                                    session_id: args.session_id.clone(),
+                                    status: Closing::HandingOff.name().to_string(),
+                                }
+                                .into());
+                            }
+                        }
                         Action::Queued(position) => {
                             sub.rt.notify.notify_waiters();
                             return Ok(json!({
