@@ -135,8 +135,8 @@ enum Command {
     },
     /// Serve the subagent tools over a Unix socket as a standalone daemon.
     /// Holds the live ACP sessions; the client commands below connect to it.
-    /// Stays resident across coordinator restarts; reaps sessions whose
-    /// owning coordinator pid (`--owner` at spawn) has exited.
+    /// Stays resident across coordinator restarts; a running turn nobody
+    /// waits on is cancelled and its session closed after the grace period.
     Daemon {
         /// Socket path (default ~/.local/share/acpsub/daemon.sock).
         #[arg(long)]
@@ -171,10 +171,6 @@ enum Command {
         /// Permission policy for this subagent.
         #[arg(long)]
         permission: Option<Permission>,
-        /// Owning coordinator pid; the daemon reaps the session if it dies
-        /// (default: `$ACPSUB_OWNER`).
-        #[arg(long)]
-        owner: Option<u32>,
         #[command(flatten)]
         prompt: PromptArg,
         #[command(flatten)]
@@ -200,9 +196,6 @@ enum Command {
         /// Permission policy override.
         #[arg(long)]
         permission: Option<Permission>,
-        /// Owning coordinator pid.
-        #[arg(long)]
-        owner: Option<u32>,
         #[command(flatten)]
         prompt: PromptArg,
         #[command(flatten)]
@@ -438,7 +431,6 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
             agent,
             config_options,
             permission,
-            owner,
             prompt,
             conn,
         } => (
@@ -451,7 +443,6 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
                 agent.as_deref(),
                 &config_options,
                 permission,
-                owner,
                 &prompt,
             )?,
         ),
@@ -462,7 +453,6 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
             agent,
             cwd,
             permission,
-            owner,
             prompt,
             conn,
         } => (
@@ -475,7 +465,6 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
                 agent.as_deref(),
                 cwd.as_deref(),
                 permission,
-                owner,
                 &prompt,
             )?,
         ),
@@ -554,7 +543,6 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
 }
 
 /// Build the `spawn` tool arguments from the CLI flags.
-#[expect(clippy::too_many_arguments, reason = "mirrors the clap surface")]
 fn spawn_args(
     cwd: &Path,
     model: Option<&str>,
@@ -562,7 +550,6 @@ fn spawn_args(
     agent: Option<&str>,
     config_options: &[String],
     permission: Option<Permission>,
-    owner: Option<u32>,
     prompt: &PromptArg,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let prompt = prompt
@@ -579,12 +566,10 @@ fn spawn_args(
         args["config"] = parse_config_options(config_options)?;
     }
     set_if(&mut args, "permission", permission.map(Permission::policy));
-    set_if(&mut args, "owner", owner.or_else(owner_env));
     Ok(args)
 }
 
 /// Build the `adopt` tool arguments from the CLI flags.
-#[expect(clippy::too_many_arguments, reason = "mirrors the clap surface")]
 fn adopt_args(
     session_id: &str,
     model: Option<&str>,
@@ -592,7 +577,6 @@ fn adopt_args(
     agent: Option<&str>,
     cwd: Option<&Path>,
     permission: Option<Permission>,
-    owner: Option<u32>,
     prompt: &PromptArg,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let mut args = json!({
@@ -604,7 +588,6 @@ fn adopt_args(
     set_if(&mut args, "cwd", cwd);
     set_if(&mut args, "prompt", prompt.text()?);
     set_if(&mut args, "permission", permission.map(Permission::policy));
-    set_if(&mut args, "owner", owner.or_else(owner_env));
     Ok(args)
 }
 
@@ -672,13 +655,6 @@ async fn restart(conn: DaemonConn) -> Result<ExitCode, Box<dyn std::error::Error
     let report =
         acpsub::client::call(&socket, "daemon/resumed", json!({}), conn.config.as_deref()).await?;
     Ok(print_result(report))
-}
-
-/// The owning coordinator pid from the environment.
-fn owner_env() -> Option<u32> {
-    std::env::var("ACPSUB_OWNER")
-        .ok()
-        .and_then(|value| value.parse().ok())
 }
 
 /// Print a tool result: JSON pretty-printed when it parses, raw text
@@ -760,7 +736,7 @@ async fn serve(
 }
 
 /// `acpsub daemon`: MCP over a Unix socket; sessions outlive the caller and
-/// are reaped when their owning coordinator pid dies.
+/// a running turn nobody waits on is cancelled after the grace period.
 async fn daemon(
     config: Option<PathBuf>,
     socket: Option<PathBuf>,

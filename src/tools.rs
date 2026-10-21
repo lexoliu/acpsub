@@ -787,11 +787,6 @@ struct SpawnArgs {
     /// Permission policy for this subagent: `allow` auto-approves, `deny`
     /// auto-rejects, `ask` queues requests for the `permit` tool.
     permission: Option<PermissionPolicy>,
-    /// Pid of the coordinator process this subagent belongs to. When the
-    /// server runs as a daemon it reaps the subagent once that pid dies,
-    /// so a session cannot outlive its coordinator as an orphan. Omit to
-    /// leave the subagent unowned.
-    owner: Option<u32>,
 }
 
 struct SpawnTool(Arc<AppState>);
@@ -818,7 +813,6 @@ impl Tool for SpawnTool {
                 config: args.config.unwrap_or_default(),
                 permission: args.permission,
                 load: None,
-                owner: args.owner,
             },
         )
         .await?;
@@ -863,8 +857,6 @@ struct AdoptArgs {
     mode: Option<String>,
     /// Permission policy override, as in `spawn`.
     permission: Option<PermissionPolicy>,
-    /// Owning coordinator pid, as in `spawn`.
-    owner: Option<u32>,
 }
 
 struct AdoptTool(Arc<AppState>);
@@ -935,7 +927,6 @@ impl Tool for AdoptTool {
                 config: BTreeMap::new(),
                 permission: args.permission,
                 load: Some(args.session_id),
-                owner: args.owner,
             },
         )
         .await?;
@@ -1159,6 +1150,10 @@ async fn steer_send(
 /// Both an `overrun` result and a `max_wait_secs` timeout carry an
 /// activity `digest` measured over the window since the wait began —
 /// its fields are documented on [`ActivityDigest`].
+///
+/// While this call is in flight it feeds the session's watchdog: a
+/// running turn with no attached `wait`/`wait_any` caller past the
+/// grace period is cancelled and its session closed.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitArgs {
     /// Session id, as returned by `spawn`/`adopt`.
@@ -1201,6 +1196,10 @@ impl Tool for WaitTool {
     async fn call(&self, args: WaitArgs, mut cx: ToolContext) -> aither_core::Result<Value> {
         check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let sub = self.state.get(&args.session_id)?;
+        // Attached for the call's life: the running turn's watchdog is
+        // fed while this wait lives — a dead client's call drops when
+        // its connection closes.
+        let _waiter = crate::watchdog::Waiter::attach(&sub);
         let started = Instant::now();
         let window_start = jiff::Timestamp::now();
         let Some(mut awaited) = awaited_turn(&sub)? else {
@@ -1351,6 +1350,11 @@ impl Tool for WaitAnyTool {
             .iter()
             .map(|session_id| self.state.get(session_id))
             .collect::<Result<Vec<_>>>()?;
+        // Each watched session's watchdog is fed while this wait lives.
+        let _waiters: Vec<crate::watchdog::Waiter> = subs
+            .iter()
+            .map(|sub| crate::watchdog::Waiter::attach(sub))
+            .collect();
         let started = Instant::now();
         let window_start = jiff::Timestamp::now();
         // Each watched session binds to the turn in flight at call time,

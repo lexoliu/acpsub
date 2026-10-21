@@ -28,7 +28,7 @@ impl Daemon {
     fn start(dir: &Path) -> Self {
         let mut agents = BTreeMap::new();
         agents.insert("fake".to_string(), fake_agent_config());
-        let config = write_config(dir, Some("fake"), &agents);
+        let config = write_config(dir, Some("fake"), &agents, None);
         let socket = dir.join("daemon.sock");
         let log = dir.join("daemon.log");
         let child = Command::new(env!("CARGO_BIN_EXE_acpsub"))
@@ -211,7 +211,7 @@ fn client_starts_daemon_when_absent() {
     let dir = tempfile::tempdir().unwrap();
     let mut agents = BTreeMap::new();
     agents.insert("fake".to_string(), fake_agent_config());
-    let config = write_config(dir.path(), Some("fake"), &agents);
+    let config = write_config(dir.path(), Some("fake"), &agents, None);
     let socket = dir.path().join("daemon.sock");
     // The auto-started daemon is detached: the guard stops it through
     // its pid file, whatever the assertions below do.

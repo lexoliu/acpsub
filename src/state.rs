@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aither_acp::{
     AcpClient, ClientError, ConfigOption, ConfigOptionValue, ConfigSelectOptions, ContentBlock,
@@ -70,6 +71,11 @@ pub struct AppState {
     pub limits_notify: Notify,
     /// Set once the resume scheduler is running.
     pub scheduler_started: AtomicBool,
+    /// How long a running turn may go without an attached `wait`/
+    /// `wait_any` caller before the watchdog cancels it and closes the
+    /// session — [`crate::watchdog::WAIT_GRACE`] unless the config sets
+    /// `[defaults] wait_grace`.
+    pub wait_grace: Duration,
     /// Daemon-generation handover coordination.
     pub handover: Handover,
     /// What this daemon's startup resume pass did — filled by
@@ -105,6 +111,7 @@ impl AppState {
             limits: Mutex::new(limits),
             limits_notify: Notify::new(),
             scheduler_started: AtomicBool::new(false),
+            wait_grace: config.defaults.wait_grace,
             handover: Handover::default(),
             resume_report: Mutex::new(ResumeReport::default()),
         });
@@ -581,11 +588,11 @@ pub struct SubRuntime {
     pub next_steer: AtomicU64,
     /// Set by `close`/`forget` before the connection is shut down.
     pub closing: AtomicBool,
-    /// Process id of the coordinator that owns this subagent, or 0 when
-    /// none was claimed at `spawn`/`adopt`. The daemon reaps a subagent
-    /// whose owner is dead, so sessions cannot outlive their coordinator
-    /// as unsupervised orphans.
-    pub owner: AtomicU32,
+    /// `wait`/`wait_any` calls attached to this subagent — each live one
+    /// feeds the turn watchdog.
+    pub waiters: AtomicU64,
+    /// Wakes the turn watchdog on a waiter attach or detach.
+    pub watch: Notify,
     /// The agent child process id — also its process group id, since the
     /// child is spawned with `process_group(0)`. 0 until spawned.
     pub agent_pid: AtomicU32,
@@ -693,33 +700,6 @@ pub struct Subagent {
     pub stderr_pump: Mutex<Option<JoinHandle<()>>>,
     /// Shared mutable state.
     pub rt: Arc<SubRuntime>,
-}
-
-impl Subagent {
-    /// Whether the coordinator process that claimed this subagent at
-    /// `spawn`/`adopt` is gone — meaning the daemon may reap it. Always
-    /// `false` for an unowned subagent.
-    ///
-    /// # Panics
-    ///
-    /// Panics never; a 0 owner means "unowned".
-    #[must_use]
-    pub fn owner_dead(&self) -> bool {
-        let pid = self.rt.owner.load(Ordering::Relaxed);
-        pid != 0 && !pid_alive(pid)
-    }
-}
-
-/// Whether `pid` exists on this machine: `kill(pid, 0)` reports
-/// `ESRCH` for a dead pid and `EPERM` for a live one we may not signal.
-#[must_use]
-pub fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 performs liveness checking only; nothing is sent.
-    (unsafe { libc::kill(pid, 0) } == 0)
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Current RFC 3339 timestamp.
@@ -831,9 +811,6 @@ pub struct Launch {
     pub permission: Option<PermissionPolicy>,
     /// `adopt`: the existing session id to load instead of `session/new`.
     pub load: Option<String>,
-    /// Owning coordinator pid, for the daemon's orphan reaper. `None`
-    /// leaves the subagent unowned — nothing reaps it.
-    pub owner: Option<u32>,
 }
 
 /// Spawn an agent process, run the ACP handshake, and register the subagent.
@@ -935,7 +912,8 @@ fn new_runtime(args: &Launch, steer: SteerSemantics) -> Arc<SubRuntime> {
         next_steer: AtomicU64::new(1),
         next_term: AtomicU64::new(1),
         closing: AtomicBool::new(false),
-        owner: AtomicU32::new(args.owner.unwrap_or(0)),
+        waiters: AtomicU64::new(0),
+        watch: Notify::new(),
         agent_pid: AtomicU32::new(0),
     })
 }
@@ -1028,6 +1006,7 @@ async fn launch_inner(
         rt,
     });
     go_live(state, &sub).await?;
+    tokio::spawn(crate::watchdog::run(state.clone(), sub.clone()));
     if let Some(session_id) = &args.load {
         release_reservation(state, &sub, session_id).await?;
     }
@@ -1355,7 +1334,7 @@ async fn handshake(
 
 /// Upsert `args`' session in the registry after a handshake: an existing
 /// entry keeps its `created` timestamp and turn count; a new one gets a
-/// fresh entry. Model, mode and owner are recorded for a `session/load`
+/// fresh entry. Model and mode are recorded for a `session/load`
 /// resume; a parked schedule the entry carried is consumed — the session
 /// is live again.
 ///
@@ -1370,7 +1349,6 @@ async fn register_session(state: &Arc<AppState>, session_id: &str, args: &Launch
                 entry.cwd.clone_from(&args.cwd);
                 entry.model.clone_from(&args.model);
                 entry.mode.clone_from(&args.mode);
-                entry.owner = args.owner;
                 entry.rate_limited = None;
                 entry.resume = None;
             }
@@ -1385,7 +1363,6 @@ async fn register_session(state: &Arc<AppState>, session_id: &str, args: &Launch
                     turns: 0,
                     model: args.model.clone(),
                     mode: args.mode.clone(),
-                    owner: args.owner,
                     rate_limited: None,
                     resume: None,
                 },
@@ -1657,7 +1634,7 @@ pub(crate) fn end_target(state: &AppState, session_id: &str, forgotten: bool) ->
 /// take the connection and stderr tasks down.
 ///
 /// Shared by the `close` and `forget` tools, by `adopt` reaping an `exited`
-/// husk, and by the daemon's orphan reaper.
+/// husk, and by the turn watchdog.
 ///
 /// # Panics
 ///
@@ -1714,7 +1691,7 @@ pub async fn close_sub(sub: &Subagent) {
 /// for a manual `adopt`, but no schedule may relaunch it.
 ///
 /// Shared by every path that ends a session deliberately: the `close`
-/// tool and the daemon's orphan reaper.
+/// tool and the turn watchdog.
 pub async fn unschedule_resume(state: &Arc<AppState>, session_id: &str) {
     let result = state
         .update_registry(|registry| {
@@ -1739,7 +1716,7 @@ pub async fn unschedule_resume(state: &Arc<AppState>, session_id: &str) {
 /// idempotent — as part of teardown.
 ///
 /// Shared by the paths that end a live session on purpose: the `close`
-/// tool and the daemon's orphan reaper. `close` on a registry-only
+/// tool and the turn watchdog. `close` on a registry-only
 /// session — no `Subagent`, nothing to flag or tear down — calls
 /// `unschedule_resume` alone.
 pub async fn end_session(state: &Arc<AppState>, sub: &Subagent) {

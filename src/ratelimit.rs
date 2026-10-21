@@ -659,9 +659,6 @@ async fn resume_loaded(state: &Arc<AppState>, session_id: &str) {
             config: BTreeMap::new(),
             permission: None,
             load: Some(session_id.to_string()),
-            // The registered owner carries over: a resumed session is
-            // reaped when its coordinator exits, same as a fresh spawn.
-            owner: entry.owner,
         },
     )
     .await;

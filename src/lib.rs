@@ -25,6 +25,7 @@ pub mod state;
 pub mod terminal;
 pub mod tools;
 pub mod transcript;
+mod watchdog;
 
 pub use config::{
     AgentConfig, Config, Defaults, PermissionPolicy, SteerSemantics, default_config_path,
