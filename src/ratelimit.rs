@@ -234,6 +234,13 @@ pub(crate) async fn park_prompt(
     let gate = active_limit(state, &sub.agent);
     let (parked, queued) = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+        // A closing session never parks: `handoff_one` already took the
+        // queue into its resume mark — a park landing now would be lost
+        // with the session. The caller falls through to the gate, where
+        // `closing` produces the refusal.
+        if sub.rt.closing.get().is_some() {
+            return None;
+        }
         // A session already parked keeps its mark: a prompt joining the
         // queue neither interrupts a turn nor drops the continuation.
         let (resume_at, reason, plan) = if let Status::RateLimited {
@@ -344,7 +351,7 @@ async fn record_park(
             // against `unschedule_resume`: a `close` that already stored
             // the flag must not see its cleared mark rewritten.
             if let Some(entry) = registry.get_mut(&session_id)
-                && !sub.rt.closing.load(Ordering::Relaxed)
+                && sub.rt.closing.get().is_none()
             {
                 entry.rate_limited = Some(crate::registry::RateLimited {
                     resume_at,
@@ -551,7 +558,7 @@ fn reserve_resume_turn(sub: &Subagent) -> Option<(String, bool)> {
     let Status::RateLimited { plan, .. } = inner.status else {
         return None;
     };
-    if sub.rt.closing.load(Ordering::Relaxed) {
+    if sub.rt.closing.get().is_some() {
         return None;
     }
     let prompt = match plan {
@@ -582,9 +589,7 @@ async fn resume_live(state: &Arc<AppState>, sub: &Arc<Subagent>) {
                 warn!(%session_id, %error, "rate-limited resume failed");
                 let mut inner = sub.rt.inner.lock().expect("inner poisoned");
                 inner.pending_turn_start = None;
-                if !matches!(inner.status, Status::Exited(_))
-                    && !sub.rt.closing.load(Ordering::Relaxed)
-                {
+                if !matches!(inner.status, Status::Exited(_)) && sub.rt.closing.get().is_none() {
                     inner.status =
                         Status::Failed(format!("resume after rate limit failed: {error}"));
                 }
@@ -659,9 +664,6 @@ async fn resume_loaded(state: &Arc<AppState>, session_id: &str) {
             config: BTreeMap::new(),
             permission: None,
             load: Some(session_id.to_string()),
-            // The registered owner carries over: a resumed session is
-            // reaped when its coordinator exits, same as a fresh spawn.
-            owner: entry.owner,
         },
     )
     .await;

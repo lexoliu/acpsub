@@ -75,17 +75,22 @@ pub fn fake_agent_config() -> AgentConfig {
 }
 
 /// Write `dir/config.toml` for `agents` under `[defaults]` pointing at
-/// `dir`, and return the config file's path.
+/// `dir` — `wait_grace` seconds when given — and return the config
+/// file's path.
 pub fn write_config(
     dir: &Path,
     default_agent: Option<&str>,
     agents: &BTreeMap<String, AgentConfig>,
+    wait_grace: Option<f64>,
 ) -> PathBuf {
     let mut text = format!(
         "[defaults]\npermission = \"allow\"\ntranscript_dir = \"{}\"\nregistry = \"{}\"\n",
         dir.join("transcripts").display(),
         dir.join("registry.json").display(),
     );
+    if let Some(wait_grace) = wait_grace {
+        let _ = writeln!(text, "wait_grace = {wait_grace}");
+    }
     if let Some(agent) = default_agent {
         let _ = writeln!(text, "agent = \"{agent}\"");
     }
@@ -222,7 +227,7 @@ pub fn test_state_full(
     default_agent: Option<&str>,
     agents: &BTreeMap<String, AgentConfig>,
 ) -> (Arc<AppState>, Tools) {
-    let path = write_config(dir, default_agent, agents);
+    let path = write_config(dir, default_agent, agents, None);
     let config = Config::load(&path).expect("config loads");
     let state = AppState::new(config, path).expect("app state");
     // The test-harness constructor: a short report interval so progress

@@ -32,11 +32,14 @@ cargo install acpsub --locked
 
 **CLI (daemon)**: the client commands below start `acpsub daemon`
 automatically when the socket is silent — nothing to wire up. `daemon` keeps
-running after the caller exits; it reaps a session whose `--owner` pid has
-died, so a subagent cannot outlive its coordinator as an orphan.
+running after the caller exits; a running turn nobody waits on is cancelled
+and its session closed after a grace period, so a turn cannot keep running —
+and spending — after every caller walked away. Each `wait`/`wait-any` call
+feeds the watchdog while it is attached; an idle session or a turn awaiting a
+permission answer burns nothing and is not watched.
 
 ```sh
-acpsub spawn --cwd . --model swe-2-high --mode bypass --prompt "Fix the typo in README" --owner $PPID
+acpsub spawn --cwd . --model swe-2-high --mode bypass --prompt "Fix the typo in README"
 acpsub wait <session_id> --expect 600   # blocks until the turn ends —
                                       # run it in the background
 ```
@@ -94,8 +97,8 @@ file that fails to parse is a tool error, never a stale fallback.
 
 | tool | arguments | behaviour |
 |---|---|---|
-| `spawn` | `cwd, prompt, model?, mode?, agent?, config?, permission?, owner?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. `model`/`mode` are required when the agent advertises a `model` option / session modes and must be omitted when it does not (the calls are skipped). Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. `owner` (a pid) lets the daemon reap the subagent when its coordinator exits. While a rate limit holds in the agent's quota scope the prompt parks instead: `{state: "rate_limited", resume_at, reason, position}`. |
-| `adopt` | `session_id, model?, mode?, agent?, cwd?, prompt?, permission?, owner?` | Take over an existing ACP session via `session/load` — a registered (closed) session, a live `exited` one (the dead runtime is reaped, no `close` needed), or an external one such as a Devin session created elsewhere. Same `model`/`mode` rule as `spawn`. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
+| `spawn` | `cwd, prompt, model?, mode?, agent?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. `model`/`mode` are required when the agent advertises a `model` option / session modes and must be omitted when it does not (the calls are skipped). Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. While a rate limit holds in the agent's quota scope the prompt parks instead: `{state: "rate_limited", resume_at, reason, position}`. |
+| `adopt` | `session_id, model?, mode?, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, a live `exited` one (the dead runtime is reaped, no `close` needed), or an external one such as a Devin session created elsewhere. Same `model`/`mode` rule as `spawn`. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
 | `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled`/`failed` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not reject it; agents configured `steer = "folded"` never answer it and the steer settles folded at the turn's end), returning `{state: "submitted", steer_id, turn}` at once — ACP has no acknowledgement to wait for, so the resolution is reported elsewhere: `status`'s `steers` list while it is in flight, `wait`'s `steers` on the target turn once resolved. On a promptable subagent all three just start the turn: `{state: "running"}`. Under a rate limit in the session's quota scope, any policy's prompt parks and returns `{state: "rate_limited", resume_at, reason, position}`. |
 | `wait` | `session_id, expect_secs, max_wait_secs?, long?` | Block until the turn ends — and every steer that targeted it has resolved — a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. `expect_secs` and `max_wait_secs` over 1800 (30 minutes) are rejected unless `long` is set. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, steers, pending_permission?, digest?, resume_at?, reason?}`; `steers` lists each steer that targeted the awaited turn with its outcome — `folded`, `rejected` with the agent's `error` text, or `turn` with the number of the turn it ran as when it landed behind the target's end (`pending` while still in flight on an early return); a wait called on a settled session whose steers are still in flight binds to their target turn, and the hold counts against `expect_secs` from the turn's start, so a steer the agent never answers ends the wait as an `overrun`. A turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. `max_wait_secs` bounds the wait call itself: when it passes first, the result is `state: "running"` with an activity `digest` (below). `overrun` results carry the same digest. A bound turn that ends rate-limited does not end the wait, and neither does calling it on a parked session: it binds to the turn the resume starts (the continuation, or the first queued prompt) and freezes while parked — the parked seconds never count against `expect_secs` — until that turn ends; a parked session whose `max_wait_secs` passes reports `state: "rate_limited"` with `resume_at` and the provider's `reason`. |
 | `wait_any` | `session_ids, expect_secs, max_wait_secs?, long?` | First of them to leave `running` — a turn end (held until its steers resolve, as in `wait`), a permission request, or an `overrun`. On a `max_wait_secs` timeout, the longest-running watched turn's `running` state with its `digest`. Same 1800-second limit and `long` opt-in as `wait`. |
@@ -103,7 +106,7 @@ file that fails to parse is a tool error, never a stale fallback.
 | `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
 | `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
 | `permit` | `session_id, request_id, option_id` | Answer a queued `ask`-policy permission request. |
-| `transcript` | `session_id, from?, tail?, full?, thinking?` | Rendered transcript (same output as the CLI). |
+| `transcript` | `session_id, from?, tail?, full?, thinking?, meta?` | Rendered transcript (same output as the CLI). |
 | `list` | — | Live and registered subagents with state. |
 | `close` | `session_id` | End the process; keep the registry entry (still adoptable). |
 | `forget` | `session_id` | Remove the registry entry (and the process if live). |
@@ -190,7 +193,7 @@ text:
   not count against `expect_secs`, which runs from the resumed turn's
   start, and `max_wait_secs` still bounds the call.
 - **Registry** (`registry.json`): `session_id → {agent, cwd, created,
-  last_turn, turn_started?, turns, model?, mode?, owner?,
+  last_turn, turn_started?, turns, model?, mode?,
   rate_limited?, resume?}`, written
   atomically. `turn_started` is
   set while a turn is in flight — it is the base `expect_secs` measures
@@ -208,7 +211,7 @@ text:
   daemon keep working — then tells the previous generation, over its
   private `daemon.<pid>.sock`, that it is superseded. Every session with
   no turn in flight hands off and resumes on the new daemon via
-  `session/load` — same id, agent, model, mode, cwd and owner — while
+  `session/load` — same id, agent, model, mode and cwd — while
   sessions with a turn or launch in flight stay with the old daemon:
   calls for them forward to its private socket until each turn ends and
   the session follows. The superseded daemon exits once it owns
@@ -224,6 +227,16 @@ text:
   stdio lifetime — there is no successor process it could hand off to,
   and a `serve` that auto-adopted every marked session would spawn
   subagents its host never asked for.
+- **Watchdog**: a running `wait`/`wait_any` is the feed. While a turn is
+  in flight, any attached wait (CLI or MCP `serve`) keeps it alive; a
+  turn with no attached waiter for the grace period — `wait_grace` in
+  `[defaults]`, 60 s by default — is cancelled and its session closed,
+  remaining in the registry, adoptable. The clock starts when the turn
+  starts and whenever the last waiter detaches — a `wait` killed with
+  its caller is detected by the connection closing — and an idle or
+  parked session, or a turn awaiting a permission answer, is never watched. A daemon restart is not waiter loss:
+  the handoff restarts each in-flight turn's clock so a `wait` can
+  reattach through the forwarding path.
 - **Transcript**: every `session/update`, prompt, and turn end is appended to
   `<transcript_dir>/<session_id>.jsonl` as a verbatim JSON record. A turn's
   `reply` is that turn's concatenated `agent_message_chunk` text.
@@ -260,6 +273,7 @@ acpsub daemon [--socket PATH] [--config PATH] [--log-file PATH]
                                                 # MCP over a Unix socket
 acpsub agents [--config PATH]                    # list configured agents
 acpsub transcript <session_id> [--from N] [--tail N] [--full] [--thinking]
+              [--meta]
 ```
 
 Every tool in the table above is also a client subcommand that talks to the
@@ -270,10 +284,10 @@ file at `<socket>.pid`:
 
 ```sh
 acpsub spawn   --cwd DIR [--model M] [--mode M] [--agent K] [--set K=V]...
-              [--permission allow|deny|ask] [--owner PID]
+              [--permission allow|deny|ask]
               --prompt TEXT | --prompt-file FILE   # FILE of `-` reads stdin
 acpsub adopt   <session_id> [--model M] [--mode M] [--agent K] [--cwd DIR]
-              [--prompt TEXT | --prompt-file FILE] [--permission P] [--owner PID]
+              [--prompt TEXT | --prompt-file FILE] [--permission P]
 acpsub send    <session_id> --policy try|queued|steer
               --prompt TEXT | --prompt-file FILE
 acpsub wait    <session_id> --expect SECS [--max-wait SECS] [--long]
@@ -314,9 +328,12 @@ pong
 === [turn 1] END end_turn
 ```
 
-Long values are clipped to 400 chars unless `--full`; `--tail N` shows the
-last N records, `--from N` skips the first N, `--thinking` includes
-`agent_thought_chunk` records.
+Long values are clipped to 400 chars unless `--full`. `--tail N` shows the
+last N rendered sections and `--from N` skips the first N — a section is a
+merged run of message chunks, a tool call, a result, a prompt, or a turn
+end. `--thinking` includes `agent_thought_chunk` records; `--meta` includes
+session-state updates (session info, config options, available commands,
+usage), which are hidden by default.
 
 ## Development
 

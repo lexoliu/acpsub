@@ -23,9 +23,10 @@ use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Gate, Launch, SessionEnd, Status, Subagent, ToolCallSummary, Turn, begin_turn,
-    close_sub, end_session, end_target, launch, next_turn_number, prompt_slot_free,
+    AppState, Closing, Gate, Launch, SessionEnd, Status, Subagent, ToolCallSummary, Turn,
+    begin_turn, close_sub, end_session, end_target, launch, next_turn_number, prompt_slot_free,
     record_queue_dropped, spawn_turn_task, start_turn, steer_turn, steer_waiter, unschedule_resume,
+    wait_out_handoff,
 };
 use crate::transcript::{RenderOptions, render};
 
@@ -787,11 +788,6 @@ struct SpawnArgs {
     /// Permission policy for this subagent: `allow` auto-approves, `deny`
     /// auto-rejects, `ask` queues requests for the `permit` tool.
     permission: Option<PermissionPolicy>,
-    /// Pid of the coordinator process this subagent belongs to. When the
-    /// server runs as a daemon it reaps the subagent once that pid dies,
-    /// so a session cannot outlive its coordinator as an orphan. Omit to
-    /// leave the subagent unowned.
-    owner: Option<u32>,
 }
 
 struct SpawnTool(Arc<AppState>);
@@ -818,7 +814,6 @@ impl Tool for SpawnTool {
                 config: args.config.unwrap_or_default(),
                 permission: args.permission,
                 load: None,
-                owner: args.owner,
             },
         )
         .await?;
@@ -863,8 +858,6 @@ struct AdoptArgs {
     mode: Option<String>,
     /// Permission policy override, as in `spawn`.
     permission: Option<PermissionPolicy>,
-    /// Owning coordinator pid, as in `spawn`.
-    owner: Option<u32>,
 }
 
 struct AdoptTool(Arc<AppState>);
@@ -935,7 +928,6 @@ impl Tool for AdoptTool {
                 config: BTreeMap::new(),
                 permission: args.permission,
                 load: Some(args.session_id),
-                owner: args.owner,
             },
         )
         .await?;
@@ -1027,24 +1019,55 @@ impl Tool for SendTool {
                 enum Action {
                     Fresh,
                     Queued(usize),
+                    /// `HandingOff` is set: hold until `handoff_one`
+                    /// resolves, like `begin_turn`'s own hold.
+                    HoldHandoff,
                 }
                 loop {
                     let action = {
                         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-                        if prompt_slot_free(&inner) && inner.queue.is_empty() {
-                            Action::Fresh
-                        } else if matches!(inner.status, Status::Exited(_)) {
-                            return Err(Error::NotPromptable {
-                                session_id: args.session_id.clone(),
-                                status: inner.status.name().to_string(),
+                        // The closing check comes first: `prompt_slot_free`
+                        // ignores it, so without these arms a `HandingOff`
+                        // session's still-promptable status would spin the
+                        // retry on the refusal `start_turn` returns.
+                        match sub.rt.closing.get() {
+                            // A queue push could miss the shipped resume
+                            // mark; the hold lets the send follow the
+                            // session instead.
+                            Some(Closing::HandingOff) => Action::HoldHandoff,
+                            Some(Closing::Ending) => {
+                                return Err(Error::NotPromptable {
+                                    session_id: args.session_id.clone(),
+                                    status: Closing::Ending.name().to_string(),
+                                }
+                                .into());
                             }
-                            .into());
-                        } else {
-                            inner.queue.push_back(args.prompt.clone());
-                            Action::Queued(inner.queue.len())
+                            None if prompt_slot_free(&inner) && inner.queue.is_empty() => {
+                                Action::Fresh
+                            }
+                            None if matches!(inner.status, Status::Exited(_)) => {
+                                return Err(Error::NotPromptable {
+                                    session_id: args.session_id.clone(),
+                                    status: inner.status.name().to_string(),
+                                }
+                                .into());
+                            }
+                            None => {
+                                inner.queue.push_back(args.prompt.clone());
+                                Action::Queued(inner.queue.len())
+                            }
                         }
                     };
                     match action {
+                        Action::HoldHandoff => {
+                            if !wait_out_handoff(&self.0, &sub).await {
+                                return Err(Error::NotPromptable {
+                                    session_id: args.session_id.clone(),
+                                    status: Closing::HandingOff.name().to_string(),
+                                }
+                                .into());
+                            }
+                        }
                         Action::Queued(position) => {
                             sub.rt.notify.notify_waiters();
                             return Ok(json!({
@@ -1159,6 +1182,10 @@ async fn steer_send(
 /// Both an `overrun` result and a `max_wait_secs` timeout carry an
 /// activity `digest` measured over the window since the wait began —
 /// its fields are documented on [`ActivityDigest`].
+///
+/// While this call is in flight it feeds the session's watchdog: a
+/// running turn with no attached `wait`/`wait_any` caller past the
+/// grace period is cancelled and its session closed.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitArgs {
     /// Session id, as returned by `spawn`/`adopt`.
@@ -1201,6 +1228,10 @@ impl Tool for WaitTool {
     async fn call(&self, args: WaitArgs, mut cx: ToolContext) -> aither_core::Result<Value> {
         check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let sub = self.state.get(&args.session_id)?;
+        // Attached for the call's life: the running turn's watchdog is
+        // fed while this wait lives — a dead client's call drops when
+        // its connection closes.
+        let _waiter = crate::watchdog::Waiter::attach(&sub);
         let started = Instant::now();
         let window_start = jiff::Timestamp::now();
         let Some(mut awaited) = awaited_turn(&sub)? else {
@@ -1351,6 +1382,11 @@ impl Tool for WaitAnyTool {
             .iter()
             .map(|session_id| self.state.get(session_id))
             .collect::<Result<Vec<_>>>()?;
+        // Each watched session's watchdog is fed while this wait lives.
+        let _waiters: Vec<crate::watchdog::Waiter> = subs
+            .iter()
+            .map(|sub| crate::watchdog::Waiter::attach(sub))
+            .collect();
         let started = Instant::now();
         let window_start = jiff::Timestamp::now();
         // Each watched session binds to the turn in flight at call time,
@@ -1822,19 +1858,23 @@ impl PermitTool {
 
 /// Render a subagent's transcript: every prompt, streamed message, thinking
 /// chunk (with `thinking`), tool call and result, plan, and mode change, in
-/// order.
+/// order. Session-state updates are hidden unless `meta`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TranscriptArgs {
     /// Session id, as returned by `spawn`/`adopt`.
     session_id: String,
-    /// Start rendering at record N (skip the first N records).
+    /// Start rendering at section N (skip the first N rendered sections).
     from: Option<usize>,
-    /// Show only the last N records.
+    /// Show only the last N rendered sections.
     tail: Option<usize>,
     /// Do not clip long values (default clips at 400 chars).
     full: Option<bool>,
     /// Include `agent_thought_chunk` records.
     thinking: Option<bool>,
+    /// Include session-state updates (`session_info_update`,
+    /// `config_option_update`, `available_commands_update`,
+    /// `usage_update`), which are hidden by default.
+    meta: Option<bool>,
 }
 
 struct TranscriptTool(Arc<AppState>);
@@ -1874,6 +1914,7 @@ impl Tool for TranscriptTool {
                 tail: args.tail,
                 full: args.full.unwrap_or(false),
                 thinking: args.thinking.unwrap_or(false),
+                meta: args.meta.unwrap_or(false),
             },
         ))
     }

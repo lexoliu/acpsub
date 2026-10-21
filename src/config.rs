@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -121,6 +122,9 @@ pub struct Defaults {
     pub transcript_dir: PathBuf,
     /// Path of the session registry JSON file.
     pub registry: PathBuf,
+    /// Grace period before a running turn with no attached `wait`/
+    /// `wait_any` caller is cancelled and its session closed.
+    pub wait_grace: Duration,
 }
 
 /// How `session/request_permission` requests are answered.
@@ -251,6 +255,7 @@ struct RawDefaults {
     permission: Option<PermissionPolicy>,
     transcript_dir: Option<String>,
     registry: Option<String>,
+    wait_grace: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,6 +292,12 @@ impl RawConfig {
                         .as_deref()
                         .unwrap_or(DEFAULT_REGISTRY),
                 ),
+                wait_grace: self
+                    .defaults
+                    .wait_grace
+                    .map_or(crate::watchdog::WAIT_GRACE, |secs| {
+                        Duration::from_secs_f64(secs.max(0.0))
+                    }),
             },
             agents: self
                 .agents
