@@ -23,7 +23,7 @@ use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::registry::RegistryEntry;
 use crate::state::{
-    AppState, Closing, Gate, Launch, SessionEnd, Status, Subagent, ToolCallSummary, Turn,
+    AppState, Closing, Gate, Inner, Launch, SessionEnd, Status, Subagent, ToolCallSummary, Turn,
     begin_turn, close_sub, end_session, end_target, launch, next_turn_number, prompt_slot_free,
     record_queue_dropped, spawn_turn_task, start_turn, steer_turn, steer_waiter, unschedule_resume,
     wait_out_handoff,
@@ -166,6 +166,13 @@ fn spawned_view(sub: &Subagent) -> Value {
 /// unbounded.
 fn awaited_turn(sub: &Subagent) -> Result<Option<u64>> {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
+    // A turn whose end is not yet recorded is still in flight — unless a
+    // steered turn materialized meanwhile: that one is newer, and its end
+    // cannot settle before this record lands (`finish_turn` holds the
+    // wire until it does).
+    if let Some(n) = inner.recording {
+        return Ok(Some(inner.current.as_ref().map_or(n, |turn| turn.n)));
+    }
     match inner.status {
         Status::Running => {}
         // A permission request is reported at once; a dead agent has no
@@ -239,6 +246,22 @@ fn awaited_elapsed(sub: &Subagent, n: u64) -> Result<Awaited> {
         session_id: sub.session_id.clone(),
         detail: "status is running but no turn start is recorded".to_string(),
     };
+    // Settled but not yet recorded: still in flight until the registry
+    // holds its end — `finish_turn` notifies once it does.
+    if inner.recording == Some(n) {
+        let Some(started) = inner
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| turn.n == n)
+            .and_then(|turn| turn.started_at)
+        else {
+            return Err(missing_start());
+        };
+        return Ok(Awaited::Running(
+            jiff::Timestamp::now().duration_since(started).as_secs_f64(),
+        ));
+    }
     if let Some(turn) = inner.current.as_ref().filter(|turn| turn.n == n) {
         // Only `running` means still in flight: `needs_permission` parks
         // the turn on a request the wait returns to report, and `close`
@@ -1544,18 +1567,15 @@ impl Tool for StatusTool {
     type Arguments = StatusArgs;
     type Res = Value;
 
-    fn call(
-        &self,
-        args: StatusArgs,
-        _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        std::future::ready(self.status(args).map_err(Into::into))
+    async fn call(&self, args: StatusArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+        self.status(args).await.map_err(Into::into)
     }
 }
 
 impl StatusTool {
-    /// Synchronous body: `status` only reads shared state.
-    fn status(&self, args: StatusArgs) -> Result<Value> {
+    /// `status` only reads shared state; a live session's read holds
+    /// until a settled turn's end is recorded.
+    async fn status(&self, args: StatusArgs) -> Result<Value> {
         let sub = self
             .0
             .live
@@ -1564,25 +1584,27 @@ impl StatusTool {
             .get(&args.session_id)
             .cloned();
         if let Some(sub) = sub {
-            let (status, turns, last_stop, pending, queued, steers) = {
-                let inner = sub.rt.inner.lock().expect("inner poisoned");
-                (
-                    inner.status.clone(),
-                    inner.turn_offset + inner.turns.len() as u64,
-                    inner.turns.last().and_then(|turn| turn.stop_reason),
-                    inner
-                        .pending
-                        .iter()
-                        .map(|p| p.request_id.clone())
-                        .collect::<Vec<_>>(),
-                    inner.queue.iter().cloned().collect::<Vec<_>>(),
-                    inner
-                        .steer_pending
-                        .iter()
-                        .map(|steer| json!({"steer_id": steer.id, "turn": steer.target}))
-                        .collect::<Vec<_>>(),
-                )
-            };
+            let (status, turns, last_stop, pending, queued, steers) = sub
+                .rt
+                .read_recorded(|inner| {
+                    (
+                        inner.status.clone(),
+                        inner.turn_offset + inner.turns.len() as u64,
+                        inner.turns.last().and_then(|turn| turn.stop_reason),
+                        inner
+                            .pending
+                            .iter()
+                            .map(|p| p.request_id.clone())
+                            .collect::<Vec<_>>(),
+                        inner.queue.iter().cloned().collect::<Vec<_>>(),
+                        inner
+                            .steer_pending
+                            .iter()
+                            .map(|steer| json!({"steer_id": steer.id, "turn": steer.target}))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .await;
             let mut view = json!({
                 "session_id": sub.session_id,
                 "agent": sub.agent,
@@ -1669,40 +1691,35 @@ impl Tool for ResultTool {
     type Arguments = ResultArgs;
     type Res = Value;
 
-    fn call(
-        &self,
-        args: ResultArgs,
-        _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        std::future::ready(self.result(&args).map_err(Into::into))
+    async fn call(&self, args: ResultArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+        self.result(&args).await.map_err(Into::into)
     }
 }
 
 impl ResultTool {
-    /// Synchronous body: `result` only reads shared state.
-    fn result(&self, args: &ResultArgs) -> Result<Value> {
+    /// `result` only reads shared state; the read holds until a settled
+    /// turn's end is recorded.
+    async fn result(&self, args: &ResultArgs) -> Result<Value> {
         let sub = self.0.get(&args.session_id)?;
-        let (n, reply, stop_reason) = {
-            let inner = sub.rt.inner.lock().expect("inner poisoned");
-            let turn = args.turn.map_or_else(
-                || inner.current.as_ref().or_else(|| inner.turns.last()),
-                |n| {
-                    n.checked_sub(inner.turn_offset + 1)
-                        .and_then(|i| inner.turns.get(usize::try_from(i).unwrap_or(usize::MAX)))
-                        .or_else(|| inner.current.as_ref().filter(|turn| turn.n == n))
-                },
-            );
-            match turn {
-                Some(turn) => (turn.n, turn.reply.clone(), turn.stop_reason),
-                None => {
-                    return Err(Error::NoSuchTurn {
+        let (n, reply, stop_reason) = sub
+            .rt
+            .read_recorded(|inner| {
+                let turn = args.turn.map_or_else(
+                    || inner.current.as_ref().or_else(|| inner.turns.last()),
+                    |n| {
+                        n.checked_sub(inner.turn_offset + 1)
+                            .and_then(|i| inner.turns.get(usize::try_from(i).unwrap_or(usize::MAX)))
+                            .or_else(|| inner.current.as_ref().filter(|turn| turn.n == n))
+                    },
+                );
+                turn.map(|turn| (turn.n, turn.reply.clone(), turn.stop_reason))
+                    .ok_or_else(|| Error::NoSuchTurn {
                         session_id: args.session_id.clone(),
                         turn: args.turn.unwrap_or(0),
                         have: inner.turn_offset + inner.turns.len() as u64,
-                    });
-                }
-            }
-        };
+                    })
+            })
+            .await?;
         let mut view = json!({
             "session_id": args.session_id,
             "turn": n,
@@ -1928,19 +1945,14 @@ struct ListArgs {}
 struct ListTool(Arc<AppState>);
 
 /// `list` view of a live subagent.
-fn live_view(sub: &Subagent) -> Value {
-    let (state, turns, parked) = {
-        let inner = sub.rt.inner.lock().expect("inner poisoned");
-        (
-            inner.status.name(),
-            inner.turn_offset + inner.turns.len() as u64,
-            match &inner.status {
-                Status::RateLimited {
-                    resume_at, reason, ..
-                } => Some((resume_at.to_string(), reason.clone())),
-                _ => None,
-            },
-        )
+fn live_view(sub: &Subagent, inner: &Inner) -> Value {
+    let state = inner.status.name();
+    let turns = inner.turn_offset + inner.turns.len() as u64;
+    let parked = match &inner.status {
+        Status::RateLimited {
+            resume_at, reason, ..
+        } => Some((resume_at.to_string(), reason.clone())),
+        _ => None,
     };
     let mut view = json!({
         "session_id": sub.session_id,
@@ -2002,31 +2014,42 @@ impl Tool for ListTool {
     type Arguments = ListArgs;
     type Res = Value;
 
-    fn call(
-        &self,
-        _args: ListArgs,
-        _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        std::future::ready(Ok(self.list()))
+    async fn call(&self, _args: ListArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+        Ok(self.list().await)
     }
 }
 
 impl ListTool {
-    /// Synchronous body: `list` only reads shared state.
-    fn list(&self) -> Value {
-        let (live_views, registered) = {
+    /// `list` only reads shared state; each live session's view holds
+    /// until a settled turn's end is recorded.
+    async fn list(&self) -> Value {
+        let (live, registered) = {
             let live = self.0.live.lock().expect("live poisoned");
             let registry = self.0.registry.lock().expect("registry poisoned");
             (
                 live.iter()
-                    .map(|(session_id, sub)| (session_id.clone(), live_view(sub)))
-                    .collect::<BTreeMap<_, _>>(),
+                    .map(|(session_id, sub)| (session_id.clone(), sub.clone()))
+                    .collect::<Vec<_>>(),
                 registry
                     .iter()
                     .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
                     .collect::<BTreeMap<_, _>>(),
             )
         };
+        // Independent reads, joined: a session holding its view for a
+        // record does not delay the others.
+        let mut reads = tokio::task::JoinSet::new();
+        for (session_id, sub) in live {
+            reads.spawn(async move {
+                let view = sub.rt.read_recorded(|inner| live_view(&sub, inner)).await;
+                (session_id, view)
+            });
+        }
+        let mut live_views = BTreeMap::new();
+        while let Some(read) = reads.join_next().await {
+            let (session_id, view) = read.expect("a list view read panicked");
+            live_views.insert(session_id, view);
+        }
         let mut by_session: BTreeMap<String, Value> = registered
             .iter()
             .map(|(session_id, entry)| (session_id.clone(), closed_view(session_id, entry)))

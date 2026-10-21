@@ -612,6 +612,24 @@ pub struct Inner {
     /// when `current` was not opened by a `send`/`spawn`/`adopt` prompt but
     /// synthesized for untracked `session/update` traffic.
     pub steer_owner: Option<u64>,
+    /// The turn whose end is settled here but not yet recorded in the
+    /// registry. Until `finish_turn` records it, every client-facing
+    /// report treats the turn as still in flight: `wait` and `wait_any`
+    /// stay bound to it, `status`, `list` and `result` hold their read,
+    /// and the handover keeps the session — so no turn is reported ended
+    /// that a crash would lose, or shipped without its count.
+    pub recording: Option<u64>,
+}
+
+impl Inner {
+    /// Whether the session has work in flight a handover must wait out: a
+    /// running turn, a permission request, an unresolved steer, or a turn
+    /// end not yet recorded.
+    pub(crate) fn in_flight(&self) -> bool {
+        matches!(self.status, Status::Running | Status::NeedsPermission)
+            || !self.steer_pending.is_empty()
+            || self.recording.is_some()
+    }
 }
 
 /// Why a session refuses new work: the teardown that claimed it.
@@ -711,6 +729,31 @@ pub struct SubRuntime {
 }
 
 impl SubRuntime {
+    /// Read `inner` once no turn end is awaiting its registry record — the
+    /// read and the check share one critical section, so what `read` sees
+    /// is durable. Waits on `notify`, which `finish_turn` fires once the
+    /// record lands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned.
+    pub async fn read_recorded<R>(&self, mut read: impl FnMut(&Inner) -> R) -> R {
+        loop {
+            // Armed before the check, so a record landing in between
+            // still wakes this read.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = self.inner.lock().expect("inner poisoned");
+                if inner.recording.is_none() {
+                    return read(&inner);
+                }
+            }
+            notified.await;
+        }
+    }
+
     /// Replace the status and wake waiters.
     ///
     /// # Panics
@@ -1013,6 +1056,7 @@ fn new_runtime(args: &Launch, steer: SteerSemantics) -> Arc<SubRuntime> {
             steer_pending: VecDeque::new(),
             steer_folded: VecDeque::new(),
             steer_owner: None,
+            recording: None,
         }),
         notify: Notify::new(),
         prompt_send: Arc::new(tokio::sync::Mutex::new(())),
@@ -2355,6 +2399,7 @@ fn settle_turn(
     if let Some(mut turn) = inner.current.take() {
         turn.stop_reason = Some(reason);
         turn.ended_at = Some(jiff::Timestamp::now());
+        inner.recording = Some(turn.n);
         inner.turns.push(turn);
     }
     let folded = fold_pending_steers(rt, &mut inner);
@@ -2411,6 +2456,7 @@ fn fail_turn(rt: &SubRuntime, reason: String) -> (VecDeque<String>, Vec<u64>) {
     let mut inner = rt.inner.lock().expect("inner poisoned");
     if let Some(mut turn) = inner.current.take() {
         turn.ended_at = Some(jiff::Timestamp::now());
+        inner.recording = Some(turn.n);
         inner.turns.push(turn);
     }
     let folded = fold_pending_steers(rt, &mut inner);
@@ -2429,6 +2475,7 @@ fn park_turn(rt: &SubRuntime, hit: &crate::ratelimit::RateLimit) -> Vec<u64> {
     if let Some(mut turn) = inner.current.take() {
         turn.ended_at = Some(jiff::Timestamp::now());
         turn.rate_limited = true;
+        inner.recording = Some(turn.n);
         inner.turns.push(turn);
     }
     let folded = fold_pending_steers(rt, &mut inner);
@@ -2515,13 +2562,20 @@ fn spawn_chained(
 
 /// The shared settlement tail of `turn_task` and a steer-owned turn's
 /// [`steer_resolved`]: record the turn's end in the transcript, settle or
-/// fail state, update the registry, and wake waiters.
+/// fail state, record the end in the registry, and wake waiters.
 ///
-/// While this task holds `rt.prompt_send` the between-turns transition is
-/// atomic: a `send`/`steer` sees either the still-`running` pre-transition
-/// state or the settled post-transition one, never the gap. A queued prompt
-/// popped here becomes the next turn without a `done` interlude; a
-/// `cancelled` or failed turn drops the queue instead.
+/// The settle marks the turn `recording`, and the mark clears only once
+/// the registry holds the end: client-facing reports treat the turn as
+/// in flight until then, so an end they report is durable.
+///
+/// This task holds `rt.prompt_send` until the end is recorded, so the
+/// between-turns transition is atomic: a `send`/`steer` sees either the
+/// still-`running` pre-transition state or the recorded post-transition
+/// one, never the gap, and no other turn end can settle in between. A
+/// queued prompt popped here becomes the next turn without a `done`
+/// interlude, starting once the end is recorded — the record never clears
+/// the next turn's `turn_started`; a `cancelled` or failed turn drops the
+/// queue instead.
 async fn finish_turn(
     state: Arc<AppState>,
     sub: &Arc<Subagent>,
@@ -2534,6 +2588,7 @@ async fn finish_turn(
     // A provider rate limit ends the turn parked, not failed — the
     // session resumes on its own when the quota lifts.
     let hit = outcome.as_ref().err().and_then(crate::ratelimit::parse);
+    let mut chained = None;
     match outcome {
         Ok(result) => {
             let reason = result.stop_reason;
@@ -2551,12 +2606,8 @@ async fn finish_turn(
                 state.handover.superseded.load(Ordering::Relaxed),
             );
             record_steers_folded(rt, turn_n, folded).await;
-            if let Some(prompt) = next {
-                spawn_chained(state.clone(), session_id.clone(), prompt, wire);
-            } else {
-                drop(wire);
-            }
             record_queue_dropped(rt, Some(turn_n), dropped).await;
+            chained = next;
         }
         Err(error) => {
             let mut reason = error.to_string();
@@ -2582,17 +2633,25 @@ async fn finish_turn(
             if let Some(hit) = &hit {
                 let folded = park_turn(rt, hit);
                 record_steers_folded(rt, turn_n, folded).await;
-                drop(wire);
-                crate::ratelimit::note_limit(&state, &sub.agent, hit).await;
             } else {
                 let (dropped, folded) = fail_turn(rt, reason);
                 record_steers_folded(rt, turn_n, folded).await;
                 record_queue_dropped(rt, Some(turn_n), dropped).await;
-                drop(wire);
             }
         }
     }
-    record_turn_end(&state, rt, session_id, hit).await;
+    record_turn_end(&state, rt, session_id, hit.as_ref()).await;
+    rt.inner.lock().expect("inner poisoned").recording = None;
+    if let Some(prompt) = chained {
+        spawn_chained(state.clone(), session_id.clone(), prompt, wire);
+    } else {
+        drop(wire);
+    }
+    // After the record: the scheduler this wakes finds the parked flag,
+    // and a later scope `resume_at` moves this session's record too.
+    if let Some(hit) = &hit {
+        crate::ratelimit::note_limit(&state, &sub.agent, hit).await;
+    }
     rt.notify.notify_waiters();
     state.handover.progressed.notify_waiters();
 }
@@ -2607,7 +2666,7 @@ async fn record_turn_end(
     state: &Arc<AppState>,
     rt: &SubRuntime,
     session_id: &str,
-    hit: Option<crate::ratelimit::RateLimit>,
+    hit: Option<&crate::ratelimit::RateLimit>,
 ) {
     let (turns, queue) = {
         let inner = rt.inner.lock().expect("inner poisoned");
@@ -2618,7 +2677,7 @@ async fn record_turn_end(
     };
     let parked = hit.map(|hit| crate::registry::RateLimited {
         resume_at: hit.resume_at.to_string(),
-        reason: hit.reason,
+        reason: hit.reason.clone(),
         plan: crate::registry::ResumePlan::Continue,
         queued: queue.into_iter().collect(),
     });
@@ -2641,8 +2700,8 @@ async fn record_turn_end(
                 ) {
                     // The armed schedule is spent once a turn settles
                     // unparked. `rate_limited` keeps its own record —
-                    // a re-park can land between the settle and this
-                    // write — and `exited` keeps the flag for the
+                    // a gated `send` can park the settled session
+                    // between the settle and this write — and `exited` keeps the flag for the
                     // fresh-process resume.
                     entry.rate_limited = None;
                 }

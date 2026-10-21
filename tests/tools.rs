@@ -970,8 +970,9 @@ async fn wait_overruns_on_chained_turn() {
     .await;
 
     // `wait` binds to the turn in flight when it is called: hold it until
-    // turn 1 has settled — `rt.notify` fires at the settle — so the call
-    // awaits the chained turn 2 whether or not `begin_turn` has run yet.
+    // turn 1 has settled and its end is recorded — `rt.notify` fires once
+    // it is — so the call awaits the chained turn 2 whether or not
+    // `begin_turn` has run yet. A turn still recording is in flight.
     let sub = state.get(&sid).expect("live subagent");
     let turn_one_settled = async {
         loop {
@@ -980,7 +981,7 @@ async fn wait_overruns_on_chained_turn() {
             notified.as_mut().enable();
             {
                 let inner = sub.rt.inner.lock().expect("inner poisoned");
-                if inner.turns.len() == 1 {
+                if inner.turns.len() == 1 && inner.recording.is_none() {
                     return;
                 }
             }

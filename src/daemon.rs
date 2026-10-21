@@ -551,11 +551,8 @@ async fn handover_watch(
             let live = state.live.lock().expect("live poisoned");
             let reserved = state.reserved.lock().expect("reserved poisoned");
             for (id, sub) in live.iter() {
-                let in_flight = {
-                    let inner = sub.rt.inner.lock().expect("inner poisoned");
-                    matches!(inner.status, Status::Running | Status::NeedsPermission)
-                        || !inner.steer_pending.is_empty()
-                } || sub.rt.closing.get().is_some();
+                let in_flight = sub.rt.inner.lock().expect("inner poisoned").in_flight()
+                    || sub.rt.closing.get().is_some();
                 if in_flight {
                     owned.insert(id.clone());
                 } else {
@@ -1140,9 +1137,7 @@ fn partition(state: &AppState, own_socket: &Path) -> Result<Partition> {
     let registry = state.registry.lock().expect("registry poisoned");
     for (id, sub) in live.iter() {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
-        let in_flight = matches!(inner.status, Status::Running | Status::NeedsPermission)
-            || !inner.steer_pending.is_empty()
-            || sub.rt.closing.get().is_some();
+        let in_flight = inner.in_flight() || sub.rt.closing.get().is_some();
         // A handed session takes no new turn here: `begin_turn`'s gate
         // checks `closing` under this same lock.
         if !in_flight {
