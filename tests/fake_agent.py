@@ -72,7 +72,13 @@ FAKE_RATE_LIMIT=<secs> makes "ratelimit" prompts — then every prompt
 until the window lifts — answer the Devin rate-limit shape.
 FAKE_RATE_LIMIT_GATE=<path> holds a rate-limited prompt's error answer
 until the file exists (polled — it is another process's signal), so the
-turn ends when the test says, not when a delay runs out.
+turn ends when the test says, not when a delay runs out; the named reset
+is measured from the answer, so a long-held gate still parks for the
+window's length rather than a day.
+FAKE_RATE_LIMIT_HOLD=<path> keeps the window itself open while the file
+is absent — every prompt errors again, whatever its text — and lifts the
+limit for good once the file exists: a test holds a park open for as long
+as it takes to observe it, then releases it.
 FAKE_MODE_IGNORED=1 makes session/set_mode a no-op: the call succeeds but
 the session's mode — reported by the `mode` config option — never changes.
 Session ids are `sess-<pid>-<n>` so concurrently spawned agents never
@@ -485,14 +491,29 @@ def on_prompt(request_id, params):
     limit_secs = float(os.environ.get("FAKE_RATE_LIMIT", "0") or 0)
     if limit_secs and "ratelimit" in text and rate_limited_until is None:
         rate_limited_until = time.time() + limit_secs
+    # FAKE_RATE_LIMIT_HOLD=<path>: the provider's limit stands while the
+    # file is absent — every prompt errors again, the window re-arming at
+    # each answer so the park it causes always has a live reset — and is
+    # gone entirely once the file exists: the test lifts the limit on its
+    # own event, never on a window's end.
+    hold = os.environ.get("FAKE_RATE_LIMIT_HOLD")
+    if hold is not None:
+        if not os.path.exists(hold):
+            rate_limited_until = time.time() + limit_secs
+        else:
+            rate_limited_until = None
     if rate_limited_until is not None:
         if time.time() < rate_limited_until:
             gate = os.environ.get("FAKE_RATE_LIMIT_GATE")
             if gate:
                 # The error waits on the gate file: the test holds the
-                # turn in flight itself instead of a fixed delay.
+                # turn in flight itself instead of a fixed delay. The
+                # window re-arms at the answer — a reset measured from
+                # the prompt's arrival can land in the past under a held
+                # gate, and a past reset parks the session for a day.
                 while not os.path.exists(gate):
                     time.sleep(0.02)
+                rate_limited_until = time.time() + limit_secs
             else:
                 delay = float(os.environ.get("FAKE_RATE_LIMIT_DELAY", "0.35") or 0.35)
                 time.sleep(delay)

@@ -31,8 +31,10 @@ use serde_json::Value;
 /// The agent set the restart tests need: `fake` (loadSession), `noload`
 /// (same script with `FAKE_NO_LOAD=1`, so `session/load` is refused) and
 /// `slowlimit` (every "ratelimit" prompt parks the turn after a 3 s delay
-/// and keeps the session parked for an 8 s window — long enough to hand
-/// over inside it).
+/// and keeps the session parked for an hour — the park cannot lift inside
+/// a test no matter how loaded the machine, so a parked session is
+/// observed rather than raced; a test releases it through the schedule
+/// itself).
 fn agents() -> BTreeMap<String, acpsub::config::AgentConfig> {
     let fake = fake_agent_config();
     let mut agents = BTreeMap::new();
@@ -48,7 +50,7 @@ fn agents() -> BTreeMap<String, acpsub::config::AgentConfig> {
         "slowlimit".to_string(),
         acpsub::config::AgentConfig {
             env: BTreeMap::from([
-                ("FAKE_RATE_LIMIT".to_string(), "8".to_string()),
+                ("FAKE_RATE_LIMIT".to_string(), "3600".to_string()),
                 ("FAKE_RATE_LIMIT_DELAY".to_string(), "3".to_string()),
             ]),
             ..fake
@@ -211,6 +213,37 @@ impl Daemon {
                 return status;
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Kill the generation currently serving this socket — a machine
+    /// death: no persist, no handover, and the registry file is the only
+    /// record the next daemon resumes from. Returns once the socket's
+    /// claim is free, so a fresh start cannot race a still-dying process.
+    fn kill_current(&self) {
+        let pid_path = self.socket.with_extension("sock.pid");
+        let pid: i32 = std::fs::read_to_string(&pid_path)
+            .expect("read daemon pid file")
+            .trim()
+            .parse()
+            .expect("daemon pid file holds a pid");
+        // SAFETY: kill(2) only delivers a signal; the pid is the claim
+        // holder's own record of itself.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let claim = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&pid_path)
+            .expect("open daemon pid file");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while claim.try_lock().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "killed daemon still holds {}",
+                pid_path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -567,9 +600,34 @@ fn parked_session_follows_restart() {
     assert!(status["resume_at"].is_string(), "{status}");
 }
 
+/// Move every parked schedule in `dir`'s registry into the past — the
+/// state a limit that lifted while its daemon was down leaves behind, so
+/// the next daemon's scheduler fires the resume at once.
+fn expire_parked(dir: &Path) {
+    let path = dir.join("registry.json");
+    let mut registry: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("registry file"))
+            .expect("registry is json");
+    for entry in registry
+        .as_object_mut()
+        .expect("registry entries")
+        .values_mut()
+    {
+        if let Some(parked) = entry.get_mut("rate_limited") {
+            parked["resume_at"] = serde_json::json!("2000-01-01T00:00:00Z");
+        }
+    }
+    std::fs::write(&path, registry.to_string()).expect("write registry");
+}
+
 /// A prompt parked before its turn started stays marked as the resume's
 /// first turn across a daemon restart: the new daemon runs it without a
-/// continuation, and `wait` blocks until that turn ends.
+/// continuation, and `wait` blocks until that turn ends. The park's
+/// window is an hour — no run of this test sees it lift — so the parked
+/// state is observed, never raced; the resume is then released the way a
+/// daemon that was down when the limit lifted releases one: the schedule
+/// the registry carries is moved into the past and a fresh daemon's
+/// scheduler fires it.
 #[test]
 fn parked_prompt_resumes_without_continuation_after_restart() {
     if !python3() {
@@ -612,9 +670,35 @@ fn parked_prompt_resumes_without_continuation_after_restart() {
         "restart failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("restart output is json");
+    assert!(
+        report["resumed"]
+            .as_array()
+            .expect("resumed")
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|sid| sid == b),
+        "{report}"
+    );
+
+    // The park survives the handover whole: an hour is never up, so the
+    // adopted session reports `rate_limited` no matter how long the
+    // restart took.
     let status = daemon.status_until(&b, |status| status["live"] == true);
     assert_eq!(status["state"], "rate_limited", "{status}");
+    assert!(status["resume_at"].is_string(), "{status}");
 
+    // Lift the limit the way a daemon down at the lift sees it: this
+    // generation dies, the persisted `resume_at` moves into the past,
+    // and the next daemon's scheduler fires the resume itself.
+    daemon.kill_current();
+    expire_parked(dir.path());
+    let daemon = Daemon::start(dir.path());
+
+    // The resumed prompt is the session's own, as its first turn.
+    daemon.status_until(&b, |status| {
+        status["live"] == true && status["state"] != "idle"
+    });
     let ended = daemon.call_json(&["wait", &b, "--expect", "60"]);
     assert_eq!(ended["state"], "done", "{ended}");
     assert_eq!(ended["turn"], 1, "{ended}");
