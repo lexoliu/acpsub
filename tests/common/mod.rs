@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +13,37 @@ use acpsub::config::{AgentConfig, SteerSemantics};
 use acpsub::{AppState, Config};
 use aither_core::llm::tool::{ToolContext, ToolResult, Tools};
 use serde_json::{Value, json};
+
+/// Run `command` until it exits, its stdout and stderr captured in
+/// anonymous temp files. The client's exit is the completion signal, not
+/// EOF on a pipe: on macOS std creates a `Command`'s pipes with `pipe()`
+/// and marks them close-on-exec only afterwards, so a client spawned at
+/// that moment on another thread inherits the write end and holds the
+/// pipe open — and with it `output()` — until it exits, or for good once
+/// it starts a daemon. A `restart` racing a blocked `wait` stalled that
+/// way until the wait ran into its expectation.
+pub fn run_to_exit(mut command: Command) -> std::io::Result<Output> {
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .status()?;
+    // The child wrote through a shared file description: rewind to read
+    // what it wrote.
+    let captured = |file: &mut File| -> std::io::Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    Ok(Output {
+        status,
+        stdout: captured(&mut stdout)?,
+        stderr: captured(&mut stderr)?,
+    })
+}
 
 /// Path to the fake agent script.
 pub fn fake_agent_script() -> PathBuf {
