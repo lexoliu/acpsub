@@ -74,7 +74,7 @@ impl Daemon {
     /// client call (a client would auto-start a daemon and hide a startup
     /// failure).
     fn start(dir: &Path) -> Self {
-        let config = write_config(dir, Some("fake"), &agents());
+        let config = write_config(dir, Some("fake"), &agents(), None);
         let socket = dir.join("daemon.sock");
         let mut child = Command::new(env!("CARGO_BIN_EXE_acpsub"))
             .arg("daemon")
@@ -199,7 +199,6 @@ fn inflight_turn_hands_off() {
     }
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path());
-    let owner = std::process::id().to_string();
 
     let running = daemon.call_json(&[
         "spawn",
@@ -209,8 +208,6 @@ fn inflight_turn_hands_off() {
         "b",
         "--mode",
         "bypass",
-        "--owner",
-        &owner,
         "--prompt",
         "gather",
     ]);
@@ -227,8 +224,6 @@ fn inflight_turn_hands_off() {
         "b",
         "--mode",
         "bypass",
-        "--owner",
-        &owner,
         "--prompt",
         "hi",
     ]);

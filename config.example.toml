@@ -8,6 +8,9 @@
 permission = "allow"
 transcript_dir = "~/.local/share/acpsub/transcripts"
 registry = "~/.local/share/acpsub/registry.json"
+# wait_grace = 60                        # seconds a running turn may go with no
+                                       # attached wait/wait_any caller before
+                                       # it is cancelled and the session closed
 # agent = "devin"                        # default backend for spawn/adopt
                                        # (a single configured agent is the
                                        #  implicit default; omitting `agent`

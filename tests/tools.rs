@@ -2692,6 +2692,7 @@ async fn removed_agent_disappears_without_restart() {
         dir.path(),
         None,
         &BTreeMap::from([("other".to_string(), fake_agent_config())]),
+        None,
     );
     let listed = call_json(&tools, "agents", json!({})).await;
     let names: Vec<&str> = listed["agents"]
@@ -3085,50 +3086,6 @@ async fn rate_limit_without_reset_fails() {
     let status = call_json(&tools, "status", json!({"session_id": sid.as_str()})).await;
     assert_eq!(status["state"], "failed", "{status}");
     assert!(status.get("resume_at").is_none(), "{status}");
-}
-
-/// A session the scheduler resumes through `session/load` — the
-/// process was gone — keeps the coordinator pid that owned it, so the
-/// reaper still sees an owner.
-#[tokio::test(flavor = "multi_thread")]
-async fn rate_limit_resume_keeps_owner() {
-    if !python3() {
-        eprintln!("skipping: python3 not found");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (state, tools) = test_state(dir.path());
-    let sid = spawn_id(
-        &tools,
-        json!({"agent": "ratelimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass", "owner": 424_242}),
-    )
-    .await;
-    status_becomes(&state, sid.as_str(), "rate_limited").await;
-    state
-        .get(sid.as_str())
-        .expect("live subagent")
-        .rt
-        .kill_process_tree();
-    status_becomes(&state, sid.as_str(), "exited").await;
-
-    drop(tools);
-    drop(state);
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    let (state, _tools) = test_state(dir.path());
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let owner = loop {
-        if let Ok(sub) = state.get(sid.as_str()) {
-            break sub.rt.owner.load(std::sync::atomic::Ordering::Relaxed);
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "parked session never resumed"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
-    assert_eq!(owner, 424_242);
-    status_becomes(&state, sid.as_str(), "done").await;
 }
 
 /// A parked session whose agent process dies keeps its prompts: the

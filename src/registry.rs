@@ -45,10 +45,6 @@ pub struct RegistryEntry {
     /// resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// The coordinator pid that owns the session — a `session/load`
-    /// resume passes it back so the reaper still sees an owner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<u32>,
     /// The session is parked by its provider's rate limit until
     /// `resume_at`: persisted so a daemon restart keeps the resume
     /// schedule.
@@ -265,7 +261,6 @@ mod tests {
                 turns: 2,
                 model: None,
                 mode: None,
-                owner: None,
                 rate_limited: None,
                 resume: None,
             },
@@ -316,7 +311,6 @@ mod tests {
                 turns: 1,
                 model: None,
                 mode: None,
-                owner: None,
                 rate_limited: None,
                 resume: None,
             },
