@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -557,6 +557,59 @@ pub struct Inner {
     pub steer_owner: Option<u64>,
 }
 
+/// Why a session refuses new work: the teardown that claimed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closing {
+    /// `close`/`forget`/`close_sub` teardown — the session is ending on
+    /// this daemon.
+    Ending = 1,
+    /// `handoff_one` is shipping the session to the next daemon
+    /// generation; a failed report clears the mark, and a refusal it
+    /// caused holds until the ship resolves.
+    HandingOff = 2,
+}
+
+impl Closing {
+    /// The status a refusal caused by this mark reports.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Ending => "closing",
+            Self::HandingOff => "handing off",
+        }
+    }
+}
+
+/// The session's closing mark — `Option<Closing>` in a lock-free cell.
+#[derive(Debug, Default)]
+pub struct ClosingFlag(AtomicU8);
+
+impl ClosingFlag {
+    /// The current mark, if the session is closing.
+    pub(crate) fn get(&self) -> Option<Closing> {
+        match self.0.load(Ordering::Relaxed) {
+            1 => Some(Closing::Ending),
+            2 => Some(Closing::HandingOff),
+            _ => None,
+        }
+    }
+
+    /// Set the mark.
+    pub(crate) fn set(&self, closing: Closing) {
+        self.0.store(closing as u8, Ordering::Relaxed);
+    }
+
+    /// Clear a `HandingOff` mark after a failed ship — a `close` that
+    /// landed meanwhile keeps its `Ending`.
+    pub(crate) fn clear_handoff(&self) {
+        let _ = self.0.compare_exchange(
+            Closing::HandingOff as u8,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+}
+
 /// Everything the handler, tools, and background tasks share about one
 /// subagent. Held by `Arc` inside both [`Subagent`] and [`SubagentHandler`].
 #[derive(Debug)]
@@ -586,8 +639,10 @@ pub struct SubRuntime {
     pub next_term: AtomicU64,
     /// Steer id counter.
     pub next_steer: AtomicU64,
-    /// Set by `close`/`forget` before the connection is shut down.
-    pub closing: AtomicBool,
+    /// The teardown that claimed the session — `close`/`forget` before
+    /// the connection is shut down (`Ending`), or a `handoff_one` ship
+    /// to the next daemon generation (`HandingOff`).
+    pub closing: ClosingFlag,
     /// `wait`/`wait_any` calls attached to this subagent — each live one
     /// feeds the turn watchdog.
     pub waiters: AtomicU64,
@@ -911,7 +966,7 @@ fn new_runtime(args: &Launch, steer: SteerSemantics) -> Arc<SubRuntime> {
         next_perm: AtomicU64::new(1),
         next_steer: AtomicU64::new(1),
         next_term: AtomicU64::new(1),
-        closing: AtomicBool::new(false),
+        closing: ClosingFlag::default(),
         waiters: AtomicU64::new(0),
         watch: Notify::new(),
         agent_pid: AtomicU32::new(0),
@@ -945,7 +1000,7 @@ async fn launch_inner(
     let accepted = match handshake(state, &client, &rt, args).await {
         Ok(accepted) => accepted,
         Err(error) => {
-            rt.closing.store(true, Ordering::Relaxed);
+            rt.closing.set(Closing::Ending);
             rt.kill_process_tree();
             client.close();
             let _ = conn.await;
@@ -959,7 +1014,7 @@ async fn launch_inner(
         .transcript_dir
         .join(format!("{session_id}.jsonl"));
     if let Err(source) = rt.transcript.lock().await.bind(&transcript_path).await {
-        rt.closing.store(true, Ordering::Relaxed);
+        rt.closing.set(Closing::Ending);
         rt.kill_process_tree();
         client.close();
         let _ = conn.await;
@@ -1046,7 +1101,7 @@ async fn go_live(state: &Arc<AppState>, sub: &Arc<Subagent>) -> Result<()> {
     }
     // A second live session with the same id (an agent reusing ids) would
     // shadow the first; refuse and kill this process.
-    sub.rt.closing.store(true, Ordering::Relaxed);
+    sub.rt.closing.set(Closing::Ending);
     sub.rt.kill_process_tree();
     sub.client.clone().close();
     let conn = sub.conn.lock().expect("conn poisoned").take();
@@ -1558,7 +1613,7 @@ fn check_config_option(
 /// `close`/`forget` set the closing flag first. A `failed` turn's reason is
 /// folded into the exit reason — the exit is the terminal fact.
 fn on_disconnect(rt: &SubRuntime) {
-    if rt.closing.load(Ordering::Relaxed) {
+    if rt.closing.get().is_some() {
         return;
     }
     let mut inner = rt.inner.lock().expect("inner poisoned");
@@ -1640,7 +1695,7 @@ pub(crate) fn end_target(state: &AppState, session_id: &str, forgotten: bool) ->
 ///
 /// Panics if a state mutex is poisoned.
 pub async fn close_sub(sub: &Subagent) {
-    sub.rt.closing.store(true, Ordering::Relaxed);
+    sub.rt.closing.set(Closing::Ending);
     sub.rt.kill_process_tree();
     let terminals: Vec<_> = sub
         .rt
@@ -1720,7 +1775,7 @@ pub async fn unschedule_resume(state: &Arc<AppState>, session_id: &str) {
 /// session — no `Subagent`, nothing to flag or tear down — calls
 /// `unschedule_resume` alone.
 pub async fn end_session(state: &Arc<AppState>, sub: &Subagent) {
-    sub.rt.closing.store(true, Ordering::Relaxed);
+    sub.rt.closing.set(Closing::Ending);
     unschedule_resume(state, &sub.session_id).await;
     close_sub(sub).await;
     state.handover.progressed.notify_waiters();
@@ -1837,35 +1892,70 @@ pub(crate) async fn begin_turn(
     gate: Gate,
     queued: bool,
 ) -> Result<(u64, PromptFut)> {
-    let started = jiff::Timestamp::now();
-    let turn_n = {
-        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-        let ready = match gate {
-            // `closing` also blocks a fresh turn: a session mid-handoff to
-            // the next daemon generation must not start one here.
-            Gate::Check => prompt_slot_free(&inner) && !sub.rt.closing.load(Ordering::Relaxed),
-            Gate::Chained => matches!(inner.status, Status::Running) && inner.current.is_none(),
-        };
-        if !ready {
-            let status = if inner.status.accepts_prompt() {
-                "steer in flight".to_string()
-            } else {
-                inner.status.name().to_string()
+    /// The gate's verdict under `inner`.
+    enum Verdict {
+        /// The turn starts with this number and start stamp.
+        Start(u64, jiff::Timestamp),
+        /// `HandingOff` is set: hold until `handoff_one` resolves.
+        HoldHandoff,
+    }
+    let (turn_n, started) = loop {
+        let verdict = {
+            let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+            let closing = sub.rt.closing.get();
+            let ready = match gate {
+                // `closing` also blocks a fresh turn: a session mid-handoff
+                // to the next daemon generation must not start one here.
+                Gate::Check => prompt_slot_free(&inner) && closing.is_none(),
+                Gate::Chained => matches!(inner.status, Status::Running) && inner.current.is_none(),
             };
-            return Err(Error::NotPromptable {
-                session_id: sub.session_id.clone(),
-                status,
-            });
+            if ready {
+                let n = next_turn_number(&inner);
+                let started = jiff::Timestamp::now();
+                inner.current = Some(Turn {
+                    n,
+                    started_at: Some(started),
+                    ..Turn::default()
+                });
+                inner.pending_turn_start = None;
+                inner.status = Status::Running;
+                drop(inner);
+                Verdict::Start(n, started)
+            } else if gate == Gate::Check && closing == Some(Closing::HandingOff) {
+                Verdict::HoldHandoff
+            } else {
+                let status = closing.map_or_else(
+                    || {
+                        if inner.status.accepts_prompt() {
+                            "steer in flight".to_string()
+                        } else {
+                            inner.status.name().to_string()
+                        }
+                    },
+                    |closing| closing.name().to_string(),
+                );
+                return Err(Error::NotPromptable {
+                    session_id: sub.session_id.clone(),
+                    status,
+                });
+            }
+        };
+        match verdict {
+            Verdict::Start(n, started) => break (n, started),
+            // A `HandingOff` refusal holds until `handoff_one` resolves
+            // rather than answering at once: the successor removed its
+            // `foreign` route before it answered the handoff, so a refusal
+            // that arrives only after the ship lands `still_owned ==
+            // false` there and re-routes the call; a failed ship clears
+            // the mark and the send retries the gate.
+            Verdict::HoldHandoff if wait_out_handoff(state, sub).await => {}
+            Verdict::HoldHandoff => {
+                return Err(Error::NotPromptable {
+                    session_id: sub.session_id.clone(),
+                    status: Closing::HandingOff.name().to_string(),
+                });
+            }
         }
-        let n = next_turn_number(&inner);
-        inner.current = Some(Turn {
-            n,
-            started_at: Some(started),
-            ..Turn::default()
-        });
-        inner.pending_turn_start = None;
-        inner.status = Status::Running;
-        n
     };
     let mut record = serde_json::json!({"ts": now(), "turn": turn_n, "prompt": prompt});
     if queued {
@@ -1901,6 +1991,34 @@ pub(crate) async fn begin_turn(
 
     let fut = enqueue_prompt(&sub.client, &sub.session_id, prompt).await;
     Ok((turn_n, fut))
+}
+
+/// Wait out `sub`'s `HandingOff` mark: `handoff_one` resolves by removing
+/// the session from `live` — the caller's refusal then routes onward — or
+/// by clearing the mark after a failed ship — the caller retries. Both
+/// wakes ride `handover.progressed`; no polling, no sleep.
+///
+/// Returns `false` once the session has left `live` — it shipped.
+pub(crate) async fn wait_out_handoff(state: &AppState, sub: &Arc<Subagent>) -> bool {
+    loop {
+        // Register the waiter BEFORE the check: a resolve between them
+        // still wakes us.
+        let notified = state.handover.progressed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !state
+            .live
+            .lock()
+            .expect("live poisoned")
+            .contains_key(&sub.session_id)
+        {
+            return false;
+        }
+        if sub.rt.closing.get() != Some(Closing::HandingOff) {
+            return true;
+        }
+        notified.await;
+    }
 }
 
 /// Spawn the turn-end task for a [`begin_turn`] result.
@@ -2127,6 +2245,12 @@ pub(crate) async fn steer_resolved(
             warn!(%error, "transcript write failed");
         }
     } else {
+        // The resolution is also the event the handover watcher needs: a
+        // steer that resolves after its turn settled was the last
+        // in-flight work keeping the session on a superseded daemon —
+        // its handoff can now run. `finish_turn` notifies on the `mine`
+        // path.
+        state.handover.progressed.notify_waiters();
         if let Some(prompt) = kick {
             let wire = sub.rt.prompt_send.clone().lock_owned().await;
             spawn_chained(state, sub.session_id.clone(), prompt, wire);
@@ -2451,7 +2575,7 @@ async fn record_turn_end(
                 // against `unschedule_resume`: a `close` that already
                 // stored the flag must not see its cleared mark rewritten.
                 if let Some(parked) = parked
-                    && !rt.closing.load(Ordering::Relaxed)
+                    && rt.closing.get().is_none()
                 {
                     entry.rate_limited = Some(parked);
                 } else if !matches!(

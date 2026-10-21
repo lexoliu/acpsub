@@ -50,6 +50,9 @@ running turn and never answer its request (codex-acp) — unless its text
 starts with "LATE ", which plays a steer that landed behind the turn's
 end: the running turn finishes and the steer runs, and answers, as a turn
 of its own.
+FAKE_LATE_STEER=<path> answers the turn's own prompt first and each
+steered prompt only once that file exists — a steer that resolves after
+its turn already settled.
 
 - "hold" -> the turn stays open until a queued prompt arrives
   (FAKE_QUEUE_PROMPTS mode only).
@@ -131,14 +134,32 @@ def new_request(method, params, kind):
 
 def answer_all(result):
     """Resolve the pending prompt and every steer with the same result, then
-    start the next agent-side queued prompt, if any."""
+    start the next agent-side queued prompt, if any. FAKE_LATE_STEER=<path>
+    answers the turn's prompt first and each steered prompt only once that
+    file exists."""
     global pending_prompt
-    for steer_id in steered:
-        respond(steer_id, result)
-    steered.clear()
-    if pending_prompt is not None:
-        respond(pending_prompt, result)
-        pending_prompt = None
+    late_gate = os.environ.get("FAKE_LATE_STEER")
+    if late_gate and steered:
+        if pending_prompt is not None:
+            respond(pending_prompt, result)
+            pending_prompt = None
+        held = list(steered)
+        steered.clear()
+
+        def answer_late():
+            while not os.path.exists(late_gate):
+                time.sleep(0.02)
+            for steer_id in held:
+                respond(steer_id, result)
+
+        threading.Thread(target=answer_late, daemon=True).start()
+    else:
+        for steer_id in steered:
+            respond(steer_id, result)
+        steered.clear()
+        if pending_prompt is not None:
+            respond(pending_prompt, result)
+            pending_prompt = None
     if pending_prompt is None and queued:
         request_id, text = queued.pop(0)
         begin_turn(request_id, text)

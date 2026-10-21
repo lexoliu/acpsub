@@ -72,7 +72,7 @@ pub async fn run(state: Arc<AppState>, sub: Arc<Subagent>) {
         tokio::pin!(progressed);
         progressed.as_mut().enable();
 
-        if sub.rt.closing.load(Ordering::Relaxed)
+        if sub.rt.closing.get().is_some()
             || !state
                 .live
                 .lock()

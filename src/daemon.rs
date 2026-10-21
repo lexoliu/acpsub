@@ -53,8 +53,8 @@ use crate::error::{Error, Result};
 use crate::ratelimit;
 use crate::registry::{RegistryEntry, Resume};
 use crate::state::{
-    AppState, Inner, Launch, ResumeFailure, ResumeReport, Status, Subagent, close_sub, launch,
-    start_turn,
+    AppState, Closing, Inner, Launch, ResumeFailure, ResumeReport, Status, Subagent, close_sub,
+    launch, start_turn,
 };
 use crate::tools::build_tools;
 
@@ -428,7 +428,7 @@ async fn handover_watch(
                     let inner = sub.rt.inner.lock().expect("inner poisoned");
                     matches!(inner.status, Status::Running | Status::NeedsPermission)
                         || !inner.steer_pending.is_empty()
-                } || sub.rt.closing.load(Ordering::Relaxed);
+                } || sub.rt.closing.get().is_some();
                 if in_flight {
                     owned.insert(id.clone());
                 } else {
@@ -488,11 +488,16 @@ fn resume_mark(inner: &Inner) -> Resume {
     }
 }
 
-/// Ship one settled session to the next daemon: mark it closing so no
-/// turn can start mid-ship, report `daemon/handoff` with its final
-/// registry entry — turn count, `last_turn`, the parked send-queue as
-/// the resume's `queued` — then close it. On a report failure the
-/// session stays owned: the next scan retries.
+/// Ship one settled session to the next daemon: mark it `HandingOff` so
+/// no turn can start mid-ship — the mark is set under the same `inner`
+/// lock `begin_turn`'s gate reads it with, and the send-queue snapshot it
+/// guards is taken in the same critical section — report `daemon/handoff`
+/// with its final registry entry — turn count, `last_turn`, the parked
+/// send-queue as the resume's `queued` — then close it. A `send` refused
+/// by the mark holds until this resolves: `handover.progressed` wakes it
+/// once `live` drops the session, or once a failed report clears the
+/// mark. On a report failure the session stays owned: the next scan
+/// retries.
 async fn handoff_one(state: &Arc<AppState>, next: &Path, sub: Arc<Subagent>) {
     let session_id = sub.session_id.clone();
     let entry = {
@@ -500,6 +505,11 @@ async fn handoff_one(state: &Arc<AppState>, next: &Path, sub: Arc<Subagent>) {
         registry.get_mut(&session_id).map(|entry| {
             let mut entry = entry.clone();
             let inner = sub.rt.inner.lock().expect("inner poisoned");
+            // `HandingOff` under the `inner` lock the gate checks: a send
+            // serialized after this point refuses and holds; one before it
+            // started its turn — which keeps the session in flight, never
+            // handed over.
+            sub.rt.closing.set(Closing::HandingOff);
             let mark = resume_mark(&inner);
             // A live parked session's queue is the truth: the parked
             // record's persisted copy can lag a `repark` that already
@@ -525,7 +535,6 @@ async fn handoff_one(state: &Arc<AppState>, next: &Path, sub: Arc<Subagent>) {
         close_sub(&sub).await;
         return;
     };
-    sub.rt.closing.store(true, Ordering::Relaxed);
     let outcome: Result<Value> = peer_json(
         next,
         "daemon/handoff",
@@ -539,12 +548,18 @@ async fn handoff_one(state: &Arc<AppState>, next: &Path, sub: Arc<Subagent>) {
                 .lock()
                 .expect("live poisoned")
                 .remove(&session_id);
+            // Wake sends holding on the `HandingOff` mark: their refusal
+            // now routes to the session's new owner.
+            state.handover.progressed.notify_waiters();
             close_sub(&sub).await;
             info!(%session_id, "session handed off to the next daemon");
         }
         Err(error) => {
             error!(%session_id, %error, "handoff report failed; keeping the session");
-            sub.rt.closing.store(false, Ordering::Relaxed);
+            sub.rt.closing.clear_handoff();
+            // Wake sends holding on the mark: the session stays owned and
+            // their retry proceeds here.
+            state.handover.progressed.notify_waiters();
         }
     }
 }
@@ -743,7 +758,7 @@ async fn resume_one(
                 // against `unschedule_resume`: a `close` that already
                 // stored the flag keeps its cleared mark.
                 if let Some(entry) = registry.get_mut(&session_id)
-                    && !sub.rt.closing.load(std::sync::atomic::Ordering::Relaxed)
+                    && sub.rt.closing.get().is_none()
                 {
                     entry.rate_limited = Some(parked);
                 }
@@ -951,11 +966,11 @@ fn partition(state: &AppState, own_socket: &Path) -> Result<Partition> {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
         let in_flight = matches!(inner.status, Status::Running | Status::NeedsPermission)
             || !inner.steer_pending.is_empty()
-            || sub.rt.closing.load(Ordering::Relaxed);
-        // A handed session takes no new turn here: `start_turn` checks
-        // `closing` under this same lock.
+            || sub.rt.closing.get().is_some();
+        // A handed session takes no new turn here: `begin_turn`'s gate
+        // checks `closing` under this same lock.
         if !in_flight {
-            sub.rt.closing.store(true, Ordering::Relaxed);
+            sub.rt.closing.set(Closing::HandingOff);
         }
         let mark = resume_mark(&inner);
         // A live parked session's queue is the truth: the parked
