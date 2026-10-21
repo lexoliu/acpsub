@@ -330,6 +330,14 @@ async fn reclaim(
             .collect()
     };
     *state.handover.next.lock().expect("next poisoned") = None;
+    // What this daemon shipped died with the successor: those sessions
+    // are registered, not live, like after any crash.
+    state
+        .handover
+        .shipped
+        .lock()
+        .expect("shipped poisoned")
+        .clear();
     state
         .update_registry(|registry| {
             let ours = std::mem::replace(registry, recorded);
@@ -688,6 +696,14 @@ async fn handoff_one(state: &Arc<AppState>, next: &Path, sub: Arc<Subagent>) {
     .await;
     match outcome {
         Ok(_) => {
+            // Recorded before `live` drops the session: a call that misses
+            // it in `live` already sees the ship.
+            state
+                .handover
+                .shipped
+                .lock()
+                .expect("shipped poisoned")
+                .insert(session_id.clone());
             state
                 .live
                 .lock()
@@ -1200,9 +1216,12 @@ fn partition(state: &AppState, own_socket: &Path) -> Result<Partition> {
     }
     drop(registry);
     drop(reserved);
+    let mut shipped = state.handover.shipped.lock().expect("shipped poisoned");
     for sub in &handed_subs {
+        shipped.insert(sub.session_id.clone());
         live.remove(&sub.session_id);
     }
+    drop(shipped);
     drop(live);
     Ok(Partition {
         kept,

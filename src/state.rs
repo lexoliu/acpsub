@@ -140,18 +140,50 @@ impl AppState {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnknownSession`] when the session is not live.
+    /// Returns [`Error::HandedOff`] when this daemon handed the session
+    /// off to the next generation, and [`Error::UnknownSession`] when the
+    /// session is otherwise not live.
     ///
     /// # Panics
     ///
     /// Panics if the live mutex is poisoned.
     pub fn get(&self, session_id: &str) -> Result<Arc<Subagent>> {
-        self.live
+        let sub = self
+            .live
             .lock()
             .expect("live poisoned")
             .get(session_id)
-            .cloned()
-            .ok_or_else(|| Error::UnknownSession(session_id.to_string()))
+            .cloned();
+        if let Some(sub) = sub {
+            return Ok(sub);
+        }
+        self.not_shipped(session_id)?;
+        Err(Error::UnknownSession(session_id.to_string()))
+    }
+
+    /// Refuse a session this daemon handed off to the next generation.
+    /// A caller checks it after finding the session missing from `live`:
+    /// a ship is recorded before the session leaves `live`, so the miss
+    /// already sees it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::HandedOff`] when the session was shipped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shipped mutex is poisoned.
+    pub fn not_shipped(&self, session_id: &str) -> Result<()> {
+        if self
+            .handover
+            .shipped
+            .lock()
+            .expect("shipped poisoned")
+            .contains(session_id)
+        {
+            return Err(Error::HandedOff(session_id.to_string()));
+        }
+        Ok(())
     }
 
     /// Mutate the registry, then persist the result.
@@ -236,6 +268,13 @@ pub struct Handover {
     /// daemon does not know forwards there; cleared once it stops
     /// answering.
     pub prev: Mutex<Option<PathBuf>>,
+    /// Sessions this superseded daemon handed off to `next`. A call that
+    /// still reaches it for one — sent before the successor dropped its
+    /// forward, or straight to this daemon's private socket — refuses with
+    /// [`Error::HandedOff`] instead of answering from what this daemon
+    /// last knew, so a forwarding successor routes the call to the
+    /// session's new owner. Recorded before the session leaves `live`.
+    pub shipped: Mutex<HashSet<String>>,
     /// Sessions mid-resume after a handoff — a call for one waits on
     /// `progressed` until the launch settles.
     pub resuming: Mutex<HashSet<String>>,
@@ -317,6 +356,7 @@ impl Default for Handover {
             next: Mutex::new(None),
             foreign: Mutex::new(HashMap::new()),
             prev: Mutex::new(None),
+            shipped: Mutex::new(HashSet::new()),
             resuming: Mutex::new(HashSet::new()),
             progressed: Notify::new(),
             finished: tokio::sync::watch::channel(false).0,
@@ -2050,12 +2090,7 @@ pub(crate) async fn begin_turn(
             // false` there and re-routes the call; a failed ship clears
             // the mark and the send retries the gate.
             Verdict::HoldHandoff if wait_out_handoff(state, sub).await => {}
-            Verdict::HoldHandoff => {
-                return Err(Error::NotPromptable {
-                    session_id: sub.session_id.clone(),
-                    status: Closing::HandingOff.name().to_string(),
-                });
-            }
+            Verdict::HoldHandoff => return Err(Error::HandedOff(sub.session_id.clone())),
         }
     };
     let mut record = serde_json::json!({"ts": now(), "turn": turn_n, "prompt": prompt});

@@ -893,6 +893,9 @@ impl Tool for AdoptTool {
     type Res = Value;
 
     async fn call(&self, args: AdoptArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+        // A shipped session lives on in the next generation: adopting it
+        // here would run it twice.
+        self.0.not_shipped(&args.session_id)?;
         let registered = self
             .0
             .registry
@@ -1084,11 +1087,7 @@ impl Tool for SendTool {
                     match action {
                         Action::HoldHandoff => {
                             if !wait_out_handoff(&self.0, &sub).await {
-                                return Err(Error::NotPromptable {
-                                    session_id: args.session_id.clone(),
-                                    status: Closing::HandingOff.name().to_string(),
-                                }
-                                .into());
+                                return Err(Error::HandedOff(args.session_id.clone()).into());
                             }
                         }
                         Action::Queued(position) => {
@@ -1635,6 +1634,9 @@ impl StatusTool {
             }
             return Ok(view);
         }
+        // The registry copy of a shipped session is this daemon's last
+        // view, not the session's state.
+        self.0.not_shipped(&args.session_id)?;
         let entry = self
             .0
             .registry
@@ -2094,7 +2096,11 @@ impl Tool for CloseTool {
     type Res = Value;
 
     async fn call(&self, args: CloseArgs, _cx: ToolContext) -> aither_core::Result<Value> {
-        match end_target(&self.0, &args.session_id, false) {
+        let found = end_target(&self.0, &args.session_id, false);
+        if matches!(found, SessionEnd::Missing) {
+            self.0.not_shipped(&args.session_id)?;
+        }
+        match found {
             SessionEnd::Live(sub) => {
                 end_session(&self.0, &sub).await;
                 Ok(json!({"session_id": args.session_id, "closed": true}))
@@ -2147,8 +2153,10 @@ impl Tool for ForgetTool {
         // forgotten — `release_reservation` ends the session as it lands
         // and drops the registry entry it may have re-created.
         let found = end_target(&self.0, &args.session_id, true);
-        if let SessionEnd::Live(sub) = &found {
-            close_sub(sub).await;
+        match &found {
+            SessionEnd::Live(sub) => close_sub(sub).await,
+            SessionEnd::Missing => self.0.not_shipped(&args.session_id)?,
+            SessionEnd::Launching => {}
         }
         let mut registered = false;
         self.0

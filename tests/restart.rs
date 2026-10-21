@@ -981,6 +981,68 @@ fn send_during_handoff_waits_for_the_ship() {
     daemon.wait_marker("session handed off to the next daemon");
 }
 
+/// A call that reaches the old owner only after its session shipped — a
+/// forward already on the wire, or a client slower than the ship —
+/// refuses with the handoff, never `unknown session` or the old owner's
+/// stale registry copy: that refusal is what lets a forwarding successor
+/// route the call to the session's new owner. The fake successor holds
+/// the ship until the test answers, so every call lands after it.
+#[test]
+fn call_after_ship_refuses_with_the_handoff() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    let old_private = dir.path().join(format!("daemon.{}.sock", daemon.pid));
+    let next_socket = dir.path().join("next.sock");
+    let calls = serve_fake_successor(&next_socket);
+    let spawn = |prompt: &str| {
+        let spawned = daemon.call_json(&[
+            "spawn",
+            "--cwd",
+            &dir.path().to_string_lossy(),
+            "--model",
+            "b",
+            "--mode",
+            "bypass",
+            "--prompt",
+            prompt,
+        ]);
+        spawned["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_string()
+    };
+    let a = spawn("gather");
+    // `b` keeps a turn in flight, so the old daemon keeps serving.
+    let _b = spawn("wait");
+    private_call(
+        &old_private,
+        "daemon/takeover",
+        &serde_json::json!({"socket": next_socket}),
+    );
+    let steered = daemon.call_json(&["send", &a, "--policy", "steer", "--prompt", "go"]);
+    assert_eq!(steered["state"], "submitted", "{steered}");
+    let call = next_call(&calls);
+    assert_eq!(call.tool, "daemon/handoff");
+    call.answer(r#"{"content":[{"type":"text","text":"{}"}]}"#);
+    daemon.wait_marker("session handed off to the next daemon");
+
+    for args in [
+        &["send", &a, "--policy", "try", "--prompt", "again"][..],
+        &["send", &a, "--policy", "queued", "--prompt", "again"],
+        &["status", &a],
+        &["close", &a],
+    ] {
+        let output = run_to_exit(daemon.command_on(&old_private, args)).expect("client runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}: {stderr}");
+        assert!(stderr.contains("handing off"), "{args:?}: {stderr}");
+    }
+}
+
 /// A successor that dies after the takeover strands nothing: the
 /// superseded daemon sees its connection to the successor close, takes
 /// the public socket back, and the session it kept finishes its turn and
