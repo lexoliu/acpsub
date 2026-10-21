@@ -67,13 +67,14 @@ impl Daemon {
 
     /// Run a client subcommand against this daemon.
     fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        Command::new(env!("CARGO_BIN_EXE_acpsub"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_acpsub"));
+        command
             .args(args)
             .arg("--socket")
             .arg(&self.socket)
             .arg("--config")
-            .arg(&self.config)
-            .output()
+            .arg(&self.config);
+        run_to_exit(command)
     }
 
     /// Run a client subcommand and return its stdout as JSON.
@@ -217,13 +218,13 @@ fn client_starts_daemon_when_absent() {
     // its pid file, whatever the assertions below do.
     let _guard = DaemonGuard::new(socket.clone(), None);
     // No daemon running: `list` must spawn one and still succeed.
-    let output = Command::new(env!("CARGO_BIN_EXE_acpsub"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_acpsub"));
+    command
         .args(["list", "--socket"])
         .arg(&socket)
         .arg("--config")
-        .arg(&config)
-        .output()
-        .expect("client runs");
+        .arg(&config);
+    let output = run_to_exit(command).expect("client runs");
     assert!(
         output.status.success(),
         "auto-start failed: {}",

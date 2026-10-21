@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -143,35 +143,31 @@ impl Daemon {
     }
 
     /// Run a client subcommand against this daemon.
-    fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        self.command(args).output()
+    fn run(&self, args: &[&str]) -> std::io::Result<Output> {
+        run_to_exit(self.command(args))
     }
 
     /// Run a client subcommand in a thread and return its handle. The
     /// thread holds an in-flight token until the client exits, so a
     /// teardown the test panics into waits the client out.
-    fn run_thread(&self, args: &[&str]) -> std::thread::JoinHandle<std::process::Output> {
-        let mut command = self.command(args);
+    fn run_thread(&self, args: &[&str]) -> std::thread::JoinHandle<Output> {
+        let command = self.command(args);
         let in_flight = self.guard.in_flight();
         std::thread::spawn(move || {
             let _in_flight = in_flight;
-            command.output().expect("client runs")
+            run_to_exit(command).expect("client runs")
         })
     }
 
     /// `run_thread` against `socket` instead of the public one — the
     /// daemon's private generation socket serves the same local tools
     /// without the forwarding dispatch.
-    fn run_thread_on(
-        &self,
-        socket: &Path,
-        args: &[&str],
-    ) -> std::thread::JoinHandle<std::process::Output> {
-        let mut command = self.command_on(socket, args);
+    fn run_thread_on(&self, socket: &Path, args: &[&str]) -> std::thread::JoinHandle<Output> {
+        let command = self.command_on(socket, args);
         let in_flight = self.guard.in_flight();
         std::thread::spawn(move || {
             let _in_flight = in_flight;
-            command.output().expect("client runs")
+            run_to_exit(command).expect("client runs")
         })
     }
 

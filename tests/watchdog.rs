@@ -81,7 +81,7 @@ impl Daemon {
 
     /// Run a client subcommand to completion.
     fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        self.command(args).output()
+        run_to_exit(self.command(args))
     }
 
     /// Run a client subcommand and return its stdout as JSON.
