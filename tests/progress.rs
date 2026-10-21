@@ -474,6 +474,19 @@ fn gated_limit_agent(gate: &Path) -> AgentConfig {
     }
 }
 
+/// `gated_limit_agent` plus a hold on the limit itself: while `hold` is
+/// absent every prompt errors again — each resume the park schedules is
+/// answered with the limit still standing — so the parked phase ends on
+/// the test's event, never on a window's end.
+fn held_limit_agent(gate: &Path, hold: &Path) -> AgentConfig {
+    let mut agent = gated_limit_agent(gate);
+    agent.env.insert(
+        "FAKE_RATE_LIMIT_HOLD".to_string(),
+        hold.to_string_lossy().into_owned(),
+    );
+    agent
+}
+
 /// A `wait_any` whose longest-running watched session changes mid-wait
 /// keeps reporting: the leader's turn ends rate-limited and parks, the
 /// runner-up takes over — and the reported value, the wait's own
@@ -486,12 +499,14 @@ async fn wait_any_reports_through_a_leader_change() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    // The leader's turn stays in flight until the test opens the gate —
-    // binding never races a delay.
+    // The leader's turn stays in flight until the test opens the gate,
+    // and the limit its error parks it under stands until the test lifts
+    // the hold — neither phase races a delay.
     let gate = dir.path().join("rate-limit-gate");
+    let hold = dir.path().join("rate-limit-hold");
     let mut agents = BTreeMap::new();
     agents.insert("fake".to_string(), fake_agent_config());
-    agents.insert("gatedlimit".to_string(), gated_limit_agent(&gate));
+    agents.insert("heldlimit".to_string(), held_limit_agent(&gate, &hold));
     let (state, tools) = test_state_with_agents(dir.path(), &agents);
     let tools = Arc::new(tools);
     // The leader spawned first, so its turn is always the
@@ -499,7 +514,7 @@ async fn wait_any_reports_through_a_leader_change() {
     // outlives every phase of the call.
     let leader = spawn_id(
         &tools,
-        json!({"agent": "gatedlimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+        json!({"agent": "heldlimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
     )
     .await;
     let runner = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
@@ -512,48 +527,45 @@ async fn wait_any_reports_through_a_leader_change() {
     // The first report proves the wait bound with every watched turn in
     // flight — and names the leader, the longest-running of them.
     let first = next_report(&mut reports).await;
+    let names = |p: &Progress, id: &str| p.message().is_some_and(|m| m.contains(id));
     assert!(
-        first.0.message().is_some_and(|m| m.contains(&leader)),
+        names(&first.0, &leader),
         "first report did not name the leader: {first:?}"
     );
 
     // Releasing the gate ends the leader's turn rate-limited: it parks,
     // and the runner-up becomes the longest-running watched turn.
     std::fs::write(&gate, b"").expect("open the rate-limit gate");
-    let gate_at = Instant::now();
     status_becomes(&state, &leader, "rate_limited").await;
 
-    // The leader's resumed continuation turn ends the wait on its own.
+    // The leader change itself is the event: while the limit stands,
+    // every resume the park schedules is answered with the limit again,
+    // so a report naming the runner-up cannot be raced out — the hold
+    // keeps the park alive until one lands.
     let mut seen = vec![first];
+    let first_runner = loop {
+        let report = next_report(&mut reports).await;
+        let runner_named = names(&report.0, &runner);
+        seen.push(report);
+        if runner_named {
+            break seen.len() - 1;
+        }
+    };
+    // Every report ahead of the park names the leader — while its turn
+    // was in flight it was the longest-running watched one.
+    assert!(
+        seen[..first_runner].iter().all(|(p, _)| names(p, &leader)),
+        "a report before the leader's park did not name the leader: {seen:?}"
+    );
+
+    // Lifting the hold lets the leader's resumed continuation turn run:
+    // it ends the wait on its own.
+    std::fs::write(&hold, b"").expect("lift the rate-limit hold");
     let waited = collect_until_return(&mut waiting, &mut reports, &mut seen).await;
     assert_eq!(waited["session_id"], leader, "{waited}");
     assert_eq!(waited["state"], "done", "{waited}");
 
     assert_increasing(&seen);
-    let names = |p: &Progress, id: &str| p.message().is_some_and(|m| m.contains(id));
-    // Every report before the gate opened names the leader; every report
-    // after the park names the runner-up — the leader change whose
-    // younger turn time used to drop the reported value.
-    let opened = seen
-        .iter()
-        .position(|(_, at)| *at >= gate_at)
-        .unwrap_or(seen.len());
-    assert!(
-        seen[..opened].iter().all(|(p, _)| names(p, &leader)),
-        "a report before the gate opened did not name the leader: {seen:?}"
-    );
-    let last_leader = seen
-        .iter()
-        .rposition(|(p, _)| names(p, &leader))
-        .expect("no report named the leader");
-    let first_runner = seen
-        .iter()
-        .position(|(p, _)| names(p, &runner))
-        .expect("no report named the runner-up after the park");
-    assert!(
-        last_leader < first_runner,
-        "the report never switched from leader to runner-up: {seen:?}"
-    );
 
     // The runner-up's "wait" turn never ends on its own.
     call_json(&tools, "cancel", json!({"session_id": runner})).await;
