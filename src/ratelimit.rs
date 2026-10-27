@@ -4,15 +4,16 @@
 //! A `session/prompt` answered with a retryable `unavailable` JSON-RPC
 //! error ends its turn in [`Status::RateLimited`] — not `failed` — and
 //! registers the limit on the agent's [`QuotaScope`]: while it is active
-//! every new prompt to every session in the scope parks instead of
-//! burning a request. The resume scheduler wakes at each limit, then
+//! every new prompt to every session in the scope is refused instead of
+//! burning a request ([`refuse_if_limited`]). The resume scheduler wakes at each limit, then
 //! resumes every parked session once its `resume_at` passes — the same
 //! ACP session, `session/load` when the process is gone — staggered so
 //! the first post-limit prompts do not hit the freshly lifted quota in a
 //! single burst. The parked state records what the resume sends: a turn
 //! the limit interrupted resumes with one fixed continuation prompt, and
-//! prompts parked behind it run after it; a session parked before its
-//! turn started resumes by running its first queued prompt.
+//! prompts queued behind it run after it; a queued prompt that chained
+//! into the limit before its turn started resumes by running the queue's
+//! first prompt.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -203,88 +204,31 @@ pub(crate) fn active_limit(state: &AppState, agent: &str) -> Option<Limit> {
     }
 }
 
-/// What `park_prompt` reports back: where the prompt parked until.
-pub(crate) struct Parked {
-    /// When the parked session resumes.
-    pub(crate) resume_at: jiff::Timestamp,
-    /// The provider's own message — the parked reason.
-    pub(crate) reason: String,
-    /// What the resume sends first.
-    pub(crate) plan: ResumePlan,
-    /// The prompt's position in the parked queue — the resume's
-    /// continuation runs ahead of all of them.
-    pub(crate) position: usize,
-}
-
-/// Park `prompt` on `sub` while its quota scope is limited — or the
-/// session is already parked: it joins the queue behind the scheduled
-/// continuation, and a promptable session's status becomes
-/// `rate_limited`. A session still running a turn (or waiting on a
-/// permission) keeps its status; its parked prompt chains into the limit
-/// the same way. `None` when nothing parks the prompt.
+/// Refuse a new prompt for `agent` while its quota scope is limited.
+///
+/// A rate limit is a planning signal: the caller decides between waiting
+/// for the reset and moving the task to another model, so a prompt that
+/// would burn against an already-known limit fails at once instead of
+/// parking behind it.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::RateLimited`] naming the agent, the scope's
+/// `resume_at`, the remaining time and the provider's message.
 ///
 /// # Panics
 ///
-/// Panics if a state mutex is poisoned.
-pub(crate) async fn park_prompt(
-    state: &Arc<AppState>,
-    sub: &Arc<Subagent>,
-    prompt: &str,
-) -> Option<Parked> {
-    let gate = active_limit(state, &sub.agent);
-    let (parked, queued) = {
-        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-        // A closing session never parks: `handoff_one` already took the
-        // queue into its resume mark — a park landing now would be lost
-        // with the session. The caller falls through to the gate, where
-        // `closing` produces the refusal.
-        if sub.rt.closing.get().is_some() {
-            return None;
-        }
-        // A session already parked keeps its mark: a prompt joining the
-        // queue neither interrupts a turn nor drops the continuation.
-        let (resume_at, reason, plan) = if let Status::RateLimited {
-            resume_at,
-            reason,
-            plan,
-        } = &inner.status
-        {
-            (*resume_at, reason.clone(), *plan)
-        } else {
-            let limit = gate?;
-            (limit.resume_at, limit.reason, ResumePlan::Queue)
-        };
-        inner.queue.push_back(prompt.to_string());
-        if inner.status.accepts_prompt() {
-            inner.status = Status::RateLimited {
-                resume_at,
-                reason: reason.clone(),
-                plan,
-            };
-        }
-        let queued = inner.queue.iter().cloned().collect();
-        (
-            Parked {
-                resume_at,
-                reason,
-                plan,
-                position: inner.queue.len(),
-            },
-            queued,
-        )
+/// Panics if the limits mutex is poisoned.
+pub(crate) fn refuse_if_limited(state: &AppState, agent: &str) -> crate::Result<()> {
+    let Some(limit) = active_limit(state, agent) else {
+        return Ok(());
     };
-    record_park(
-        state,
-        sub,
-        prompt,
-        parked.resume_at,
-        &parked.reason,
-        parked.plan,
-        queued,
-    )
-    .await;
-    ensure_scheduler(state);
-    Some(parked)
+    Err(crate::Error::RateLimited {
+        agent: agent.to_string(),
+        resume_at: limit.resume_at,
+        remaining: limit.resume_at.duration_since(jiff::Timestamp::now()),
+        reason: limit.reason,
+    })
 }
 
 /// Re-park a chained prompt whose turn popped into an active `limit`:
@@ -426,7 +370,7 @@ pub(crate) async fn note_limit(state: &Arc<AppState>, agent: &str, hit: &RateLim
 }
 
 /// Spawn the resume scheduler once: `scheduler_started` guards it, so
-/// `AppState::new`, `park_prompt`, and `note_limit` can all call it.
+/// `AppState::new` and `note_limit` can all call it.
 ///
 /// # Panics
 ///

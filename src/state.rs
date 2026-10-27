@@ -1206,21 +1206,15 @@ async fn launch_inner(
     if let Some(session_id) = &args.load {
         release_reservation(state, &sub, session_id).await?;
     }
-    if let Some(prompt) = &args.prompt {
-        // A quota gate for this agent parks the prompt instead of letting
-        // it burn a request that is bound to fail.
-        if crate::ratelimit::park_prompt(state, &sub, prompt)
-            .await
-            .is_none()
-            && let Err(error) = start_turn(state.clone(), &sub, prompt.clone()).await
-        {
-            state
-                .live
-                .lock()
-                .expect("live poisoned")
-                .remove(&session_id);
-            return Err(error);
-        }
+    if let Some(prompt) = &args.prompt
+        && let Err(error) = start_turn(state.clone(), &sub, prompt.clone()).await
+    {
+        state
+            .live
+            .lock()
+            .expect("live poisoned")
+            .remove(&session_id);
+        return Err(error);
     }
     Ok(sub)
 }

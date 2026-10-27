@@ -74,6 +74,37 @@ pub fn fake_agent_config() -> AgentConfig {
     }
 }
 
+/// A rate-limit agent whose provider window (3600 s) outlasts any test,
+/// and whose error answer holds until `gate` exists: the test decides when
+/// the awaited turn ends, never a delay, and a parked session is released
+/// by the test's own event. A prompt `gated <path>` holds its turn open
+/// until that file exists.
+pub fn gated_limit_agent(gate: &Path) -> AgentConfig {
+    AgentConfig {
+        env: BTreeMap::from([
+            ("FAKE_RATE_LIMIT".to_string(), "3600".to_string()),
+            (
+                "FAKE_RATE_LIMIT_GATE".to_string(),
+                gate.to_string_lossy().into_owned(),
+            ),
+        ]),
+        ..fake_agent_config()
+    }
+}
+
+/// `gated_limit_agent` plus a hold on the limit itself: while `hold` is
+/// absent every prompt errors again — each resume the park schedules is
+/// answered with the limit still standing — so the parked phase ends on
+/// the test's event, never on a window's end.
+pub fn held_limit_agent(gate: &Path, hold: &Path) -> AgentConfig {
+    let mut agent = gated_limit_agent(gate);
+    agent.env.insert(
+        "FAKE_RATE_LIMIT_HOLD".to_string(),
+        hold.to_string_lossy().into_owned(),
+    );
+    agent
+}
+
 /// Write `dir/config.toml` for `agents` under `[defaults]` pointing at
 /// `dir` — `wait_grace` seconds when given — and return the config
 /// file's path.

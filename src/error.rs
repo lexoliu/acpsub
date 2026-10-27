@@ -107,6 +107,22 @@ pub enum Error {
         status: String,
     },
 
+    /// The agent's quota scope has an active provider rate limit: a new
+    /// prompt would burn against it, so it is refused rather than parked.
+    #[error(
+        "agent '{agent}' is rate limited until {resume_at} ({remaining:#} remaining): {reason}"
+    )]
+    RateLimited {
+        /// The agent config key whose quota scope is limited.
+        agent: String,
+        /// When the provider says the quota resets.
+        resume_at: jiff::Timestamp,
+        /// Time left until `resume_at`.
+        remaining: jiff::SignedDuration,
+        /// The provider's own message.
+        reason: String,
+    },
+
     /// A `wait`/`wait_any` expected longer than the ceiling for a call
     /// without a progress channel.
     #[error(

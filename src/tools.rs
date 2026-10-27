@@ -203,16 +203,9 @@ enum Awaited {
     /// Still in flight: its elapsed seconds, measured from its own
     /// recorded start.
     Running(f64),
-    /// The awaited turn ended `rate_limited`: `active` is its own elapsed
-    /// seconds before the park — the only part that counts against
-    /// `expect_secs` — and `next` is the turn the resume's continuation
-    /// takes, which the wait rebinds to.
-    Parked {
-        /// The awaited turn's elapsed seconds before it parked.
-        active: f64,
-        /// The turn number the resume's continuation takes.
-        next: u64,
-    },
+    /// The awaited turn ended `rate_limited`: the wait returns at once,
+    /// it does not follow the parked session into its resumed turn.
+    RateLimited,
     /// The awaited turn has not started and the session is parked
     /// rate-limited: the wait freezes — it must not end, and the pause
     /// does not count against `expect_secs`, which runs from the resumed
@@ -276,23 +269,15 @@ fn awaited_elapsed(sub: &Subagent, n: u64) -> Result<Awaited> {
             jiff::Timestamp::now().duration_since(started).as_secs_f64(),
         ));
     }
-    // The awaited turn settled: `rate_limited` means the wait follows
-    // the resume's turn — the park itself does not count against
-    // `expect_secs`. A settled turn that already chained into `current`
-    // was caught by the arm above.
-    if let Some(turn) = inner.turns.iter().find(|turn| turn.n == n)
-        && turn.rate_limited
+    // The awaited turn settled `rate_limited`: the limit is a planning
+    // signal the caller acts on, so the wait ends here. A settled turn
+    // that already chained into `current` was caught by the arm above.
+    if inner
+        .turns
+        .iter()
+        .any(|turn| turn.n == n && turn.rate_limited)
     {
-        let active = turn
-            .started_at
-            .zip(turn.ended_at)
-            .map_or(0.0, |(started, ended)| {
-                ended.duration_since(started).as_secs_f64()
-            });
-        return Ok(Awaited::Parked {
-            active,
-            next: next_turn_number(&inner),
-        });
+        return Ok(Awaited::RateLimited);
     }
     // The gap the awaited turn was predicted in: the slot is still
     // reserved (`Running`, no `current` yet) until `begin_turn` runs.
@@ -412,6 +397,9 @@ enum WaitOutcome {
     /// The awaited turn left `running` — ended, parked on a permission,
     /// or gone with the session — and the result reports that state.
     Ended,
+    /// The awaited turn ended `rate_limited`: the result reports that
+    /// state with the reset time and the provider's message.
+    RateLimited,
     /// The awaited turn outlived `expect_secs`: the result reports
     /// `overrun`, the turn's own elapsed time, its latest tool call, and
     /// the activity digest.
@@ -593,37 +581,21 @@ fn pending_view(perm: &crate::state::PendingPermission) -> Value {
     })
 }
 
-/// The `send`/`spawn`/`adopt` result for a prompt parked by a rate limit:
-/// where it parks and for how long — the continuation the scheduler sends
-/// at `resume_at` runs ahead of the queued prompts.
-fn parked_view(session_id: &str, parked: &crate::ratelimit::Parked) -> Value {
-    json!({
-        "session_id": session_id,
-        "state": "rate_limited",
-        "resume_at": parked.resume_at.to_string(),
-        "reason": parked.reason,
-        "position": parked.position,
-    })
-}
-
 /// A `wait`-style result for one subagent. `overrun` marks that the turn
 /// outlived `expect_secs`: the result reports `overrun`, the turn's own
 /// elapsed time, and its latest tool call. `awaited` is the turn the call
 /// bound to (see [`awaited_turn`]); `None` reports the latest turn, the
 /// shape a wait on a non-running subagent has always had. `window_start`
 /// is when the wait call began — the base of the activity digest an
-/// `Overrun`/`MaxWait` outcome carries; `parked_secs` is the active
-/// seconds an earlier bound turn banked before a rate-limit park, folded
-/// into the reported `elapsed_secs` on an overrun.
+/// `Overrun`/`MaxWait` outcome carries.
 fn wait_view(
     sub: &Subagent,
     started: Instant,
     outcome: WaitOutcome,
     awaited: Option<u64>,
     window_start: jiff::Timestamp,
-    parked_secs: f64,
 ) -> Value {
-    let snap = wait_snapshot(sub, outcome, awaited, window_start, parked_secs);
+    let snap = wait_snapshot(sub, outcome, awaited, window_start);
     let mut view = json!({
         "session_id": sub.session_id,
         "state": snap.status.name(),
@@ -643,6 +615,8 @@ fn wait_view(
             view["latest_tool_call"] = serde_json::to_value(latest)
                 .expect("ToolCallSummary holds only owned primitives; serialization cannot fail");
         }
+    } else if outcome == WaitOutcome::RateLimited {
+        view["state"] = json!("rate_limited");
     } else if let Some(reason) = snap.ended_reason {
         // The awaited turn's own end: its stop reason wins over the
         // session status, which may already show the turn that chained
@@ -701,7 +675,7 @@ struct WaitSnapshot {
     turn_n: Option<u64>,
     /// Client-side queued prompt count.
     queued: usize,
-    /// The reported turn's elapsed seconds, including banked pre-park time.
+    /// The reported turn's elapsed seconds.
     elapsed: Option<f64>,
     /// The reported turn's latest tool call summary.
     latest: Option<ToolCallSummary>,
@@ -719,7 +693,6 @@ fn wait_snapshot(
     outcome: WaitOutcome,
     awaited: Option<u64>,
     window_start: jiff::Timestamp,
-    parked_secs: f64,
 ) -> WaitSnapshot {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
     // The awaited turn's own record — the same lookup `result` uses
@@ -737,7 +710,7 @@ fn wait_snapshot(
         },
     );
     let digest = match outcome {
-        WaitOutcome::Ended => None,
+        WaitOutcome::Ended | WaitOutcome::RateLimited => None,
         WaitOutcome::Overrun | WaitOutcome::MaxWait => Some(activity_digest(turn, window_start)),
     };
     let turn_n = turn.map(|turn| turn.n).or(awaited);
@@ -750,9 +723,9 @@ fn wait_snapshot(
         pending: inner.pending.first().map(pending_view),
         turn_n,
         queued: inner.queue.len(),
-        elapsed: turn.and_then(|turn| turn.started_at).map(|started| {
-            parked_secs + jiff::Timestamp::now().duration_since(started).as_secs_f64()
-        }),
+        elapsed: turn
+            .and_then(|turn| turn.started_at)
+            .map(|started| jiff::Timestamp::now().duration_since(started).as_secs_f64()),
         latest: turn.and_then(|turn| {
             turn.latest_tool_call
                 .as_ref()
@@ -825,6 +798,9 @@ impl Tool for SpawnTool {
     async fn call(&self, args: SpawnArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let config = self.0.load_config()?;
         let (agent, _) = config.resolve_agent(args.agent.as_deref())?;
+        // A limited quota scope refuses the prompt before any process
+        // starts: it would burn against a limit the daemon already knows.
+        crate::ratelimit::refuse_if_limited(&self.0, agent)?;
         let sub = launch(
             &self.0,
             &config,
@@ -919,6 +895,9 @@ impl Tool for AdoptTool {
             .or_else(|| registered.as_ref().map(|entry| entry.agent.as_str()));
         let config = self.0.load_config()?;
         let (agent, agent_cfg) = config.resolve_agent(requested)?;
+        if args.prompt.is_some() {
+            crate::ratelimit::refuse_if_limited(&self.0, agent)?;
+        }
         let cwd = if let Some(cwd) = args
             .cwd
             .or_else(|| registered.as_ref().map(|entry| entry.cwd.clone()))
@@ -1029,11 +1008,9 @@ impl Tool for SendTool {
 
     async fn call(&self, args: SendArgs, _cx: ToolContext) -> aither_core::Result<Value> {
         let sub = self.0.get(&args.session_id)?;
-        // A quota gate for this agent's scope parks the prompt instead of
-        // letting it burn a request that is bound to fail.
-        if let Some(parked) = crate::ratelimit::park_prompt(&self.0, &sub, &args.prompt).await {
-            return Ok(parked_view(&args.session_id, &parked));
-        }
+        // A limited quota scope refuses the prompt: it would burn a
+        // request that is bound to fail, and the caller decides what to do.
+        crate::ratelimit::refuse_if_limited(&self.0, &sub.agent)?;
         match args.policy {
             SendPolicy::Try => {
                 start_turn(self.0.clone(), &sub, args.prompt).await?;
@@ -1117,9 +1094,9 @@ impl Tool for SendTool {
 /// `send` with `policy: "steer"`: inject the prompt into the running
 /// turn as a steering message — a second `session/prompt` while it is in
 /// flight. On a promptable session it just runs as the next turn; a
-/// parked or dead one is [`Error::NotPromptable`] (`park_prompt` in the
-/// caller has already parked prompts while a limit holds, so the
-/// `rate_limited` arm is unreachable but kept for completeness).
+/// parked or dead one is [`Error::NotPromptable`] (`send` refuses prompts
+/// while a limit holds, so a parked session reaches it only in the
+/// instant between the limit expiring and the scheduler's resume).
 ///
 /// A steer into a running turn returns `submitted` at once: its
 /// resolution is reported by `status`/`wait`, never by this call.
@@ -1256,14 +1233,13 @@ impl Tool for WaitTool {
         let _waiter = crate::watchdog::Waiter::attach(&sub);
         let started = Instant::now();
         let window_start = jiff::Timestamp::now();
-        let Some(mut awaited) = awaited_turn(&sub)? else {
+        let Some(awaited) = awaited_turn(&sub)? else {
             return Ok(wait_view(
                 &sub,
                 started,
                 WaitOutcome::Ended,
                 None,
                 window_start,
-                0.0,
             ));
         };
         // The wait's own deadline: `Instant` can represent anything the
@@ -1275,9 +1251,6 @@ impl Tool for WaitTool {
         let expect = args.expect_secs as f64;
         let interval = self.interval;
         let mut next_report = started;
-        // Seconds the awaited turn ran before it parked rate-limited —
-        // they count once against `expect_secs`; the pause never does.
-        let mut parked_secs = 0.0;
         let outcome = loop {
             // Armed before the state is read, so a wake that lands between
             // the read and the await is not lost.
@@ -1297,12 +1270,8 @@ impl Tool for WaitTool {
             };
             match state {
                 Awaited::Ended => break WaitOutcome::Ended,
-                Awaited::Parked { active, next } => {
-                    parked_secs += active;
-                    awaited = next;
-                }
+                Awaited::RateLimited => break WaitOutcome::RateLimited,
                 Awaited::Running(elapsed) | Awaited::Steers(elapsed) => {
-                    let elapsed = parked_secs + elapsed;
                     if elapsed >= expect {
                         break WaitOutcome::Overrun;
                     }
@@ -1351,7 +1320,6 @@ impl Tool for WaitTool {
             outcome,
             Some(awaited),
             window_start,
-            parked_secs,
         ))
     }
 }
@@ -1413,7 +1381,7 @@ impl Tool for WaitAnyTool {
         let window_start = jiff::Timestamp::now();
         // Each watched session binds to the turn in flight at call time,
         // the same rule `wait` applies to one.
-        let mut awaited = subs
+        let awaited = subs
             .iter()
             .map(|sub| awaited_turn(sub))
             .collect::<Result<Vec<_>>>()?;
@@ -1424,9 +1392,6 @@ impl Tool for WaitAnyTool {
         let expect = args.expect_secs as f64;
         let interval = self.interval;
         let mut next_report = started;
-        // Per-session active seconds before a rate-limit park — the same
-        // rebind `wait` applies to one turn.
-        let mut parked_secs = vec![0.0; subs.len()];
         loop {
             let mut poll = WAIT_ANY_POLL;
             // Report the longest-running watched turn — by index, so a
@@ -1441,7 +1406,6 @@ impl Tool for WaitAnyTool {
                         WaitOutcome::Ended,
                         None,
                         window_start,
-                        0.0,
                     ));
                 };
                 match awaited_elapsed(sub, n)? {
@@ -1452,21 +1416,21 @@ impl Tool for WaitAnyTool {
                             WaitOutcome::Ended,
                             Some(n),
                             window_start,
-                            parked_secs[index],
                         ));
                     }
-                    Awaited::Parked { active, next } => {
-                        // The awaited turn ended rate-limited: its
-                        // pre-park time counts once, and the wait follows
-                        // the resume's turn.
-                        parked_secs[index] += active;
-                        awaited[index] = Some(next);
+                    Awaited::RateLimited => {
+                        return Ok(wait_view(
+                            sub,
+                            started,
+                            WaitOutcome::RateLimited,
+                            Some(n),
+                            window_start,
+                        ));
                     }
                     // Parked rate-limited: nothing running to compare.
                     Awaited::Paused => {}
                     // A steer hold counts like the turn it extends.
                     Awaited::Running(elapsed) | Awaited::Steers(elapsed) => {
-                        let elapsed = parked_secs[index] + elapsed;
                         if elapsed >= expect {
                             return Ok(wait_view(
                                 sub,
@@ -1474,7 +1438,6 @@ impl Tool for WaitAnyTool {
                                 WaitOutcome::Overrun,
                                 Some(n),
                                 window_start,
-                                parked_secs[index],
                             ));
                         }
                         poll = poll.min(Duration::from_secs_f64(expect - elapsed));
@@ -1494,7 +1457,6 @@ impl Tool for WaitAnyTool {
                     WaitOutcome::MaxWait,
                     awaited[index],
                     window_start,
-                    parked_secs[index],
                 ));
             }
             if now >= next_report {
