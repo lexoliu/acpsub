@@ -11,6 +11,11 @@ registry = "~/.local/share/acpsub/registry.json"
 # wait_grace = 60                        # seconds a running turn may go with no
                                        # attached wait/wait_any caller before
                                        # it is cancelled and the session closed
+# transcript_retention = "3d"            # how long a non-live session's
+                                       # transcript and registry entry are
+                                       # kept (a duration string like "12h",
+                                       # "3d" or "1w"); live sessions are
+                                       # never pruned
 # agent = "devin"                        # default backend for spawn/adopt
                                        # (a single configured agent is the
                                        #  implicit default; omitting `agent`

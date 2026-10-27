@@ -12,6 +12,13 @@
 //! caller has fed it for the grace period, so a turn cannot keep running
 //! — and spending — after every caller walked away.
 //!
+//! A retention task prunes what the watchdog closes: a session that is
+//! not live and whose transcript has not been written inside
+//! `[defaults] transcript_retention` loses its transcript file and its
+//! registry entry, at startup and then hourly. Only the newest
+//! generation prunes — a superseded daemon owns neither the registry
+//! file nor the sessions it handed off.
+//!
 //! # Restart: hand over the listener, not the turns
 //!
 //! Every daemon also binds a private generation socket
@@ -197,6 +204,10 @@ async fn serve(
     let mut listener = lead(state, socket_path, succession).await?;
     info!(socket = %socket_path.display(), "daemon listening");
     resume_marked(state).await;
+    // Spawned only after `lead`: the takeover has populated `foreign`
+    // and the resume pass its marks, so the first retention pass already
+    // sees every session another generation still owns.
+    tokio::spawn(crate::prune::run(state.clone()));
     let mut finished = state.handover.finished.subscribe();
     loop {
         if *finished.borrow() {

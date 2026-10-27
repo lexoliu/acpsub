@@ -76,6 +76,11 @@ pub struct AppState {
     /// session — [`crate::watchdog::WAIT_GRACE`] unless the config sets
     /// `[defaults] wait_grace`.
     pub wait_grace: Duration,
+    /// How long a non-live session's transcript and registry entry are
+    /// kept after the transcript's last write —
+    /// [`crate::prune::TRANSCRIPT_RETENTION`] unless the config sets
+    /// `[defaults] transcript_retention`.
+    pub transcript_retention: Duration,
     /// Daemon-generation handover coordination.
     pub handover: Handover,
     /// What this daemon's startup resume pass did — filled by
@@ -112,6 +117,7 @@ impl AppState {
             limits_notify: Notify::new(),
             scheduler_started: AtomicBool::new(false),
             wait_grace: config.defaults.wait_grace,
+            transcript_retention: config.defaults.transcript_retention,
             handover: Handover::default(),
             resume_report: Mutex::new(ResumeReport::default()),
         });

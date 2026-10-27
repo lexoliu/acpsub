@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod error;
 pub mod handler;
 pub mod prose;
+pub mod prune;
 pub mod ratelimit;
 pub mod registry;
 pub mod state;
