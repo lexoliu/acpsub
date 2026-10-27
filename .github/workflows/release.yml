@@ -37,6 +37,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   DIST_VERSION: 0.30.2
+  # release-plz publishes no checksum file; this is GitHub's recorded asset digest.
+  RELEASE_PLZ_VERSION: 0.4.2
+  RELEASE_PLZ_SHA256: bd7c3adc1a4ed3831e6bfde51b92b168f32ab6d15cd210ed88044e7f858f0cae
 
 jobs:
   release-pr:
@@ -55,10 +58,20 @@ jobs:
           ref: dev
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install release-plz
-        uses: taiki-e/install-action@v2
-        with:
-          tool: release-plz
+      # The gnu build, not install-action's musl one: musl misreports the main-thread stack and pest >= 2.9.3's stack guard then fails every changelog template (lexoliu/acpsub#109).
+      - &install-release-plz
+        name: Install release-plz
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="release-plz-x86_64-unknown-linux-gnu.tar.gz"
+          dir="$RUNNER_TEMP/release-plz"
+          mkdir -p "$dir"
+          gh release download "release-plz-v${RELEASE_PLZ_VERSION}" -R release-plz/release-plz -p "$asset" -D "$dir"
+          echo "${RELEASE_PLZ_SHA256}  $dir/$asset" | sha256sum -c -
+          tar xzf "$dir/$asset" -C "$dir"
+          echo "$dir" >> "$GITHUB_PATH"
       - uses: release-plz/git-config@v0.1.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -92,10 +105,7 @@ jobs:
       # CARGO_REGISTRY_TOKEN secret is needed.
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
-      - name: Install release-plz
-        uses: taiki-e/install-action@v2
-        with:
-          tool: release-plz
+      - *install-release-plz
       - uses: release-plz/git-config@v0.1.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
