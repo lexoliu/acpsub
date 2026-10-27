@@ -125,6 +125,10 @@ pub struct Defaults {
     /// Grace period before a running turn with no attached `wait`/
     /// `wait_any` caller is cancelled and its session closed.
     pub wait_grace: Duration,
+    /// How long a non-live session's transcript and registry entry are
+    /// kept after the transcript's last write; the daemon prunes past
+    /// this window.
+    pub transcript_retention: Duration,
 }
 
 /// How `session/request_permission` requests are answered.
@@ -256,6 +260,11 @@ struct RawDefaults {
     transcript_dir: Option<String>,
     registry: Option<String>,
     wait_grace: Option<f64>,
+    #[serde(
+        default,
+        with = "jiff::fmt::serde::unsigned_duration::friendly::compact::optional"
+    )]
+    transcript_retention: Option<Duration>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +307,10 @@ impl RawConfig {
                     .map_or(crate::watchdog::WAIT_GRACE, |secs| {
                         Duration::from_secs_f64(secs.max(0.0))
                     }),
+                transcript_retention: self
+                    .defaults
+                    .transcript_retention
+                    .unwrap_or(crate::prune::TRANSCRIPT_RETENTION),
             },
             agents: self
                 .agents
