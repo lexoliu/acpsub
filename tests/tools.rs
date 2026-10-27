@@ -890,8 +890,9 @@ async fn wait_within_expected_duration_returns_done() {
     assert_eq!(done["stop_reason"], "end_turn");
 }
 
-/// Re-issuing `wait` cannot extend the budget: both waits overrun at the
-/// same wall-clock point, measured from the turn's recorded start.
+/// Re-issuing `wait` cannot extend the budget: it is measured from the
+/// turn's recorded start, so a second wait with the same expectation is
+/// refused rather than given a fresh 2 seconds (issue #105).
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_overrun_is_measured_from_turn_start() {
     if !python3() {
@@ -905,21 +906,101 @@ async fn wait_overrun_is_measured_from_turn_start() {
     let first = wait(&tools, &sid, 2).await;
     assert_eq!(first["state"], "overrun", "{first}");
 
-    // The budget ran out at turn_start + 2s: a second wait overruns at
-    // once rather than getting a fresh 2 seconds.
-    let reissued = std::time::Instant::now();
-    let second = wait(&tools, &sid, 2).await;
+    // The budget ran out at turn_start + 2s: a second wait with the same
+    // expectation is refused, not given a fresh 2 seconds.
+    let err = call_err(
+        &tools,
+        "wait",
+        json!({"session_id": sid.as_str(), "expect_secs": 2}),
+    )
+    .await;
     assert!(
-        reissued.elapsed() < std::time::Duration::from_secs(1),
-        "re-issued wait must not extend the budget: {second}"
-    );
-    assert_eq!(second["state"], "overrun", "{second}");
-    assert!(
-        second["elapsed_secs"].as_f64().expect("elapsed_secs")
-            > first["elapsed_secs"].as_f64().expect("elapsed_secs"),
-        "elapsed keeps growing from the turn's start: {second}"
+        err.contains("--expect counts from the turn's start"),
+        "{err}"
     );
     call_json(&tools, "cancel", json!({"session_id": sid})).await;
+}
+
+/// A `wait`/`wait_any` armed with an `expect_secs` the turn has already
+/// run past could only return `overrun` at once, so it is refused before
+/// any waiter attaches: the error names the session, reports the elapsed
+/// seconds and states that `--expect` counts from the turn's start —
+/// while the turn runs on, unwatched (issue #105).
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_refuses_expect_past_elapsed() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, tools) = test_state(dir.path());
+    let running = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+    // A settled sibling: `wait_any` must refuse on the running one even
+    // though the settled one would return at once.
+    let settled = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+    wait(&tools, &settled, 60).await;
+
+    // Run the turn past the expectation the calls will arm.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let err = call_err(
+        &tools,
+        "wait",
+        json!({"session_id": running.as_str(), "expect_secs": 1}),
+    )
+    .await;
+    assert!(err.contains(&running), "{err}");
+    assert!(err.contains("expect_secs 1"), "{err}");
+    assert!(
+        err.contains("--expect counts from the turn's start"),
+        "{err}"
+    );
+    let elapsed = err
+        .split("already run ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|token| token.parse::<f64>().ok())
+        .expect("the error reports the elapsed seconds");
+    assert!(elapsed >= 1.0, "{err}");
+
+    // `wait_any` refuses when any named session's turn has passed
+    // --expect — the settled sibling does not spare it.
+    let err = call_err(
+        &tools,
+        "wait_any",
+        json!({"session_ids": [settled.as_str(), running.as_str()], "expect_secs": 1}),
+    )
+    .await;
+    assert!(err.contains(&running), "{err}");
+    assert!(
+        err.contains("--expect counts from the turn's start"),
+        "{err}"
+    );
+
+    // Neither refusal attached a waiter, and the turn is untouched.
+    let sub = state.get(&running).expect("live subagent");
+    assert_eq!(
+        sub.rt.waiters.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a refused wait must not feed the watchdog"
+    );
+    let status = call_json(&tools, "status", json!({"session_id": running})).await;
+    assert_eq!(status["state"], "running", "{status}");
+
+    // A wait on a settled session is not refused — there is no running
+    // turn clock the expectation could sit under.
+    let done = wait(&tools, &settled, 1).await;
+    assert_eq!(done["state"], "done", "{done}");
+
+    // An expectation beyond the elapsed time still attaches and waits.
+    let out = call_json(
+        &tools,
+        "wait",
+        json!({"session_id": running.as_str(), "expect_secs": 60, "max_wait_secs": 1}),
+    )
+    .await;
+    assert_eq!(out["state"], "running", "{out}");
+    call_json(&tools, "cancel", json!({"session_id": running})).await;
 }
 
 /// `expect_secs` is required on both wait tools — there is no default.
@@ -1145,7 +1226,7 @@ async fn wait_max_wait_returns_activity_digest() {
     let over = call_json(
         &tools,
         "wait",
-        json!({"session_id": sid.as_str(), "expect_secs": 1}),
+        json!({"session_id": sid.as_str(), "expect_secs": 4}),
     )
     .await;
     assert_eq!(over["state"], "overrun", "{over}");

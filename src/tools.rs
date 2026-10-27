@@ -391,6 +391,55 @@ const fn check_expect(
     Ok(())
 }
 
+/// Refuse a wait whose expectation the awaited turn has already reached:
+/// `expect_secs` counts from the turn's recorded start, so armed at or
+/// below its elapsed time the wait could only return `overrun` the
+/// moment it attached — the call fails before any waiter feeds the
+/// watchdog, surfacing a planning error instead of a result the caller
+/// might re-arm.
+///
+/// # Errors
+///
+/// Returns [`Error::ExpectAlreadyElapsed`] when the turn bound to `n` is
+/// in flight — or held by an unresolved steer — with elapsed seconds at
+/// or past `expect_secs`, and propagates [`awaited_elapsed`]'s
+/// [`Error::Internal`]. An ended, parked or rate-limited turn passes: it
+/// has no running clock the expectation could already sit under.
+fn check_expect_not_past(sub: &Subagent, n: u64, expect_secs: u64) -> Result<()> {
+    #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
+    let expect = expect_secs as f64;
+    if let Awaited::Running(elapsed) | Awaited::Steers(elapsed) = awaited_elapsed(sub, n)?
+        && elapsed >= expect
+    {
+        return Err(Error::ExpectAlreadyElapsed {
+            session_id: sub.session_id.clone(),
+            elapsed_secs: elapsed,
+            expect_secs,
+        });
+    }
+    Ok(())
+}
+
+/// [`check_expect_not_past`] over every turn a `wait_any` binds: any named
+/// turn already past the expectation refuses the call before a waiter
+/// attaches. A session with no turn in flight has nothing to check.
+///
+/// # Errors
+///
+/// The first [`check_expect_not_past`] error.
+fn check_all_expect_not_past(
+    subs: &[Arc<Subagent>],
+    awaited: &[Option<u64>],
+    expect_secs: u64,
+) -> Result<()> {
+    for (sub, n) in subs.iter().zip(awaited) {
+        if let Some(n) = n {
+            check_expect_not_past(sub, *n, expect_secs)?;
+        }
+    }
+    Ok(())
+}
+
 /// How a `wait`/`wait_any` ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitOutcome {
@@ -1200,9 +1249,10 @@ struct WaitArgs {
     session_id: String,
     /// Required: how long the awaited turn is expected to take, in seconds.
     /// Measured from the turn's recorded start — re-issuing a wait never
-    /// extends it. The wait returns early on any state change, so an
-    /// accurate expectation is free. Values beyond 1800 (30 minutes) are
-    /// rejected unless `long` is set.
+    /// extends it; a value the turn has already run past is refused
+    /// before the wait attaches. The wait returns early on any state
+    /// change, so an accurate expectation is free. Values beyond 1800
+    /// (30 minutes) are rejected unless `long` is set.
     expect_secs: u64,
     /// Optional: the wait call's own deadline in seconds, measured from
     /// when the wait began — unlike `expect_secs` it bounds the wait, not
@@ -1236,10 +1286,6 @@ impl Tool for WaitTool {
     async fn call(&self, args: WaitArgs, mut cx: ToolContext) -> aither_core::Result<Value> {
         check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let sub = self.state.get(&args.session_id)?;
-        // Attached for the call's life: the running turn's watchdog is
-        // fed while this wait lives — a dead client's call drops when
-        // its connection closes.
-        let _waiter = crate::watchdog::Waiter::attach(&sub);
         let started = Instant::now();
         let window_start = jiff::Timestamp::now();
         let Some(awaited) = awaited_turn(&sub)? else {
@@ -1251,6 +1297,13 @@ impl Tool for WaitTool {
                 window_start,
             ));
         };
+        // Refused before the wait attaches: an expectation the turn has
+        // already reached could only overrun at once.
+        check_expect_not_past(&sub, awaited, args.expect_secs)?;
+        // Attached for the call's life: the running turn's watchdog is
+        // fed while this wait lives — a dead client's call drops when
+        // its connection closes.
+        let _waiter = crate::watchdog::Waiter::attach(&sub);
         // The wait's own deadline: `Instant` can represent anything the
         // caller would wait through; an overflowing bound is no bound.
         let deadline = args
@@ -1348,8 +1401,9 @@ struct WaitAnyArgs {
     session_ids: Vec<String>,
     /// Required: how long the awaited turns are expected to take, in
     /// seconds. Measured from each turn's recorded start — re-issuing a
-    /// wait never extends it. Values beyond 1800 (30 minutes) are
-    /// rejected unless `long` is set.
+    /// wait never extends it; a value any named turn has already run
+    /// past is refused before the wait attaches. Values beyond 1800 (30
+    /// minutes) are rejected unless `long` is set.
     expect_secs: u64,
     /// Optional: the wait call's own deadline in seconds, as in `wait` —
     /// on expiry the result is the longest-running watched turn's
@@ -1381,11 +1435,6 @@ impl Tool for WaitAnyTool {
             .iter()
             .map(|session_id| self.state.get(session_id))
             .collect::<Result<Vec<_>>>()?;
-        // Each watched session's watchdog is fed while this wait lives.
-        let _waiters: Vec<crate::watchdog::Waiter> = subs
-            .iter()
-            .map(|sub| crate::watchdog::Waiter::attach(sub))
-            .collect();
         let started = Instant::now();
         let window_start = jiff::Timestamp::now();
         // Each watched session binds to the turn in flight at call time,
@@ -1394,6 +1443,12 @@ impl Tool for WaitAnyTool {
             .iter()
             .map(|sub| awaited_turn(sub))
             .collect::<Result<Vec<_>>>()?;
+        check_all_expect_not_past(&subs, &awaited, args.expect_secs)?;
+        // Each watched session's watchdog is fed while this wait lives.
+        let _waiters: Vec<crate::watchdog::Waiter> = subs
+            .iter()
+            .map(|sub| crate::watchdog::Waiter::attach(sub))
+            .collect();
         let deadline = args
             .max_wait_secs
             .and_then(|secs| started.checked_add(Duration::from_secs(secs)));
