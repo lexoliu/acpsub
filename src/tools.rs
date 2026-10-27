@@ -667,7 +667,7 @@ struct WaitSnapshot {
     status: Status,
     /// The reported turn's concatenated reply text.
     reply: String,
-    /// The reported turn's tool calls.
+    /// The reported turn's tool calls, in the order they started.
     tool_calls: Vec<ToolCallSummary>,
     /// The first queued permission request's view, when any wait.
     pending: Option<Value>,
@@ -685,6 +685,17 @@ struct WaitSnapshot {
     digest: Option<ActivityDigest>,
     /// The reported turn's steer resolutions (`turn_steer_view`).
     steers: Vec<Value>,
+}
+
+/// `turn`'s tool calls in the order they started, ties by id. The map is
+/// keyed by id for update lookups, and an agent's ids carry no time order
+/// — Devin's `read:…` ids sort after its `edit:…` and `exec:…` ones — so
+/// the map order would end the list on whatever id sorts last.
+fn tool_calls_in_start_order(turn: &Turn) -> Vec<ToolCallSummary> {
+    let mut calls: Vec<ToolCallSummary> = turn.tool_calls.values().cloned().collect();
+    // Stable: equal starts keep the map's id order.
+    calls.sort_by_key(|call| call.started_at);
+    calls
 }
 
 /// Read the state [`wait_view`] reports under one `inner` lock.
@@ -717,9 +728,7 @@ fn wait_snapshot(
     WaitSnapshot {
         status: inner.status.clone(),
         reply: turn.map_or_else(String::new, |turn| turn.reply.clone()),
-        tool_calls: turn.map_or_else(Vec::new, |turn| {
-            turn.tool_calls.values().cloned().collect::<Vec<_>>()
-        }),
+        tool_calls: turn.map_or_else(Vec::new, tool_calls_in_start_order),
         pending: inner.pending.first().map(pending_view),
         turn_n,
         queued: inner.queue.len(),
@@ -2378,5 +2387,38 @@ mod tests {
         ));
         assert!(check_expect(&cx, 7200, Some(7200), true).is_ok());
         assert!(check_expect(&cx, 7200, None, false).is_err());
+    }
+
+    /// A wait lists a turn's tool calls by start, not by id: Devin-style
+    /// ids whose sort order runs opposite to the calls' starts come back
+    /// in start order, and calls sharing a start fall back to id order.
+    #[test]
+    fn tool_calls_listed_in_start_order() {
+        let start = jiff::Timestamp::from_second(1_800_000_000).expect("valid timestamp");
+        let call = |id: &str, offset_secs: i64| ToolCallSummary {
+            id: id.to_string(),
+            title: id.to_string(),
+            kind: None,
+            status: None,
+            locations: Vec::new(),
+            started_at: start
+                .checked_add(jiff::SignedDuration::from_secs(offset_secs))
+                .expect("in range"),
+            ended_at: None,
+        };
+        let mut turn = Turn::default();
+        for summary in [
+            call("read:4#a", 0),
+            call("read:5#b", 0),
+            call("edit:0#c", 60),
+            call("exec:0#d", 120),
+        ] {
+            turn.tool_calls.insert(summary.id.clone(), summary);
+        }
+        let ids: Vec<String> = tool_calls_in_start_order(&turn)
+            .into_iter()
+            .map(|call| call.id)
+            .collect();
+        assert_eq!(ids, ["read:4#a", "read:5#b", "edit:0#c", "exec:0#d"]);
     }
 }
