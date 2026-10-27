@@ -162,6 +162,21 @@ pub enum Error {
         limit_secs: u64,
     },
 
+    /// A `wait`/`wait_any` armed `expect_secs` at or below the awaited
+    /// turn's elapsed time: it could only return `overrun` at once, so
+    /// the call is refused before the wait attaches.
+    #[error(
+        "session '{session_id}'s turn has already run {elapsed_secs:.1} s: --expect counts from the turn's start, so expect_secs {expect_secs} would overrun at once"
+    )]
+    ExpectAlreadyElapsed {
+        /// Session whose awaited turn outran the expectation.
+        session_id: String,
+        /// The awaited turn's elapsed seconds.
+        elapsed_secs: f64,
+        /// The refused expectation.
+        expect_secs: u64,
+    },
+
     /// The chosen option was not offered by the permission request.
     #[error("option '{option}' was not offered by permission request '{request}' (offered: {})", .offered.join(", "))]
     BadOption {
