@@ -573,8 +573,8 @@ fn parked_session_follows_restart() {
         .expect("session_id")
         .to_string();
 
-    // `wait` follows a park through to the resumed turn, so the park is
-    // observed on `status` — quiescent work that hands off at once.
+    // The park is observed on `status` — quiescent work that hands off
+    // at once.
     let parked = daemon.status_until(&a, |status| status["state"] == "rate_limited");
     assert_eq!(parked["state"], "rate_limited", "{parked}");
 
@@ -620,16 +620,16 @@ fn expire_parked(dir: &Path) {
     std::fs::write(&path, registry.to_string()).expect("write registry");
 }
 
-/// A prompt parked before its turn started stays marked as the resume's
-/// first turn across a daemon restart: the new daemon runs it without a
-/// continuation, and `wait` blocks until that turn ends. The park's
-/// window is an hour — no run of this test sees it lift — so the parked
-/// state is observed, never raced; the resume is then released the way a
-/// daemon that was down when the limit lifted releases one: the schedule
-/// the registry carries is moved into the past and a fresh daemon's
-/// scheduler fires it.
+/// A queued prompt that chained into a limit learned meanwhile stays
+/// marked as the resume's first turn across a daemon restart: the new
+/// daemon runs it without a continuation, and `wait` blocks until that
+/// turn ends. The park's window is an hour — no run of this test sees it
+/// lift — so the parked state is observed, never raced; the resume is
+/// then released the way a daemon that was down when the limit lifted
+/// releases one: the schedule the registry carries is moved into the
+/// past and a fresh daemon's scheduler fires it.
 #[test]
-fn parked_prompt_resumes_without_continuation_after_restart() {
+fn reparked_prompt_resumes_without_continuation_after_restart() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
@@ -655,12 +655,18 @@ fn parked_prompt_resumes_without_continuation_after_restart() {
             .expect("session_id")
             .to_string()
     };
+    // A turn held open by the test, with a prompt queued behind it.
+    let turn_gate = dir.path().join("turn-gate");
+    let b = spawn(&format!("gated {}", turn_gate.display()));
+    daemon.call_json(&["send", &b, "--policy", "queued", "--prompt", "hi"]);
+
+    // Another session of the scope meets the limit meanwhile.
     let trigger = spawn("ratelimit");
     let parked = daemon.status_until(&trigger, |status| status["state"] == "rate_limited");
     assert_eq!(parked["state"], "rate_limited", "{parked}");
 
-    // No turn of this session ever started: its prompt is parked.
-    let b = spawn("hi");
+    // The held turn ends into the known limit: its queued prompt parks.
+    std::fs::write(&turn_gate, b"").expect("open the turn gate");
     let status = daemon.status_until(&b, |status| status["state"] == "rate_limited");
     assert_eq!(status["state"], "rate_limited", "{status}");
 
@@ -695,18 +701,95 @@ fn parked_prompt_resumes_without_continuation_after_restart() {
     expire_parked(dir.path());
     let daemon = Daemon::start(dir.path());
 
-    // The resumed prompt is the session's own, as its first turn.
+    // The resumed prompt is the session's own, as its second turn.
     daemon.status_until(&b, |status| {
         status["live"] == true && status["state"] != "idle"
     });
     let ended = daemon.call_json(&["wait", &b, "--expect", "60"]);
     assert_eq!(ended["state"], "done", "{ended}");
-    assert_eq!(ended["turn"], 1, "{ended}");
+    assert_eq!(ended["turn"], 2, "{ended}");
     let status = daemon.call_json(&["status", &b]);
     let path = status["transcript"].as_str().expect("transcript path");
     let text = std::fs::read_to_string(path).expect("transcript file");
     assert!(text.contains("\"prompt\":\"hi\""), "{text}");
     assert!(!text.contains("rate limit has lifted"), "{text}");
+}
+
+/// A `wait` that ends on a rate-limited turn exits 75 with the state, the
+/// reset time and the provider's message; `spawn` and `send` into the
+/// limited scope fail with exit 1 and an error naming the agent and the
+/// reset instead of parking the prompt.
+#[test]
+fn rate_limit_exit_code_and_refusals() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    let cwd = dir.path().to_string_lossy().into_owned();
+    let spawn_args = |prompt: &str| {
+        [
+            "spawn",
+            "--cwd",
+            &cwd,
+            "--agent",
+            "slowlimit",
+            "--model",
+            "b",
+            "--mode",
+            "bypass",
+            "--prompt",
+            prompt,
+        ]
+        .map(str::to_string)
+    };
+    let run = |args: &[String]| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        daemon.run(&args).expect("client runs")
+    };
+
+    let spawned = daemon.call_json(&spawn_args("ratelimit").each_ref().map(String::as_str));
+    let sid = spawned["session_id"].as_str().expect("session_id");
+    // Bound to the turn while the fake delays its error, the wait ends on
+    // the rate-limited turn; armed after the park it freezes on the parked
+    // session instead and `--max-wait` returns the same state.
+    let out = daemon
+        .run(&["wait", sid, "--expect", "60", "--max-wait", "30"])
+        .expect("wait runs");
+    assert_eq!(out.status.code(), Some(75), "{out:?}");
+    let ended: Value = serde_json::from_slice(&out.stdout).expect("wait output is json");
+    assert_eq!(ended["state"], "rate_limited", "{ended}");
+    assert!(ended["resume_at"].is_string(), "{ended}");
+    assert!(
+        ended["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("rate limit")),
+        "{ended}"
+    );
+    let resume_at = ended["resume_at"].as_str().unwrap();
+
+    let out = run(&spawn_args("hi"));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent 'slowlimit' is rate limited until"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(resume_at), "{stderr}");
+    let out = run(&[
+        "send".to_string(),
+        sid.to_string(),
+        "--policy".to_string(),
+        "queued".to_string(),
+        "--prompt".to_string(),
+        "again".to_string(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is rate limited until"),
+        "{out:?}"
+    );
 }
 
 /// A session whose `session/load` fails is reported in the resume report

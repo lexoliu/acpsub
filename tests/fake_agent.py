@@ -20,6 +20,7 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 - "loops" -> a busy-looping turn that never completes: an edit call and
   the standard call stay open ~0.3 s while three same-titled calls run
   and close, leaving one long in-progress call.
+- "gated <path>" -> the turn completes normally once that file exists.
 - "gather" -> the prompt completes once a steered prompt arrives; the
   steered text is recorded into the reply.
 - "die" -> the process exits mid-turn with status 3.
@@ -235,6 +236,12 @@ def begin_turn(request_id, text):
         session_id,
         {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "in_progress"},
     )
+    if text.startswith("gated "):
+        # "gated <path>": the turn stays open until that file exists,
+        # then completes normally — the test ends the turn on its own
+        # event, never on a delay.
+        while not os.path.exists(text[len("gated "):]):
+            time.sleep(0.02)
     if text in ("wait", "gather", "hold"):
         return
     if text == "loops":

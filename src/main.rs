@@ -214,10 +214,11 @@ enum Command {
         conn: DaemonConn,
     },
     /// Block until the subagent's turn ends, a permission needs an answer,
-    /// or the turn outlives --expect. A rate-limited (parked) session does
-    /// not end the wait: it blocks until the resumed turn ends, and --expect
-    /// counts from that turn's start. Designed to run in the background:
-    /// exit means "check the result".
+    /// or the turn outlives --expect. A turn that ends rate-limited ends the
+    /// wait at once with exit code 75 and the reset time in the result; a
+    /// wait started on an already parked session blocks until the resumed
+    /// turn ends, and --expect counts from that turn's start. Designed to
+    /// run in the background: exit means "check the result".
     Wait {
         /// Session id.
         session_id: String,
@@ -539,7 +540,9 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
     };
     let socket = conn.socket_path()?;
     let result = acpsub::client::call(&socket, tool, arguments, conn.config.as_deref()).await?;
-    Ok(print_result(result))
+    // Only a wait reports a turn that ended rate-limited as an outcome of
+    // its own; for every other tool `rate_limited` is just a state.
+    Ok(print_result(result, matches!(tool, "wait" | "wait_any")))
 }
 
 /// Build the `spawn` tool arguments from the CLI flags.
@@ -654,12 +657,19 @@ async fn restart(conn: DaemonConn) -> Result<ExitCode, Box<dyn std::error::Error
     }
     let report =
         acpsub::client::call(&socket, "daemon/resumed", json!({}), conn.config.as_deref()).await?;
-    Ok(print_result(report))
+    Ok(print_result(report, false))
 }
 
+/// Exit code of a `wait`/`wait-any` that ended `rate_limited`: the awaited
+/// turn was stopped by a provider limit (`EX_TEMPFAIL`), so the caller
+/// decides between waiting for `resume_at` and moving the task elsewhere.
+/// Distinct from `1`, a tool error, and `2`, a usage error.
+const RATE_LIMITED_EXIT: u8 = 75;
+
 /// Print a tool result: JSON pretty-printed when it parses, raw text
-/// otherwise; tool errors go to stderr with a failure exit.
-fn print_result(result: CallToolResult) -> ExitCode {
+/// otherwise; tool errors go to stderr with a failure exit. With
+/// `wait_result`, a `rate_limited` state exits [`RATE_LIMITED_EXIT`].
+fn print_result(result: CallToolResult, wait_result: bool) -> ExitCode {
     let mut text = String::new();
     for item in result.content {
         if let Content::Text(item) = item {
@@ -676,6 +686,9 @@ fn print_result(result: CallToolResult) -> ExitCode {
                 "{}",
                 serde_json::to_string_pretty(&value).expect("Value serializes")
             );
+            if wait_result && value["state"] == "rate_limited" {
+                return ExitCode::from(RATE_LIMITED_EXIT);
+            }
         }
         Err(_) => println!("{text}"),
     }

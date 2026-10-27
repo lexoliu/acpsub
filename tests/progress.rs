@@ -11,11 +11,9 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use acpsub::config::AgentConfig;
 use aither_core::llm::tool::{Progress, ProgressSink, ToolContext, ToolResult, Tools};
 use common::*;
 use serde_json::{Value, json};
@@ -459,124 +457,12 @@ fn assert_increasing(seen: &[(Progress, Instant)]) {
     }
 }
 
-/// The `ratelimit` agent whose error answer holds until `gate` exists:
-/// the test decides when the awaited turn ends, never a delay.
-fn gated_limit_agent(gate: &Path) -> AgentConfig {
-    AgentConfig {
-        env: BTreeMap::from([
-            ("FAKE_RATE_LIMIT".to_string(), "4".to_string()),
-            (
-                "FAKE_RATE_LIMIT_GATE".to_string(),
-                gate.to_string_lossy().into_owned(),
-            ),
-        ]),
-        ..fake_agent_config()
-    }
-}
-
-/// `gated_limit_agent` plus a hold on the limit itself: while `hold` is
-/// absent every prompt errors again — each resume the park schedules is
-/// answered with the limit still standing — so the parked phase ends on
-/// the test's event, never on a window's end.
-fn held_limit_agent(gate: &Path, hold: &Path) -> AgentConfig {
-    let mut agent = gated_limit_agent(gate);
-    agent.env.insert(
-        "FAKE_RATE_LIMIT_HOLD".to_string(),
-        hold.to_string_lossy().into_owned(),
-    );
-    agent
-}
-
-/// A `wait_any` whose longest-running watched session changes mid-wait
-/// keeps reporting: the leader's turn ends rate-limited and parks, the
-/// runner-up takes over — and the reported value, the wait's own
-/// elapsed time, never drops the way the runner-up's younger turn
-/// would have dropped it (#66).
+/// A `wait` bound to a turn that ends rate-limited reports progress while
+/// the turn runs, then returns `rate_limited` with the reset time: the
+/// reported value is the wait's own elapsed time, increasing for its whole
+/// life (#66).
 #[tokio::test(flavor = "multi_thread")]
-async fn wait_any_reports_through_a_leader_change() {
-    if !python3() {
-        eprintln!("skipping: python3 not found");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    // The leader's turn stays in flight until the test opens the gate,
-    // and the limit its error parks it under stands until the test lifts
-    // the hold — neither phase races a delay.
-    let gate = dir.path().join("rate-limit-gate");
-    let hold = dir.path().join("rate-limit-hold");
-    let mut agents = BTreeMap::new();
-    agents.insert("fake".to_string(), fake_agent_config());
-    agents.insert("heldlimit".to_string(), held_limit_agent(&gate, &hold));
-    let (state, tools) = test_state_with_agents(dir.path(), &agents);
-    let tools = Arc::new(tools);
-    // The leader spawned first, so its turn is always the
-    // longest-running one while both run; the runner-up's "wait" turn
-    // outlives every phase of the call.
-    let leader = spawn_id(
-        &tools,
-        json!({"agent": "heldlimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
-    )
-    .await;
-    let runner = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
-
-    let (mut reports, mut waiting) = start_wait(
-        &tools,
-        "wait_any",
-        json!({"session_ids": [leader, runner], "expect_secs": EXPECT_SECS, "long": true}),
-    );
-    // The first report proves the wait bound with every watched turn in
-    // flight — and names the leader, the longest-running of them.
-    let first = next_report(&mut reports).await;
-    let names = |p: &Progress, id: &str| p.message().is_some_and(|m| m.contains(id));
-    assert!(
-        names(&first.0, &leader),
-        "first report did not name the leader: {first:?}"
-    );
-
-    // Releasing the gate ends the leader's turn rate-limited: it parks,
-    // and the runner-up becomes the longest-running watched turn.
-    std::fs::write(&gate, b"").expect("open the rate-limit gate");
-    status_becomes(&state, &leader, "rate_limited").await;
-
-    // The leader change itself is the event: while the limit stands,
-    // every resume the park schedules is answered with the limit again,
-    // so a report naming the runner-up cannot be raced out — the hold
-    // keeps the park alive until one lands.
-    let mut seen = vec![first];
-    let first_runner = loop {
-        let report = next_report(&mut reports).await;
-        let runner_named = names(&report.0, &runner);
-        seen.push(report);
-        if runner_named {
-            break seen.len() - 1;
-        }
-    };
-    // Every report ahead of the park names the leader — while its turn
-    // was in flight it was the longest-running watched one.
-    assert!(
-        seen[..first_runner].iter().all(|(p, _)| names(p, &leader)),
-        "a report before the leader's park did not name the leader: {seen:?}"
-    );
-
-    // Lifting the hold lets the leader's resumed continuation turn run:
-    // it ends the wait on its own.
-    std::fs::write(&hold, b"").expect("lift the rate-limit hold");
-    let waited = collect_until_return(&mut waiting, &mut reports, &mut seen).await;
-    assert_eq!(waited["session_id"], leader, "{waited}");
-    assert_eq!(waited["state"], "done", "{waited}");
-
-    assert_increasing(&seen);
-
-    // The runner-up's "wait" turn never ends on its own.
-    call_json(&tools, "cancel", json!({"session_id": runner})).await;
-}
-
-/// A `wait` bound to a turn that ends rate-limited reports through the
-/// park and the resume's rebind: the reported value is the wait's own
-/// elapsed time, so it keeps increasing across the resume where the
-/// rebound turn's restarted clock would have dropped it (#66).
-#[tokio::test(flavor = "multi_thread")]
-async fn wait_reports_through_a_rate_limit_pause() {
+async fn wait_reports_until_a_rate_limit_ends_it() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
@@ -587,7 +473,7 @@ async fn wait_reports_through_a_rate_limit_pause() {
     let gate = dir.path().join("rate-limit-gate");
     let mut agents = BTreeMap::new();
     agents.insert("gatedlimit".to_string(), gated_limit_agent(&gate));
-    let (state, tools) = test_state_with_agents(dir.path(), &agents);
+    let (_state, tools) = test_state_with_agents(dir.path(), &agents);
     let tools = Arc::new(tools);
     let session_id = spawn_id(
         &tools,
@@ -608,17 +494,14 @@ async fn wait_reports_through_a_rate_limit_pause() {
         "first report did not name the session: {first:?}"
     );
 
-    // Releasing the gate ends the turn rate-limited: the session parks,
-    // then the scheduler's resume runs the continuation turn that ends
-    // the wait.
+    // Releasing the gate ends the turn rate-limited, which ends the wait.
     std::fs::write(&gate, b"").expect("open the rate-limit gate");
-    status_becomes(&state, &session_id, "rate_limited").await;
 
     let mut seen = vec![first];
     let waited = collect_until_return(&mut waiting, &mut reports, &mut seen).await;
-    assert_eq!(waited["state"], "done", "{waited}");
-    assert_eq!(waited["stop_reason"], "end_turn", "{waited}");
-    assert!(waited["turn"].as_u64().unwrap() >= 2, "{waited}");
+    assert_eq!(waited["state"], "rate_limited", "{waited}");
+    assert_eq!(waited["turn"], 1, "{waited}");
+    assert!(waited["resume_at"].is_string(), "{waited}");
 
     assert_increasing(&seen);
     for (p, _) in &seen {
@@ -627,4 +510,48 @@ async fn wait_reports_through_a_rate_limit_pause() {
             "report does not name the session: {p:?}"
         );
     }
+}
+
+/// A `wait_any` returns the watched session whose turn ends rate-limited
+/// as soon as it does — with the reset time — while the other watched turn
+/// is still running.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_any_returns_when_a_turn_ends_rate_limited() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("rate-limit-gate");
+    let mut agents = BTreeMap::new();
+    agents.insert("fake".to_string(), fake_agent_config());
+    agents.insert("gatedlimit".to_string(), gated_limit_agent(&gate));
+    let (_state, tools) = test_state_with_agents(dir.path(), &agents);
+    let tools = Arc::new(tools);
+    let limited = spawn_id(
+        &tools,
+        json!({"agent": "gatedlimit", "cwd": dir.path(), "prompt": "ratelimit", "model": "b", "mode": "bypass"}),
+    )
+    .await;
+    // The runner-up's "wait" turn never ends on its own.
+    let runner = spawn_id(&tools, spawn_args(dir.path(), "wait")).await;
+
+    let (mut reports, mut waiting) = start_wait(
+        &tools,
+        "wait_any",
+        json!({"session_ids": [limited, runner], "expect_secs": EXPECT_SECS, "long": true}),
+    );
+    // The first report proves the wait bound with both turns in flight.
+    let first = next_report(&mut reports).await;
+
+    std::fs::write(&gate, b"").expect("open the rate-limit gate");
+    let mut seen = vec![first];
+    let waited = collect_until_return(&mut waiting, &mut reports, &mut seen).await;
+    assert_eq!(waited["session_id"], limited, "{waited}");
+    assert_eq!(waited["state"], "rate_limited", "{waited}");
+    assert!(waited["resume_at"].is_string(), "{waited}");
+    assert!(waited["reason"].is_string(), "{waited}");
+    assert_increasing(&seen);
+
+    call_json(&tools, "cancel", json!({"session_id": runner})).await;
 }
