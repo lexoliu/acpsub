@@ -172,7 +172,7 @@ args = ["{script}"]
         "tools/call",
         &json!({
             "name": "spawn",
-            "arguments": {"cwd": dir.path(), "prompt": "hi", "model": "b", "mode": "bypass"},
+            "arguments": {"cwd": dir.path(), "prompt": "hi", "model": "b", "mode": "bypass", "json": true},
         }),
     );
     let spawned = tool_json(&spawned);
@@ -182,13 +182,30 @@ args = ["{script}"]
 
     let waited = server.request(
         "tools/call",
-        &json!({"name": "wait", "arguments": {"session_id": session_id, "expect_secs": 60}}),
+        &json!({"name": "wait", "arguments": {"session_id": session_id, "expect_secs": 60, "json": true}}),
     );
     let waited = tool_json(&waited);
     assert_eq!(waited["state"], "done", "{waited}");
     assert_eq!(waited["reply"], "Hello abworld");
 
-    let list = server.request("tools/call", &json!({"name": "list", "arguments": {}}));
+    // The default is prose: the outcome line, then the reply verbatim.
+    let prose = server.request(
+        "tools/call",
+        &json!({"name": "wait", "arguments": {"session_id": session_id, "expect_secs": 60}}),
+    );
+    let text = prose["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert_eq!(
+        text,
+        format!("Session {session_id}, turn 1: done (end_turn)\n\nHello abworld\n"),
+        "{text}"
+    );
+
+    let list = server.request(
+        "tools/call",
+        &json!({"name": "list", "arguments": {"json": true}}),
+    );
     let list = tool_json(&list);
     assert_eq!(list["subagents"][0]["session_id"], session_id);
 }
@@ -241,7 +258,7 @@ args = ["{script}"]
         "tools/call",
         &json!({
             "name": "spawn",
-            "arguments": {"cwd": dir.path(), "prompt": "wait", "model": "b", "mode": "bypass"},
+            "arguments": {"cwd": dir.path(), "prompt": "wait", "model": "b", "mode": "bypass", "json": true},
         }),
     );
     let session_id = tool_json(&spawned)["session_id"]
@@ -253,7 +270,7 @@ args = ["{script}"]
         "tools/call",
         &json!({
             "name": "wait",
-            "arguments": {"session_id": session_id, "expect_secs": 12},
+            "arguments": {"session_id": session_id, "expect_secs": 12, "json": true},
             "_meta": {"progressToken": "tok-1"},
         }),
     );

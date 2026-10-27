@@ -24,6 +24,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Print the command's structured JSON form instead of prose.
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 /// Connection options every daemon client command accepts.
@@ -222,18 +225,17 @@ enum Command {
     Wait {
         /// Session id.
         session_id: String,
-        /// Expected turn duration in seconds; an overrun returns early with
-        /// `state: "overrun"` for investigation. Rejected above 1800 (30
-        /// minutes) unless --long.
+        /// Expected turn duration in seconds; an overrun prints a short
+        /// "still running" paragraph pointing at `acpsub transcript`
+        /// instead of the reply. Rejected above 1800 (30 minutes) unless
+        /// --long.
         #[arg(long)]
         expect: u64,
         /// The wait's own deadline in seconds. When it passes with the
-        /// turn still running, wait returns `state: "running"` with an
-        /// activity `digest` of the window (shape documented in the
-        /// README's `wait` entry) instead of dying silent under a
-        /// background-task kill limit — set it just below that limit.
-        /// Overrun results carry the same digest. Rejected above 1800
-        /// unless --long.
+        /// turn still running, wait prints the same still-running
+        /// paragraph instead of dying silent under a background-task
+        /// kill limit — set it just below that limit. Rejected above
+        /// 1800 unless --long.
         #[arg(long)]
         max_wait: Option<u64>,
         /// Lift the 1800-second (30-minute) limit on --expect and
@@ -254,8 +256,8 @@ enum Command {
         #[arg(long)]
         expect: u64,
         /// The wait's own deadline in seconds, as in `wait`: on expiry the
-        /// result is the longest-running watched turn's `state: "running"`
-        /// with its activity `digest`. Rejected above 1800 unless --long.
+        /// longest-running watched turn is reported still running, as in
+        /// `wait`. Rejected above 1800 unless --long.
         #[arg(long)]
         max_wait: Option<u64>,
         /// Lift the 1800-second (30-minute) limit on --expect and
@@ -381,7 +383,8 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    match cli.command {
         Command::Serve { config, log_file } => {
             serve(config, log_file).await?;
             Ok(ExitCode::SUCCESS)
@@ -395,7 +398,7 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Agents { config } => {
-            agents(config)?;
+            agents(config, cli.json)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Transcript {
@@ -407,10 +410,17 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             meta,
             config,
         } => {
-            transcript(&session_id, config, from, tail, full, thinking, meta)?;
+            let options = RenderOptions {
+                from: from.unwrap_or(0),
+                tail,
+                full,
+                thinking,
+                meta,
+            };
+            transcript(&session_id, config, &options, cli.json)?;
             Ok(ExitCode::SUCCESS)
         }
-        command => call(command).await,
+        command => call(command, cli.json).await,
     }
 }
 
@@ -420,9 +430,9 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     clippy::too_many_lines,
     reason = "one arm per subcommand; every arm is a thin flag-to-JSON mapping"
 )]
-async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> {
+async fn call(command: Command, as_json: bool) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Command::Restart { conn } = command {
-        return restart(conn).await;
+        return restart(conn, as_json).await;
     }
     let (conn, tool, arguments) = match command {
         Command::Spawn {
@@ -539,10 +549,21 @@ async fn call(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> 
         _ => unreachable!("non-client commands are handled before `call`"),
     };
     let socket = conn.socket_path()?;
+    // A wait always asks for the structured form: the rate_limited exit
+    // code is read off it, and the prose is rendered locally from the
+    // same value the tool itself would render.
+    let is_wait = matches!(tool, "wait" | "wait_any");
+    let mut arguments = arguments;
+    if is_wait || as_json {
+        arguments["json"] = json!(true);
+    }
+    let expect_secs = arguments["expect_secs"].as_u64();
     let result = acpsub::client::call(&socket, tool, arguments, conn.config.as_deref()).await?;
-    // Only a wait reports a turn that ended rate-limited as an outcome of
-    // its own; for every other tool `rate_limited` is just a state.
-    Ok(print_result(result, matches!(tool, "wait" | "wait_any")))
+    if is_wait {
+        let expect_secs = expect_secs.ok_or("a wait carries --expect")?;
+        return Ok(print_wait_result(&result, as_json, expect_secs));
+    }
+    Ok(print_result(&result))
 }
 
 /// Build the `spawn` tool arguments from the CLI flags.
@@ -626,7 +647,7 @@ fn parse_config_options(pairs: &[String]) -> acpsub::Result<Value> {
 /// and adopts every session the old one hands off. The pid file naming
 /// a new generation is the takeover signal: the socket then reaches the
 /// new daemon, whose `daemon/resumed` answer is the report this prints.
-async fn restart(conn: DaemonConn) -> Result<ExitCode, Box<dyn std::error::Error>> {
+async fn restart(conn: DaemonConn, as_json: bool) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let socket = conn.socket_path()?;
     if async_net::unix::UnixStream::connect(&socket).await.is_err() {
         return Err(format!("no acpsub daemon at {}", socket.display()).into());
@@ -655,9 +676,14 @@ async fn restart(conn: DaemonConn) -> Result<ExitCode, Box<dyn std::error::Error
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let report =
-        acpsub::client::call(&socket, "daemon/resumed", json!({}), conn.config.as_deref()).await?;
-    Ok(print_result(report, false))
+    let report = acpsub::client::call(
+        &socket,
+        "daemon/resumed",
+        json!({"json": as_json}),
+        conn.config.as_deref(),
+    )
+    .await?;
+    Ok(print_result(&report))
 }
 
 /// Exit code of a `wait`/`wait-any` that ended `rate_limited`: the awaited
@@ -666,33 +692,62 @@ async fn restart(conn: DaemonConn) -> Result<ExitCode, Box<dyn std::error::Error
 /// Distinct from `1`, a tool error, and `2`, a usage error.
 const RATE_LIMITED_EXIT: u8 = 75;
 
-/// Print a tool result: JSON pretty-printed when it parses, raw text
-/// otherwise; tool errors go to stderr with a failure exit. With
-/// `wait_result`, a `rate_limited` state exits [`RATE_LIMITED_EXIT`].
-fn print_result(result: CallToolResult, wait_result: bool) -> ExitCode {
-    let mut text = String::new();
-    for item in result.content {
-        if let Content::Text(item) = item {
-            text.push_str(&item.text);
-        }
-    }
+/// Print a tool result: JSON pretty-printed when it parses (the tool was
+/// asked for its `--json` form), the daemon's prose text otherwise; tool
+/// errors go to stderr with a failure exit.
+fn print_result(result: &CallToolResult) -> ExitCode {
+    let text = result_text(result);
     if result.is_error {
         eprintln!("{text}");
         return ExitCode::FAILURE;
     }
     match serde_json::from_str::<Value>(text.trim()) {
-        Ok(value) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value).expect("Value serializes")
-            );
-            if wait_result && value["state"] == "rate_limited" {
-                return ExitCode::from(RATE_LIMITED_EXIT);
-            }
-        }
-        Err(_) => println!("{text}"),
+        Ok(value) => println!(
+            "{}",
+            serde_json::to_string_pretty(&value).expect("Value serializes")
+        ),
+        Err(_) => print!("{text}"),
     }
     ExitCode::SUCCESS
+}
+
+/// Print a `wait`/`wait_any` result, which always arrived in its
+/// structured form: `--json` pretty-prints it, otherwise the prose is
+/// rendered locally from the same value the tool itself renders. A
+/// `rate_limited` state exits [`RATE_LIMITED_EXIT`].
+fn print_wait_result(result: &CallToolResult, as_json: bool, expect_secs: u64) -> ExitCode {
+    let text = result_text(result);
+    if result.is_error {
+        eprintln!("{text}");
+        return ExitCode::FAILURE;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+        print!("{text}");
+        return ExitCode::SUCCESS;
+    };
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).expect("Value serializes")
+        );
+    } else {
+        print!("{}", acpsub::prose::wait(&value, expect_secs));
+    }
+    if value["state"] == "rate_limited" {
+        return ExitCode::from(RATE_LIMITED_EXIT);
+    }
+    ExitCode::SUCCESS
+}
+
+/// The concatenated text of a tool result's content items.
+fn result_text(result: &CallToolResult) -> String {
+    let mut text = String::new();
+    for item in &result.content {
+        if let Content::Text(item) = item {
+            text.push_str(&item.text);
+        }
+    }
+    text
 }
 
 /// Resolve the config path from `--config` or the default location.
@@ -769,9 +824,27 @@ async fn daemon(
     Ok(())
 }
 
-/// `acpsub agents`: the configured agents, one line each.
-fn agents(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+/// `acpsub agents`: the configured agents, one line each — a JSON array
+/// of their config entries with `--json`.
+fn agents(config: Option<PathBuf>, as_json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(config)?;
+    if as_json {
+        let agents: Vec<Value> = config
+            .agents
+            .iter()
+            .map(|(name, agent)| {
+                json!({
+                    "name": name,
+                    "command": agent.command,
+                    "args": agent.args,
+                    "allow_outside_cwd": agent.allow_outside_cwd,
+                    "permission": agent.permission,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&agents)?);
+        return Ok(());
+    }
     let mut out = String::new();
     for (name, agent) in &config.agents {
         let mut line = format!("{name}\t{} {}", agent.command, agent.args.join(" "));
@@ -792,15 +865,13 @@ fn agents(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `acpsub transcript <session_id>`: render the JSONL transcript.
+/// `acpsub transcript <session_id>`: render the JSONL transcript — the
+/// raw file itself with `--json`.
 fn transcript(
     session_id: &str,
     config: Option<PathBuf>,
-    from: Option<usize>,
-    tail: Option<usize>,
-    full: bool,
-    thinking: bool,
-    meta: bool,
+    options: &RenderOptions,
+    as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(config)?;
     let path = config
@@ -809,16 +880,11 @@ fn transcript(
         .join(format!("{session_id}.jsonl"));
     let text =
         std::fs::read_to_string(&path).map_err(|_| acpsub::Error::NoTranscript(path.clone()))?;
-    let rendered = render(
-        &text,
-        &RenderOptions {
-            from: from.unwrap_or(0),
-            tail,
-            full,
-            thinking,
-            meta,
-        },
-    );
+    if as_json {
+        std::io::stdout().write_all(text.as_bytes())?;
+        return Ok(());
+    }
+    let rendered = render(&text, options);
     std::io::stdout().write_all(rendered.as_bytes())?;
     Ok(())
 }

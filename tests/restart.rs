@@ -192,7 +192,9 @@ impl Daemon {
 
     /// Run a client subcommand and return its stdout as JSON.
     fn call_json(&self, args: &[&str]) -> Value {
-        let output = self.run(args).expect("client runs");
+        let mut args = args.to_vec();
+        args.push("--json");
+        let output = self.run(&args).expect("client runs");
         assert!(
             output.status.success(),
             "{args:?} failed: {}\nfirst daemon log:\n{}",
@@ -295,7 +297,7 @@ fn inflight_turn_hands_off() {
     // The restart completes while A's turn still runs: the new daemon is
     // serving and reports A as still owned by the old one, and the idle
     // session already resumed.
-    let output = daemon.run(&["restart"]).expect("restart runs");
+    let output = daemon.run(&["restart", "--json"]).expect("restart runs");
     assert!(
         output.status.success(),
         "restart failed: {}",
@@ -391,7 +393,7 @@ fn spawn_during_restart_serves_immediately() {
 
     // The spawn races the restart: whichever generation it lands on, it
     // runs — the turn in flight on A does not block it.
-    let restart = daemon.run_thread(&["restart"]);
+    let restart = daemon.run_thread(&["restart", "--json"]);
     let spawn = daemon.run_thread(&[
         "spawn",
         "--cwd",
@@ -402,6 +404,7 @@ fn spawn_during_restart_serves_immediately() {
         "bypass",
         "--prompt",
         "hi",
+        "--json",
     ]);
 
     let spawned: Value = serde_json::from_slice(&spawn.join().expect("spawn thread").stdout)
@@ -462,8 +465,8 @@ fn wait_blocked_across_restart() {
     // daemon's listener before the rename takes the socket over — or
     // forwards through the new one if it is late. Either way it must
     // answer, not fail.
-    let wait = daemon.run_thread(&["wait", &a, "--expect", "60"]);
-    let restart = daemon.run_thread(&["restart"]);
+    let wait = daemon.run_thread(&["wait", &a, "--expect", "60", "--json"]);
+    let restart = daemon.run_thread(&["restart", "--json"]);
 
     let output = restart.join().expect("restart thread");
     assert!(
@@ -519,7 +522,7 @@ fn forwarded_calls_for_old_owned_session() {
         .expect("session_id")
         .to_string();
 
-    let output = daemon.run(&["restart"]).expect("restart runs");
+    let output = daemon.run(&["restart", "--json"]).expect("restart runs");
     assert!(
         output.status.success(),
         "restart failed: {}",
@@ -578,7 +581,7 @@ fn parked_session_follows_restart() {
     let parked = daemon.status_until(&a, |status| status["state"] == "rate_limited");
     assert_eq!(parked["state"], "rate_limited", "{parked}");
 
-    let output = daemon.run(&["restart"]).expect("restart runs");
+    let output = daemon.run(&["restart", "--json"]).expect("restart runs");
     assert!(
         output.status.success(),
         "restart failed: {}",
@@ -670,7 +673,7 @@ fn reparked_prompt_resumes_without_continuation_after_restart() {
     let status = daemon.status_until(&b, |status| status["state"] == "rate_limited");
     assert_eq!(status["state"], "rate_limited", "{status}");
 
-    let output = daemon.run(&["restart"]).expect("restart runs");
+    let output = daemon.run(&["restart", "--json"]).expect("restart runs");
     assert!(
         output.status.success(),
         "restart failed: {}",
@@ -755,7 +758,7 @@ fn rate_limit_exit_code_and_refusals() {
     // the rate-limited turn; armed after the park it freezes on the parked
     // session instead and `--max-wait` returns the same state.
     let out = daemon
-        .run(&["wait", sid, "--expect", "60", "--max-wait", "30"])
+        .run(&["wait", sid, "--expect", "60", "--max-wait", "30", "--json"])
         .expect("wait runs");
     assert_eq!(out.status.code(), Some(75), "{out:?}");
     let ended: Value = serde_json::from_slice(&out.stdout).expect("wait output is json");
@@ -825,7 +828,7 @@ fn failed_resume_is_reported() {
     let ended = daemon.call_json(&["wait", &c, "--expect", "60"]);
     assert_eq!(ended["state"], "done", "{ended}");
 
-    let output = daemon.run(&["restart"]).expect("restart runs");
+    let output = daemon.run(&["restart", "--json"]).expect("restart runs");
     assert!(
         output.status.success(),
         "restart failed: {}",
@@ -915,7 +918,7 @@ fn late_steer_resolution_still_hands_off() {
         .expect("session_id")
         .to_string();
 
-    let output = daemon.run(&["restart"]).expect("restart runs");
+    let output = daemon.run(&["restart", "--json"]).expect("restart runs");
     assert!(
         output.status.success(),
         "restart failed: {}",
