@@ -282,7 +282,7 @@ async fn wait_returns_the_turn_it_started_on() {
             call_with(
                 &tools,
                 "wait",
-                json!({"session_id": session_id, "expect_secs": EXPECT_SECS, "long": true}),
+                json!({"session_id": session_id, "expect_secs": EXPECT_SECS, "long": true, "json": true}),
                 ToolContext::with_progress(Collect(tx)),
             )
             .await
@@ -484,7 +484,7 @@ async fn wait_reports_until_a_rate_limit_ends_it() {
     let (mut reports, mut waiting) = start_wait(
         &tools,
         "wait",
-        json!({"session_id": session_id, "expect_secs": EXPECT_SECS, "long": true}),
+        json!({"session_id": session_id, "expect_secs": EXPECT_SECS, "long": true, "json": true}),
     );
     // The first report proves the wait bound while the turn is in
     // flight.
@@ -539,7 +539,7 @@ async fn wait_any_returns_when_a_turn_ends_rate_limited() {
     let (mut reports, mut waiting) = start_wait(
         &tools,
         "wait_any",
-        json!({"session_ids": [limited, runner], "expect_secs": EXPECT_SECS, "long": true}),
+        json!({"session_ids": [limited, runner], "expect_secs": EXPECT_SECS, "long": true, "json": true}),
     );
     // The first report proves the wait bound with both turns in flight.
     let first = next_report(&mut reports).await;

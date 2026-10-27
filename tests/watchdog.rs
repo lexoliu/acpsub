@@ -86,7 +86,9 @@ impl Daemon {
 
     /// Run a client subcommand and return its stdout as JSON.
     fn call_json(&self, args: &[&str]) -> Value {
-        let output = self.run(args).expect("client runs");
+        let mut args = args.to_vec();
+        args.push("--json");
+        let output = self.run(&args).expect("client runs");
         assert!(
             output.status.success(),
             "{args:?} failed: {}",
@@ -170,7 +172,7 @@ fn dead_waiter_turn_is_cancelled() {
     let sid = daemon.spawn(dir.path(), "wait");
 
     let mut waiter = daemon
-        .command(&["wait", &sid, "--expect", "60"])
+        .command(&["wait", &sid, "--expect", "60", "--json"])
         .spawn()
         .expect("spawn wait client");
     // Let the client's tools/call land so it is attached.
@@ -293,7 +295,7 @@ fn restart_handoff_does_not_cancel_turns() {
 
     // Reattach through the new daemon's forwarding and end the turn.
     let waiter = daemon
-        .command(&["wait", &sid, "--expect", "60"])
+        .command(&["wait", &sid, "--expect", "60", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

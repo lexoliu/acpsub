@@ -38,8 +38,8 @@ async fn spawn_wait_reply() {
     assert_eq!(done["state"], "done");
     assert_eq!(done["stop_reason"], "end_turn");
     assert_eq!(done["reply"], "Hello abworld", "{done}");
-    assert_eq!(done["tool_calls"][0]["id"], "tc-1");
-    assert_eq!(done["tool_calls"][0]["status"], "completed");
+    // A wait returns the turn's reply, not its tool calls (issue #104).
+    assert!(done.get("tool_calls").is_none(), "{done}");
 
     let result = call_json(&tools, "result", json!({"session_id": sid})).await;
     assert_eq!(result["reply"], "Hello abworld");
@@ -421,7 +421,7 @@ async fn bound_wait(
             call_with(
                 &tools,
                 "wait",
-                json!({"session_id": sid, "expect_secs": 60}),
+                json!({"session_id": sid, "expect_secs": 60, "json": true}),
                 aither_core::llm::tool::ToolContext::with_progress(Ping(tx)),
             )
             .await
@@ -1164,11 +1164,12 @@ async fn wait_any_reports_overrun() {
 }
 
 /// `--max-wait` is the wait's own deadline: it returns `state: "running"`
-/// with an activity digest measured from the tool calls' recorded
-/// timestamps — the still-open call named as the longest, repeated titles
-/// counted, and the mid-window edit's end measured.
+/// — the turn's detail lives in the transcript, not the result — and the
+/// prose form is the short paragraph naming the session, turn, elapsed
+/// time against `--expect`, and `acpsub transcript`. `wait_any` takes the
+/// same bound on the longest-running watched turn.
 #[tokio::test(flavor = "multi_thread")]
-async fn wait_max_wait_returns_activity_digest() {
+async fn wait_max_wait_reports_still_running() {
     if !python3() {
         eprintln!("skipping: python3 not found");
         return;
@@ -1184,61 +1185,38 @@ async fn wait_max_wait_returns_activity_digest() {
     )
     .await;
     assert_eq!(out["state"], "running", "{out}");
-    let digest = &out["digest"];
-    let window = digest["window_secs"].as_f64().expect("window_secs");
-    assert!((1.9..10.0).contains(&window), "{digest}");
-    // tc-1, tc-edit, tc-sleep and the three "run check" calls all overlap
-    // the window.
-    assert_eq!(digest["tool_calls"], 6, "{digest}");
-    // tc-sleep is the only call still open at the deadline: it owns the
-    // window's wall time and the top of the longest list.
-    let longest = digest["longest_tool_calls"]
-        .as_array()
-        .expect("longest_tool_calls");
-    assert_eq!(longest[0]["id"], "tc-sleep", "{digest}");
-    assert_eq!(longest[0]["title"], "run sleep 300", "{digest}");
-    // Its recorded start can land inside the window when update traffic
-    // lags under load; it still owns most of the window's wall time.
-    assert!(
-        longest[0]["duration_secs"].as_f64().expect("duration_secs") >= window / 2.0,
-        "{digest}"
-    );
-    assert_eq!(
-        digest["repeated_titles"],
-        json!([{"title": "run check", "count": 3}]),
-        "{digest}"
-    );
-    // The edit finished ~0.3 s in, inside the window.
-    let since_edit = digest["secs_since_last_edit"]
-        .as_f64()
-        .expect("secs_since_last_edit");
-    assert!(since_edit > 0.1 && since_edit < window, "{digest}");
-    assert_eq!(digest["latest_tool_call"]["id"], "tc-edit", "{digest}");
-    // Same lag margin: the open call plus the two ~0.3 s calls put most of
-    // the window's wall time inside tool calls.
-    assert!(
-        digest["tool_call_share"].as_f64().expect("tool_call_share") >= 0.5,
-        "{digest}"
-    );
+    assert!(out.get("digest").is_none(), "{out}");
 
-    // An overrun carries the same digest — over that wait's own window,
-    // where only the still-running call remains in scope.
-    let over = call_json(
+    // The prose default: one short paragraph — session, turn, still
+    // running, elapsed vs --expect, and the transcript pointer.
+    let text = call_text(
+        &tools,
+        "wait",
+        json!({"session_id": sid.as_str(), "expect_secs": 60, "max_wait_secs": 1}),
+    )
+    .await;
+    assert!(
+        text.starts_with(&format!("Session {sid} turn 1 is still running")),
+        "{text}"
+    );
+    assert!(text.contains("--expect of 60s"), "{text}");
+    assert!(text.contains(&format!("acpsub transcript {sid}")), "{text}");
+
+    // An overrun reports the same paragraph shape.
+    let over = call_text(
         &tools,
         "wait",
         json!({"session_id": sid.as_str(), "expect_secs": 4}),
     )
     .await;
-    assert_eq!(over["state"], "overrun", "{over}");
-    let digest = &over["digest"];
-    assert_eq!(digest["tool_calls"], 1, "{digest}");
-    assert_eq!(
-        digest["longest_tool_calls"][0]["id"], "tc-sleep",
-        "{digest}"
+    assert!(
+        over.starts_with(&format!("Session {sid} turn 1 is still running")),
+        "{over}"
     );
-    assert_eq!(digest["repeated_titles"], json!([]), "{digest}");
+    assert!(over.contains("--expect of 4s"), "{over}");
 
-    // `wait_any` takes the same bound and reports the same digest.
+    // `wait_any` takes the same bound and reports the longest-running
+    // watched turn.
     let any = call_json(
         &tools,
         "wait_any",
@@ -1247,12 +1225,33 @@ async fn wait_max_wait_returns_activity_digest() {
     .await;
     assert_eq!(any["state"], "running", "{any}");
     assert_eq!(any["session_id"], sid, "{any}");
-    assert_eq!(any["digest"]["tool_calls"], 1, "{any}");
-    assert_eq!(
-        any["digest"]["longest_tool_calls"][0]["id"], "tc-sleep",
-        "{any}"
-    );
     call_json(&tools, "cancel", json!({"session_id": sid})).await;
+}
+
+/// A finished turn's wait output is the outcome line — session, turn and
+/// outcome — then the turn's final assistant message verbatim, nothing
+/// else (#104).
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_on_a_finished_turn_prints_outcome_line_then_reply() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, tools) = test_state(dir.path());
+    let sid = spawn_id(&tools, spawn_args(dir.path(), "hi")).await;
+
+    let text = call_text(
+        &tools,
+        "wait",
+        json!({"session_id": sid.as_str(), "expect_secs": 60}),
+    )
+    .await;
+    assert_eq!(
+        text,
+        format!("Session {sid}, turn 1: done (end_turn)\n\nHello abworld\n"),
+        "{text}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2988,8 +2987,8 @@ async fn rate_limit_refuses_spawn_and_send() {
 /// A `wait` armed on a session already parked does not end on the park:
 /// it freezes, and once the limit lifts it follows the resumed turn to
 /// its end — the parked seconds never count against `expect_secs`. A
-/// `max_wait_secs` shorter than the park returns its activity digest with
-/// the session still `rate_limited`.
+/// `max_wait_secs` shorter than the park returns the session still
+/// `rate_limited`.
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_on_parked_session_follows_resumed_turn() {
     if !python3() {
@@ -3014,7 +3013,6 @@ async fn wait_on_parked_session_follows_resumed_turn() {
     .await;
     assert_eq!(bounded["state"], "rate_limited", "{bounded}");
     assert!(bounded["resume_at"].is_string(), "{bounded}");
-    assert!(bounded["digest"].is_object(), "{bounded}");
 
     // The provider's limit lifts: the continuation runs in the same
     // session, and the wait that was armed on the park ends with it.
@@ -3407,7 +3405,7 @@ async fn close_cancels_restart_resume() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let report = acpsub::client::call(&socket, "daemon/resumed", json!({}), None)
+    let report = acpsub::client::call(&socket, "daemon/resumed", json!({"json": true}), None)
         .await
         .expect("daemon/resumed call");
     assert!(!report.is_error, "daemon/resumed failed");

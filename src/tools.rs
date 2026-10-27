@@ -12,15 +12,15 @@ use std::time::{Duration, Instant};
 
 use aither_acp::{
     ConfigOption, ConfigOptionValue, ConfigSelectOptions, RequestPermissionOutcome, StopReason,
-    ToolKind,
 };
-use aither_core::llm::tool::{Progress, Tool, ToolContext, Tools};
+use aither_core::llm::tool::{Progress, Tool, ToolContext, ToolResult, Tools};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
+use crate::prose;
 use crate::registry::RegistryEntry;
 use crate::state::{
     AppState, Closing, Gate, Inner, Launch, SessionEnd, Status, Subagent, ToolCallSummary, Turn,
@@ -450,132 +450,21 @@ enum WaitOutcome {
     /// state with the reset time and the provider's message.
     RateLimited,
     /// The awaited turn outlived `expect_secs`: the result reports
-    /// `overrun`, the turn's own elapsed time, its latest tool call, and
-    /// the activity digest.
+    /// `overrun`, the turn's own elapsed time and its latest tool call.
     Overrun,
     /// The call's own `max_wait_secs` bound passed first: the result
-    /// reports `running` with the activity digest.
+    /// reports `running`.
     MaxWait,
 }
 
-/// The activity digest a `wait`/`wait_any` result carries on `overrun` and
-/// on a `max_wait_secs` timeout, measured over the window from when the
-/// wait call began to now. Every value comes from the tool calls'
-/// recorded `started_at`/`ended_at`; nothing is classified from command
-/// text.
-///
-/// A call counts toward the window when any of its recorded lifetime
-/// overlaps it — a call that ended before the wait began is excluded, and
-/// a still-running call's duration is measured to now.
-#[derive(Debug, Serialize)]
-struct ActivityDigest {
-    /// The window's length in seconds.
-    window_secs: f64,
-    /// Calls whose recorded lifetime overlaps the window.
-    tool_calls: u64,
-    /// Fraction of window wall time spent inside calls — above 1.0 when
-    /// calls overlap.
-    tool_call_share: f64,
-    /// The five longest calls by in-window duration.
-    longest_tool_calls: Vec<DigestCall>,
-    /// Every title seen three or more times, with its count.
-    repeated_titles: Vec<DigestTitle>,
-    /// Seconds since the most recent edit-kind call (`edit`/`delete`/`move`)
-    /// finished — about 0 while one is still running; `null` when none
-    /// overlaps the window.
-    secs_since_last_edit: Option<f64>,
-    /// The turn's latest tool call summary.
-    latest_tool_call: Option<ToolCallSummary>,
-}
-
-/// A `longest_tool_calls` entry.
-#[derive(Debug, Serialize)]
-struct DigestCall {
-    /// Tool call id.
-    id: String,
-    /// Human-readable title.
-    title: String,
-    /// The call's in-window duration in seconds.
-    duration_secs: f64,
-}
-
-/// A `repeated_titles` entry.
-#[derive(Debug, Serialize)]
-struct DigestTitle {
-    /// The repeated title.
-    title: String,
-    /// How many in-window calls carry it.
-    count: u64,
-}
-
-/// Build the [`ActivityDigest`] of `turn` over the window from
-/// `window_start` to now.
-fn activity_digest(turn: Option<&Turn>, window_start: jiff::Timestamp) -> ActivityDigest {
-    let now = jiff::Timestamp::now();
-    let window_secs = now.duration_since(window_start).as_secs_f64();
-    let mut tool_calls = 0_u64;
-    let mut busy_secs = 0.0_f64;
-    let mut longest: Vec<(&ToolCallSummary, f64)> = Vec::new();
-    let mut titles: BTreeMap<&str, u64> = BTreeMap::new();
-    let mut last_edit_end: Option<jiff::Timestamp> = None;
-    if let Some(turn) = turn {
-        for call in turn.tool_calls.values() {
-            let call_end = call.ended_at.unwrap_or(now);
-            if call_end <= window_start {
-                continue;
-            }
-            tool_calls += 1;
-            let duration = call_end
-                .duration_since(call.started_at.max(window_start))
-                .as_secs_f64();
-            busy_secs += duration;
-            longest.push((call, duration));
-            *titles.entry(call.title.as_str()).or_default() += 1;
-            if matches!(
-                call.kind,
-                Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
-            ) {
-                last_edit_end = Some(last_edit_end.map_or(call_end, |prev| prev.max(call_end)));
-            }
-        }
-    }
-    longest.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let mut repeated: Vec<(&str, u64)> = titles
-        .into_iter()
-        .filter(|(_, count)| *count >= 3)
-        .collect();
-    repeated.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    ActivityDigest {
-        window_secs,
-        tool_calls,
-        tool_call_share: if window_secs > 0.0 {
-            busy_secs / window_secs
-        } else {
-            0.0
-        },
-        longest_tool_calls: longest
-            .iter()
-            .take(5)
-            .map(|(call, duration)| DigestCall {
-                id: call.id.clone(),
-                title: call.title.clone(),
-                duration_secs: *duration,
-            })
-            .collect(),
-        repeated_titles: repeated
-            .iter()
-            .map(|(title, count)| DigestTitle {
-                title: (*title).to_string(),
-                count: *count,
-            })
-            .collect(),
-        secs_since_last_edit: last_edit_end.map(|end| now.duration_since(end).as_secs_f64()),
-        latest_tool_call: turn.and_then(|turn| {
-            turn.latest_tool_call
-                .as_ref()
-                .and_then(|id| turn.tool_calls.get(id))
-                .cloned()
-        }),
+/// Answer a tool call: the structured `view` when `json` was set, its
+/// prose rendering otherwise. Both describe the same value, so the two
+/// forms can never disagree.
+fn emit(json: bool, view: Value, prose: impl FnOnce(&Value) -> String) -> ToolResult {
+    if json {
+        ToolResult::json_value(view)
+    } else {
+        ToolResult::text(prose(&view))
     }
 }
 
@@ -634,23 +523,19 @@ fn pending_view(perm: &crate::state::PendingPermission) -> Value {
 /// outlived `expect_secs`: the result reports `overrun`, the turn's own
 /// elapsed time, and its latest tool call. `awaited` is the turn the call
 /// bound to (see [`awaited_turn`]); `None` reports the latest turn, the
-/// shape a wait on a non-running subagent has always had. `window_start`
-/// is when the wait call began — the base of the activity digest an
-/// `Overrun`/`MaxWait` outcome carries.
+/// shape a wait on a non-running subagent has always had.
 fn wait_view(
     sub: &Subagent,
     started: Instant,
     outcome: WaitOutcome,
     awaited: Option<u64>,
-    window_start: jiff::Timestamp,
 ) -> Value {
-    let snap = wait_snapshot(sub, outcome, awaited, window_start);
+    let snap = wait_snapshot(sub, awaited);
     let mut view = json!({
         "session_id": sub.session_id,
         "state": snap.status.name(),
         "turn": snap.turn_n,
         "reply": snap.reply,
-        "tool_calls": snap.tool_calls,
         "queued": snap.queued,
         "elapsed_secs": started.elapsed().as_secs_f64(),
         "steers": snap.steers,
@@ -703,10 +588,6 @@ fn wait_view(
     if let Some(pending) = snap.pending {
         view["pending_permission"] = pending;
     }
-    if let Some(digest) = snap.digest {
-        view["digest"] = serde_json::to_value(digest)
-            .expect("ActivityDigest holds only owned primitives; serialization cannot fail");
-    }
     view
 }
 
@@ -716,8 +597,6 @@ struct WaitSnapshot {
     status: Status,
     /// The reported turn's concatenated reply text.
     reply: String,
-    /// The reported turn's tool calls, in the order they started.
-    tool_calls: Vec<ToolCallSummary>,
     /// The first queued permission request's view, when any wait.
     pending: Option<Value>,
     /// The reported turn's number — the awaited turn's when it is bound.
@@ -730,30 +609,12 @@ struct WaitSnapshot {
     latest: Option<ToolCallSummary>,
     /// The awaited turn's stop reason — `None` on the latest-turn view.
     ended_reason: Option<StopReason>,
-    /// The activity digest an `Overrun`/`MaxWait` outcome carries.
-    digest: Option<ActivityDigest>,
     /// The reported turn's steer resolutions (`turn_steer_view`).
     steers: Vec<Value>,
 }
 
-/// `turn`'s tool calls in the order they started, ties by id. The map is
-/// keyed by id for update lookups, and an agent's ids carry no time order
-/// — Devin's `read:…` ids sort after its `edit:…` and `exec:…` ones — so
-/// the map order would end the list on whatever id sorts last.
-fn tool_calls_in_start_order(turn: &Turn) -> Vec<ToolCallSummary> {
-    let mut calls: Vec<ToolCallSummary> = turn.tool_calls.values().cloned().collect();
-    // Stable: equal starts keep the map's id order.
-    calls.sort_by_key(|call| call.started_at);
-    calls
-}
-
 /// Read the state [`wait_view`] reports under one `inner` lock.
-fn wait_snapshot(
-    sub: &Subagent,
-    outcome: WaitOutcome,
-    awaited: Option<u64>,
-    window_start: jiff::Timestamp,
-) -> WaitSnapshot {
+fn wait_snapshot(sub: &Subagent, awaited: Option<u64>) -> WaitSnapshot {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
     // The awaited turn's own record — the same lookup `result` uses
     // for an explicit turn number: `turns` once settled, `current`
@@ -769,15 +630,10 @@ fn wait_snapshot(
                 .or_else(|| inner.current.as_ref().filter(|turn| turn.n == n))
         },
     );
-    let digest = match outcome {
-        WaitOutcome::Ended | WaitOutcome::RateLimited => None,
-        WaitOutcome::Overrun | WaitOutcome::MaxWait => Some(activity_digest(turn, window_start)),
-    };
     let turn_n = turn.map(|turn| turn.n).or(awaited);
     WaitSnapshot {
         status: inner.status.clone(),
         reply: turn.map_or_else(String::new, |turn| turn.reply.clone()),
-        tool_calls: turn.map_or_else(Vec::new, tool_calls_in_start_order),
         pending: inner.pending.first().map(pending_view),
         turn_n,
         queued: inner.queue.len(),
@@ -793,7 +649,6 @@ fn wait_snapshot(
         ended_reason: turn
             .and_then(|turn| turn.stop_reason)
             .filter(|_| awaited.is_some()),
-        digest,
         steers: turn_steer_view(&inner, turn, turn_n),
     }
 }
@@ -842,6 +697,9 @@ struct SpawnArgs {
     /// Permission policy for this subagent: `allow` auto-approves, `deny`
     /// auto-rejects, `ask` queues requests for the `permit` tool.
     permission: Option<PermissionPolicy>,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 struct SpawnTool(Arc<AppState>);
@@ -851,9 +709,9 @@ impl Tool for SpawnTool {
         Cow::Borrowed("spawn")
     }
     type Arguments = SpawnArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: SpawnArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: SpawnArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         let config = self.0.load_config()?;
         let (agent, _) = config.resolve_agent(args.agent.as_deref())?;
         // A limited quota scope refuses the prompt before any process
@@ -874,7 +732,7 @@ impl Tool for SpawnTool {
             },
         )
         .await?;
-        Ok(spawned_view(&sub))
+        Ok(emit(args.json, spawned_view(&sub), prose::spawned))
     }
 }
 
@@ -915,6 +773,9 @@ struct AdoptArgs {
     mode: Option<String>,
     /// Permission policy override, as in `spawn`.
     permission: Option<PermissionPolicy>,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 struct AdoptTool(Arc<AppState>);
@@ -924,9 +785,9 @@ impl Tool for AdoptTool {
         Cow::Borrowed("adopt")
     }
     type Arguments = AdoptArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: AdoptArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: AdoptArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         // A shipped session lives on in the next generation: adopting it
         // here would run it twice.
         self.0.not_shipped(&args.session_id)?;
@@ -994,7 +855,7 @@ impl Tool for AdoptTool {
             },
         )
         .await?;
-        Ok(spawned_view(&sub))
+        Ok(emit(args.json, spawned_view(&sub), prose::spawned))
     }
 }
 
@@ -1038,6 +899,9 @@ struct SendArgs {
     /// that landed behind the turn's end still runs and resolves as a
     /// turn of its own.
     policy: SendPolicy,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 /// Delivery policy for `send` while a turn is running — no default, the
@@ -1062,9 +926,9 @@ impl Tool for SendTool {
         Cow::Borrowed("send")
     }
     type Arguments = SendArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: SendArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: SendArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         let sub = self.0.get(&args.session_id)?;
         // A limited quota scope refuses the prompt: it would burn a
         // request that is bound to fail, and the caller decides what to do.
@@ -1127,11 +991,15 @@ impl Tool for SendTool {
                         }
                         Action::Queued(position) => {
                             sub.rt.notify.notify_waiters();
-                            return Ok(json!({
-                                "session_id": args.session_id,
-                                "state": "queued",
-                                "position": position,
-                            }));
+                            return Ok(emit(
+                                args.json,
+                                json!({
+                                    "session_id": args.session_id,
+                                    "state": "queued",
+                                    "position": position,
+                                }),
+                                prose::send,
+                            ));
                         }
                         Action::Fresh => {
                             match start_turn(self.0.clone(), &sub, args.prompt.clone()).await {
@@ -1143,9 +1011,17 @@ impl Tool for SendTool {
                     }
                 }
             }
-            SendPolicy::Steer => return steer_send(&self.0, &sub, &args).await,
+            SendPolicy::Steer => {
+                return steer_send(&self.0, &sub, &args)
+                    .await
+                    .map(|view| emit(args.json, view, prose::send));
+            }
         }
-        Ok(json!({"session_id": args.session_id, "state": "running"}))
+        Ok(emit(
+            args.json,
+            json!({"session_id": args.session_id, "state": "running"}),
+            prose::send,
+        ))
     }
 }
 
@@ -1227,18 +1103,17 @@ async fn steer_send(
 /// `turn` with the number of the turn it ran as when it landed behind the
 /// target's end (`pending` while still in flight on an early return).
 ///
-/// Returns the subagent state (`done`/`cancelled`/`failed`/`exited`/
-/// `needs_permission`), the turn's `reply` (concatenated agent message
-/// text), its tool calls, and — when `needs_permission` — the
-/// `pending_permission` request to answer with `permit`. When the turn has
-/// run longer than `expect_secs` the result is `overrun`, carrying the
-/// turn's elapsed time and its latest tool call: an overrun is to be
-/// investigated (`status`, `transcript`, a `send` steer), not re-waited
-/// with a larger expectation.
-///
-/// Both an `overrun` result and a `max_wait_secs` timeout carry an
-/// activity `digest` measured over the window since the wait began —
-/// its fields are documented on [`ActivityDigest`].
+/// Returns prose: a turn that ended is one outcome line — session, turn
+/// and outcome — followed by the turn's final assistant message, with a
+/// `needs_permission` wait also naming the request to answer with
+/// `permit`. A turn still running — `overrun` past `expect_secs`, or a
+/// `max_wait_secs` expiry — is one short paragraph naming the session,
+/// turn, elapsed time against `expect_secs`, and `acpsub transcript` as
+/// the place to look; an overrun is to be investigated (`status`,
+/// `transcript`, a `send` steer), not re-waited with a larger
+/// expectation. `json` returns the structured form instead: `state`,
+/// `turn`, `reply`, `steers`, `pending_permission`, and
+/// friends.
 ///
 /// While this call is in flight it feeds the session's watchdog: a
 /// running turn with no attached `wait`/`wait_any` caller past the
@@ -1257,12 +1132,14 @@ struct WaitArgs {
     /// Optional: the wait call's own deadline in seconds, measured from
     /// when the wait began — unlike `expect_secs` it bounds the wait, not
     /// the turn. When it passes before the awaited turn ends or overruns,
-    /// the wait returns `state: "running"` with an activity `digest` of
-    /// the window (fields documented on `ActivityDigest`), rather than
-    /// dying silent under a caller-side kill limit — set it just below
-    /// the caller's own timeout. Values beyond 1800 are rejected unless
-    /// `long` is set.
+    /// the wait reports the turn as still running and points at the
+    /// transcript, rather than dying silent under a caller-side kill
+    /// limit — set it just below the caller's own timeout. Values beyond
+    /// 1800 are rejected unless `long` is set.
     max_wait_secs: Option<u64>,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
     /// Optional: lift the 1800-second (30-minute) limit on `expect_secs`
     /// and `max_wait_secs` for this call — a local subagent is meant for
     /// short execution, so a wait armed longer is rejected as a planning
@@ -1281,20 +1158,17 @@ impl Tool for WaitTool {
         Cow::Borrowed("wait")
     }
     type Arguments = WaitArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: WaitArgs, mut cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: WaitArgs, mut cx: ToolContext) -> aither_core::Result<ToolResult> {
         check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let sub = self.state.get(&args.session_id)?;
         let started = Instant::now();
-        let window_start = jiff::Timestamp::now();
         let Some(awaited) = awaited_turn(&sub)? else {
-            return Ok(wait_view(
-                &sub,
-                started,
-                WaitOutcome::Ended,
-                None,
-                window_start,
+            return Ok(emit(
+                args.json,
+                wait_view(&sub, started, WaitOutcome::Ended, None),
+                |view| prose::wait(view, args.expect_secs),
             ));
         };
         // Refused before the wait attaches: an expectation the turn has
@@ -1376,12 +1250,10 @@ impl Tool for WaitTool {
                 }
             }
         };
-        Ok(wait_view(
-            &sub,
-            started,
-            outcome,
-            Some(awaited),
-            window_start,
+        Ok(emit(
+            args.json,
+            wait_view(&sub, started, outcome, Some(awaited)),
+            |view| prose::wait(view, args.expect_secs),
         ))
     }
 }
@@ -1392,9 +1264,9 @@ impl Tool for WaitTool {
 /// `expect_secs` — then return that one's wait-style result. An overrun
 /// is to be investigated, not re-waited with a larger number.
 ///
-/// On a `max_wait_secs` timeout the result is the longest-running watched
-/// turn's `running` state with its activity digest — the same shape
-/// `wait` reports, documented there.
+/// On a `max_wait_secs` timeout the result reports the longest-running
+/// watched turn as still running — the same prose or JSON `wait` emits,
+/// documented there.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitAnyArgs {
     /// Session ids to watch.
@@ -1406,14 +1278,17 @@ struct WaitAnyArgs {
     /// minutes) are rejected unless `long` is set.
     expect_secs: u64,
     /// Optional: the wait call's own deadline in seconds, as in `wait` —
-    /// on expiry the result is the longest-running watched turn's
-    /// `running` state with its activity `digest`. Values beyond 1800 are
-    /// rejected unless `long` is set.
+    /// on expiry the result reports the longest-running watched turn as
+    /// still running. Values beyond 1800 are rejected unless `long` is
+    /// set.
     max_wait_secs: Option<u64>,
     /// Optional: lift the 1800-second (30-minute) limit on `expect_secs`
     /// and `max_wait_secs` for this call, as in `wait`.
     #[serde(default)]
     long: bool,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 struct WaitAnyTool {
@@ -1426,9 +1301,13 @@ impl Tool for WaitAnyTool {
         Cow::Borrowed("wait_any")
     }
     type Arguments = WaitAnyArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: WaitAnyArgs, mut cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(
+        &self,
+        args: WaitAnyArgs,
+        mut cx: ToolContext,
+    ) -> aither_core::Result<ToolResult> {
         check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let subs = args
             .session_ids
@@ -1436,7 +1315,6 @@ impl Tool for WaitAnyTool {
             .map(|session_id| self.state.get(session_id))
             .collect::<Result<Vec<_>>>()?;
         let started = Instant::now();
-        let window_start = jiff::Timestamp::now();
         // Each watched session binds to the turn in flight at call time,
         // the same rule `wait` applies to one.
         let awaited = subs
@@ -1464,31 +1342,25 @@ impl Tool for WaitAnyTool {
             for index in 0..subs.len() {
                 let sub = &subs[index];
                 let Some(n) = awaited[index] else {
-                    return Ok(wait_view(
-                        sub,
-                        started,
-                        WaitOutcome::Ended,
-                        None,
-                        window_start,
+                    return Ok(emit(
+                        args.json,
+                        wait_view(sub, started, WaitOutcome::Ended, None),
+                        |view| prose::wait(view, args.expect_secs),
                     ));
                 };
                 match awaited_elapsed(sub, n)? {
                     Awaited::Ended => {
-                        return Ok(wait_view(
-                            sub,
-                            started,
-                            WaitOutcome::Ended,
-                            Some(n),
-                            window_start,
+                        return Ok(emit(
+                            args.json,
+                            wait_view(sub, started, WaitOutcome::Ended, Some(n)),
+                            |view| prose::wait(view, args.expect_secs),
                         ));
                     }
                     Awaited::RateLimited => {
-                        return Ok(wait_view(
-                            sub,
-                            started,
-                            WaitOutcome::RateLimited,
-                            Some(n),
-                            window_start,
+                        return Ok(emit(
+                            args.json,
+                            wait_view(sub, started, WaitOutcome::RateLimited, Some(n)),
+                            |view| prose::wait(view, args.expect_secs),
                         ));
                     }
                     // Parked rate-limited: nothing running to compare.
@@ -1496,12 +1368,10 @@ impl Tool for WaitAnyTool {
                     // A steer hold counts like the turn it extends.
                     Awaited::Running(elapsed) | Awaited::Steers(elapsed) => {
                         if elapsed >= expect {
-                            return Ok(wait_view(
-                                sub,
-                                started,
-                                WaitOutcome::Overrun,
-                                Some(n),
-                                window_start,
+                            return Ok(emit(
+                                args.json,
+                                wait_view(sub, started, WaitOutcome::Overrun, Some(n)),
+                                |view| prose::wait(view, args.expect_secs),
                             ));
                         }
                         poll = poll.min(Duration::from_secs_f64(expect - elapsed));
@@ -1515,12 +1385,10 @@ impl Tool for WaitAnyTool {
             if deadline.is_some_and(|deadline| now >= deadline)
                 && let Some(index) = max_wait_index(longest, &awaited)
             {
-                return Ok(wait_view(
-                    &subs[index],
-                    started,
-                    WaitOutcome::MaxWait,
-                    awaited[index],
-                    window_start,
+                return Ok(emit(
+                    args.json,
+                    wait_view(&subs[index], started, WaitOutcome::MaxWait, awaited[index]),
+                    |view| prose::wait(view, args.expect_secs),
                 ));
             }
             if now >= next_report {
@@ -1581,6 +1449,9 @@ async fn report_longest(
 struct StatusArgs {
     /// Session id, as returned by `spawn`/`adopt`.
     session_id: String,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 struct StatusTool(Arc<AppState>);
@@ -1590,10 +1461,14 @@ impl Tool for StatusTool {
         Cow::Borrowed("status")
     }
     type Arguments = StatusArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: StatusArgs, _cx: ToolContext) -> aither_core::Result<Value> {
-        self.status(args).await.map_err(Into::into)
+    async fn call(&self, args: StatusArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+        let json = args.json;
+        self.status(args)
+            .await
+            .map(|view| emit(json, view, prose::status))
+            .map_err(Into::into)
     }
 }
 
@@ -1708,6 +1583,9 @@ struct ResultArgs {
     session_id: String,
     /// 1-based turn number; defaults to the latest turn.
     turn: Option<u64>,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 struct ResultTool(Arc<AppState>);
@@ -1717,10 +1595,13 @@ impl Tool for ResultTool {
         Cow::Borrowed("result")
     }
     type Arguments = ResultArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: ResultArgs, _cx: ToolContext) -> aither_core::Result<Value> {
-        self.result(&args).await.map_err(Into::into)
+    async fn call(&self, args: ResultArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+        self.result(&args)
+            .await
+            .map(|view| emit(args.json, view, prose::result))
+            .map_err(Into::into)
     }
 }
 
@@ -1772,6 +1653,9 @@ impl ResultTool {
 struct CancelArgs {
     /// Session id, as returned by `spawn`/`adopt`.
     session_id: String,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 struct CancelTool(Arc<AppState>);
@@ -1781,9 +1665,9 @@ impl Tool for CancelTool {
         Cow::Borrowed("cancel")
     }
     type Arguments = CancelArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: CancelArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: CancelArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         let sub = self.0.get(&args.session_id)?;
         let (dropped, turn_n) = {
             let mut inner = sub.rt.inner.lock().expect("inner poisoned");
@@ -1807,7 +1691,11 @@ impl Tool for CancelTool {
                 agent: args.session_id.clone(),
                 source,
             })?;
-        Ok(json!({"session_id": args.session_id, "cancelled": true}))
+        Ok(emit(
+            args.json,
+            json!({"session_id": args.session_id, "cancelled": true}),
+            prose::cancel,
+        ))
     }
 }
 
@@ -1823,6 +1711,9 @@ struct PermitArgs {
     request_id: String,
     /// The option id to select (one of the request's `options`).
     option_id: String,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 struct PermitTool(Arc<AppState>);
@@ -1832,14 +1723,18 @@ impl Tool for PermitTool {
         Cow::Borrowed("permit")
     }
     type Arguments = PermitArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
     fn call(
         &self,
         args: PermitArgs,
         _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        std::future::ready(self.permit(&args).map_err(Into::into))
+    ) -> impl Future<Output = aither_core::Result<ToolResult>> + Send {
+        std::future::ready(
+            self.permit(&args)
+                .map(|view| emit(args.json, view, prose::permit))
+                .map_err(Into::into),
+        )
     }
 }
 
@@ -1968,7 +1863,11 @@ impl Tool for TranscriptTool {
 /// List subagents: live ones with their state, and registered (closed but
 /// resumable) ones from the registry.
 #[derive(Debug, Deserialize, JsonSchema)]
-struct ListArgs {}
+struct ListArgs {
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
+}
 
 struct ListTool(Arc<AppState>);
 
@@ -2040,10 +1939,10 @@ impl Tool for ListTool {
         Cow::Borrowed("list")
     }
     type Arguments = ListArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, _args: ListArgs, _cx: ToolContext) -> aither_core::Result<Value> {
-        Ok(self.list().await)
+    async fn call(&self, args: ListArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+        Ok(emit(args.json, self.list().await, prose::list))
     }
 }
 
@@ -2110,6 +2009,9 @@ impl ListTool {
 struct CloseArgs {
     /// Session id, as returned by `spawn`/`adopt`.
     session_id: String,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 struct CloseTool(Arc<AppState>);
@@ -2119,9 +2021,9 @@ impl Tool for CloseTool {
         Cow::Borrowed("close")
     }
     type Arguments = CloseArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: CloseArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: CloseArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         let found = end_target(&self.0, &args.session_id, false);
         if matches!(found, SessionEnd::Missing) {
             self.0.not_shipped(&args.session_id)?;
@@ -2129,15 +2031,23 @@ impl Tool for CloseTool {
         match found {
             SessionEnd::Live(sub) => {
                 end_session(&self.0, &sub).await;
-                Ok(json!({"session_id": args.session_id, "closed": true}))
+                Ok(emit(
+                    args.json,
+                    json!({"session_id": args.session_id, "closed": true}),
+                    prose::close,
+                ))
             }
             SessionEnd::Launching => {
                 unschedule_resume(&self.0, &args.session_id).await;
-                Ok(json!({
-                    "session_id": args.session_id,
-                    "closed": true,
-                    "launch_in_flight": true,
-                }))
+                Ok(emit(
+                    args.json,
+                    json!({
+                        "session_id": args.session_id,
+                        "closed": true,
+                        "launch_in_flight": true,
+                    }),
+                    prose::close,
+                ))
             }
             SessionEnd::Missing
                 if self
@@ -2149,7 +2059,11 @@ impl Tool for CloseTool {
                     .is_some() =>
             {
                 unschedule_resume(&self.0, &args.session_id).await;
-                Ok(json!({"session_id": args.session_id, "closed": true, "was_live": false}))
+                Ok(emit(
+                    args.json,
+                    json!({"session_id": args.session_id, "closed": true, "was_live": false}),
+                    prose::close,
+                ))
             }
             SessionEnd::Missing => Err(Error::UnknownSession(args.session_id).into()),
         }
@@ -2162,6 +2076,9 @@ impl Tool for CloseTool {
 struct ForgetArgs {
     /// Session id, as returned by `spawn`/`adopt`.
     session_id: String,
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
 }
 
 struct ForgetTool(Arc<AppState>);
@@ -2171,9 +2088,9 @@ impl Tool for ForgetTool {
         Cow::Borrowed("forget")
     }
     type Arguments = ForgetArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: ForgetArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: ForgetArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         // Same in-flight handling as `close`: a `session/load` launch
         // holding the id gets its reservation marked closed and
         // forgotten — `release_reservation` ends the session as it lands
@@ -2191,15 +2108,23 @@ impl Tool for ForgetTool {
             })
             .await?;
         match found {
-            SessionEnd::Launching => Ok(json!({
-                "session_id": args.session_id,
-                "forgotten": true,
-                "launch_in_flight": true,
-            })),
+            SessionEnd::Launching => Ok(emit(
+                args.json,
+                json!({
+                    "session_id": args.session_id,
+                    "forgotten": true,
+                    "launch_in_flight": true,
+                }),
+                prose::forget,
+            )),
             SessionEnd::Missing if !registered => {
                 Err(Error::UnknownSession(args.session_id).into())
             }
-            _ => Ok(json!({"session_id": args.session_id, "forgotten": true})),
+            _ => Ok(emit(
+                args.json,
+                json!({"session_id": args.session_id, "forgotten": true}),
+                prose::forget,
+            )),
         }
     }
 }
@@ -2207,7 +2132,11 @@ impl Tool for ForgetTool {
 /// List the configured agents; for agents with a live subagent also report
 /// their `agentInfo`, modes, and config options.
 #[derive(Debug, Deserialize, JsonSchema)]
-struct AgentsArgs {}
+struct AgentsArgs {
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
+}
 
 struct AgentsTool(Arc<AppState>);
 
@@ -2216,14 +2145,18 @@ impl Tool for AgentsTool {
         Cow::Borrowed("agents")
     }
     type Arguments = AgentsArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
     fn call(
         &self,
-        _args: AgentsArgs,
+        args: AgentsArgs,
         _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
-        std::future::ready(self.agents().map_err(Into::into))
+    ) -> impl Future<Output = aither_core::Result<ToolResult>> + Send {
+        std::future::ready(
+            self.agents()
+                .map(|view| emit(args.json, view, prose::agents))
+                .map_err(Into::into),
+        )
     }
 }
 
@@ -2337,7 +2270,11 @@ fn config_option_view(option: &ConfigOption) -> Value {
 /// still in flight — they hand off and resume when it ends). All lists
 /// are empty on a daemon that did not take over from a previous one.
 #[derive(Debug, Deserialize, JsonSchema)]
-struct ResumedArgs {}
+struct ResumedArgs {
+    /// Return the structured JSON form instead of prose.
+    #[serde(default)]
+    json: bool,
+}
 
 struct ResumedTool(Arc<AppState>);
 
@@ -2346,13 +2283,13 @@ impl Tool for ResumedTool {
         Cow::Borrowed("daemon/resumed")
     }
     type Arguments = ResumedArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
     fn call(
         &self,
-        _args: ResumedArgs,
+        args: ResumedArgs,
         _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Value>> + Send {
+    ) -> impl Future<Output = aither_core::Result<ToolResult>> + Send {
         let mut report = self
             .0
             .resume_report
@@ -2380,7 +2317,8 @@ impl Tool for ResumedTool {
                 .cloned(),
         );
         report.pending = pending;
-        std::future::ready(Ok(serde_json::to_value(report).unwrap_or_default()))
+        let view = serde_json::to_value(report).unwrap_or_default();
+        std::future::ready(Ok(emit(args.json, view, prose::resumed)))
     }
 }
 
@@ -2442,38 +2380,5 @@ mod tests {
         ));
         assert!(check_expect(&cx, 7200, Some(7200), true).is_ok());
         assert!(check_expect(&cx, 7200, None, false).is_err());
-    }
-
-    /// A wait lists a turn's tool calls by start, not by id: Devin-style
-    /// ids whose sort order runs opposite to the calls' starts come back
-    /// in start order, and calls sharing a start fall back to id order.
-    #[test]
-    fn tool_calls_listed_in_start_order() {
-        let start = jiff::Timestamp::from_second(1_800_000_000).expect("valid timestamp");
-        let call = |id: &str, offset_secs: i64| ToolCallSummary {
-            id: id.to_string(),
-            title: id.to_string(),
-            kind: None,
-            status: None,
-            locations: Vec::new(),
-            started_at: start
-                .checked_add(jiff::SignedDuration::from_secs(offset_secs))
-                .expect("in range"),
-            ended_at: None,
-        };
-        let mut turn = Turn::default();
-        for summary in [
-            call("read:4#a", 0),
-            call("read:5#b", 0),
-            call("edit:0#c", 60),
-            call("exec:0#d", 120),
-        ] {
-            turn.tool_calls.insert(summary.id.clone(), summary);
-        }
-        let ids: Vec<String> = tool_calls_in_start_order(&turn)
-            .into_iter()
-            .map(|call| call.id)
-            .collect();
-        assert_eq!(ids, ["read:4#a", "read:5#b", "edit:0#c", "exec:0#d"]);
     }
 }

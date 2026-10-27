@@ -276,7 +276,7 @@ impl ClientHandler for SubagentHandler {
 
 /// Record a `tool_call` update: insert the call's summary with the
 /// sighting as `started_at`, and `ended_at` when it arrives already
-/// terminal. These timestamps are what `wait`'s digest measures from.
+/// terminal.
 pub(crate) fn note_tool_call(turn: &mut Turn, call: ToolCall) {
     let seen = jiff::Timestamp::now();
     turn.latest_tool_call = Some(call.tool_call_id.clone());

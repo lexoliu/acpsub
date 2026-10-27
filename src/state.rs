@@ -499,9 +499,9 @@ pub struct ToolCallSummary {
     /// Affected locations.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<ToolCallLocation>,
-    /// When the call first appeared in a `session/update` — the start every
-    /// digest duration is measured from. Always set: a summary exists only
-    /// because an update carrying the call's id was seen.
+    /// When the call first appeared in a `session/update`. Always set: a
+    /// summary exists only because an update carrying the call's id was
+    /// seen.
     pub started_at: jiff::Timestamp,
     /// When the call first reached a terminal status (`completed` or
     /// `failed`); absent while it is still running.

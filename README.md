@@ -97,21 +97,25 @@ file that fails to parse is a tool error, never a stale fallback.
 
 | tool | arguments | behaviour |
 |---|---|---|
-| `spawn` | `cwd, prompt, model?, mode?, agent?, config?, permission?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. `model`/`mode` are required when the agent advertises a `model` option / session modes and must be omitted when it does not (the calls are skipped). Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. While a rate limit holds in the agent's quota scope it fails instead (see **Rate limits** below). |
-| `adopt` | `session_id, model?, mode?, agent?, cwd?, prompt?, permission?` | Take over an existing ACP session via `session/load` — a registered (closed) session, a live `exited` one (the dead runtime is reaped, no `close` needed), or an external one such as a Devin session created elsewhere. Same `model`/`mode` rule as `spawn`. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
-| `send` | `session_id, prompt, policy` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled`/`failed` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not reject it; agents configured `steer = "folded"` never answer it and the steer settles folded at the turn's end), returning `{state: "submitted", steer_id, turn}` at once — ACP has no acknowledgement to wait for, so the resolution is reported elsewhere: `status`'s `steers` list while it is in flight, `wait`'s `steers` on the target turn once resolved. On a promptable subagent all three just start the turn: `{state: "running"}`. While a rate limit holds in the session's quota scope, `send` fails under every policy (see **Rate limits** below). |
-| `wait` | `session_id, expect_secs, max_wait_secs?, long?` | Block until the turn ends — and every steer that targeted it has resolved — a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. `expect_secs` and `max_wait_secs` over 1800 (30 minutes) are rejected unless `long` is set. Returns `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, steers, pending_permission?, digest?, resume_at?, reason?}`; `steers` lists each steer that targeted the awaited turn with its outcome — `folded`, `rejected` with the agent's `error` text, or `turn` with the number of the turn it ran as when it landed behind the target's end (`pending` while still in flight on an early return); a wait called on a settled session whose steers are still in flight binds to their target turn, and the hold counts against `expect_secs` from the turn's start, so a steer the agent never answers ends the wait as an `overrun`. A turn past its budget reports `state: "overrun"` with the turn's `elapsed_secs` and `latest_tool_call`. `max_wait_secs` bounds the wait call itself: when it passes first, the result is `state: "running"` with an activity `digest` (below). `overrun` results carry the same digest. A bound turn that ends rate-limited ends the wait at once with `state: "rate_limited"`, `resume_at` and the provider's `reason` (the CLI exits 75, see **Rate limits**); the wait does not follow the parked session into its resumed turn. Calling `wait` on a session that is already parked is the other case: it binds to the turn the resume starts (the continuation, or the first queued prompt) and freezes while parked — the parked seconds never count against `expect_secs` — until that turn ends; if `max_wait_secs` passes first it reports `state: "rate_limited"` with `resume_at` and `reason`. |
-| `wait_any` | `session_ids, expect_secs, max_wait_secs?, long?` | First of them to leave `running` — a turn end (held until its steers resolve, as in `wait`), a turn that ends `rate_limited` (reported as in `wait`), a permission request, or an `overrun`. On a `max_wait_secs` timeout, the longest-running watched turn's `running` state with its `digest`. Same 1800-second limit and `long` opt-in as `wait`. |
-| `status` | `session_id` | State, cwd, agent, model, mode (`null` for agents without them), turns, queued prompts, unresolved steers (`steers`: id and target turn), transcript path — instant check; a parked session also reports `resume_at` and `reason`. |
-| `result` | `session_id, turn?` | The reply of the last (or nth) turn. |
-| `cancel` | `session_id` | Answer pending permissions `cancelled`, send `session/cancel`. |
-| `permit` | `session_id, request_id, option_id` | Answer a queued `ask`-policy permission request. |
+| `spawn` | `cwd, prompt, model?, mode?, agent?, config?, permission?, json?` | Start the process, `initialize`, `session/new`, `set_mode`, `set_config_option`, send the prompt. `model`/`mode` are required when the agent advertises a `model` option / session modes and must be omitted when it does not (the calls are skipped). Returns `{session_id, agent, state, model, mode}` at once — the session id is the handle for every other call. While a rate limit holds in the agent's quota scope it fails instead (see **Rate limits** below). |
+| `adopt` | `session_id, model?, mode?, agent?, cwd?, prompt?, permission?, json?` | Take over an existing ACP session via `session/load` — a registered (closed) session, a live `exited` one (the dead runtime is reaped, no `close` needed), or an external one such as a Devin session created elsewhere. Same `model`/`mode` rule as `spawn`. Returns `{session_id, agent, state, model, mode}`; with `prompt` the first turn starts immediately. |
+| `send` | `session_id, prompt, policy, json?` | Prompt the session; `policy` (required — nothing is queued or injected implicitly) says what a `running`/`needs_permission` subagent does with it: `try` errors unless `idle`/`done`/`cancelled`/`failed` (the original behaviour); `queued` parks it FIFO and fires it as the next turn when the current one ends — dropped if that turn is cancelled or fails, and on `cancel`/`close`/`forget` — returning `{state: "queued", position}`; `steer` injects it into the running turn as a second `session/prompt` (mid-turn steering — agents that support it fold the text into the active task, agents that do not reject it; agents configured `steer = "folded"` never answer it and the steer settles folded at the turn's end), returning `{state: "submitted", steer_id, turn}` at once — ACP has no acknowledgement to wait for, so the resolution is reported elsewhere: `status`'s `steers` list while it is in flight, `wait`'s `steers` on the target turn once resolved. On a promptable subagent all three just start the turn: `{state: "running"}`. While a rate limit holds in the session's quota scope, `send` fails under every policy (see **Rate limits** below). |
+| `wait` | `session_id, expect_secs, max_wait_secs?, long?, json?` | Block until the turn ends — and every steer that targeted it has resolved — a permission is needed, or the turn has run longer than `expect_secs` — required, measured from the turn's recorded start, so re-issuing a wait never extends it. `expect_secs` and `max_wait_secs` over 1800 (30 minutes) are rejected unless `long` is set. A turn that ended prints one outcome line — session, turn and outcome — followed by the turn's final assistant message; a `needs_permission` wait also names the request to answer with `permit`. A turn still running — `overrun` past `expect_secs`, or a `max_wait_secs` expiry — is one short paragraph naming the session, turn, elapsed time against `expect_secs`, and `acpsub transcript` as the place to look. `json` returns the structured form instead: `{state, turn, stop_reason?, reply, tool_calls, queued, elapsed_secs, steers, pending_permission?, resume_at?, reason?}`; `steers` lists each steer that targeted the awaited turn with its outcome — `folded`, `rejected` with the agent's `error` text, or `turn` with the number of the turn it ran as when it landed behind the target's end (`pending` while still in flight on an early return); a wait called on a settled session whose steers are still in flight binds to their target turn, and the hold counts against `expect_secs` from the turn's start, so a steer the agent never answers ends the wait as an `overrun`. A bound turn that ends rate-limited ends the wait at once with `state: "rate_limited"`, `resume_at` and the provider's `reason` (the CLI exits 75, see **Rate limits**); the wait does not follow the parked session into its resumed turn. Calling `wait` on a session that is already parked is the other case: it binds to the turn the resume starts (the continuation, or the first queued prompt) and freezes while parked — the parked seconds never count against `expect_secs` — until that turn ends; if `max_wait_secs` passes first it reports `state: "rate_limited"` with `resume_at` and `reason`. |
+| `wait_any` | `session_ids, expect_secs, max_wait_secs?, long?, json?` | First of them to leave `running` — a turn end (held until its steers resolve, as in `wait`), a turn that ends `rate_limited` (reported as in `wait`), a permission request, or an `overrun`. On a `max_wait_secs` timeout, the longest-running watched turn is reported still running, as in `wait`. Same 1800-second limit and `long` opt-in as `wait`. |
+| `status` | `session_id, json?` | State, cwd, agent, model, mode (`null` for agents without them), turns, queued prompts, unresolved steers (`steers`: id and target turn), transcript path — instant check; a parked session also reports `resume_at` and `reason`. |
+| `result` | `session_id, turn?, json?` | The reply of the last (or nth) turn. |
+| `cancel` | `session_id, json?` | Answer pending permissions `cancelled`, send `session/cancel`. |
+| `permit` | `session_id, request_id, option_id, json?` | Answer a queued `ask`-policy permission request. |
 | `transcript` | `session_id, from?, tail?, full?, thinking?, meta?` | Rendered transcript (same output as the CLI). |
-| `list` | — | Live and registered subagents with state. |
-| `close` | `session_id` | End the process; keep the registry entry (still adoptable). |
-| `forget` | `session_id` | Remove the registry entry (and the process if live). |
-| `agents` | — | Configured agents; for initialised ones their `agentInfo`, modes, config options. |
-| `daemon/resumed` | — | Daemon only: the resume report after a restart — which sessions came back via `session/load`, which failed (with the agent's error), and which the previous generation still owns while their turn runs. |
+| `list` | `json?` | Live and registered subagents with state. |
+| `close` | `session_id, json?` | End the process; keep the registry entry (still adoptable). |
+| `forget` | `session_id, json?` | Remove the registry entry (and the process if live). |
+| `agents` | `json?` | Configured agents; for initialised ones their `agentInfo`, modes, config options. |
+| `daemon/resumed` | `json?` | Daemon only: the resume report after a restart — which sessions came back via `session/load`, which failed (with the agent's error), and which the previous generation still owns while their turn runs. |
+
+Every tool's default output is prose written for an agent to read; pass
+`json: true` (`--json` on the CLI) for the structured form the tables
+describe.
 
 `agent` may be omitted anywhere it appears: the `[defaults].agent` setting
 wins, then a single configured agent is used implicitly; with several agents
@@ -138,30 +142,9 @@ naming the value — pass `long` (CLI `--long`) to lift it for that call.
 `max_wait_secs` is the cap on how long the wait call itself blocks —
 measured from when the wait began, unlike `expect_secs`. It exists
 because a backgrounded `wait` can outlive its host's task limit: set it
-just below that limit and the wait returns `state: "running"` with an
-activity `digest` instead of dying silent. The digest covers the window
-since the wait began, and every value is measured from the tool calls'
-recorded `started_at`/`ended_at` — nothing is classified from command
-text:
-
-```json
-"digest": {
-  "window_secs": 60.1,          // length of the measured window
-  "tool_calls": 6,              // calls whose recorded lifetime overlaps it
-  "tool_call_share": 0.83,      // fraction of window wall time inside calls
-                                //   (> 1 when calls overlap)
-  "longest_tool_calls": [       // up to 5, by in-window duration
-    {"id": "tc-7", "title": "run sleep 300", "duration_secs": 60.1}
-  ],
-  "repeated_titles": [          // every title seen 3+ times
-    {"title": "run check", "count": 3}
-  ],
-  "secs_since_last_edit": 42.7, // since the last edit/delete/move call
-                                //   finished; ~0 while one runs; null
-                                //   when none overlaps the window
-  "latest_tool_call": {"id": "tc-7", "title": "run sleep 300", ...}
-}
-```
+just below that limit and the wait reports the turn as still running —
+the same paragraph an `overrun` prints — instead of dying silent. What
+the turn was doing lives in `acpsub transcript`, not the result.
 
 ## Model
 
@@ -318,7 +301,12 @@ acpsub restart                                  # start the next daemon: it
                                                 #   the resume report
 ```
 
-Client output is the tool's JSON result on stdout; a tool error exits 1 with
+Client output is prose on stdout; `--json` prints the tool's structured
+result instead — a `wait` on a finished turn prints one outcome line
+(session, turn and outcome) then the turn's final assistant message
+verbatim, and an overrun or `--max-wait` expiry prints a short
+"still running" paragraph pointing at `acpsub transcript`. A tool error
+exits 1 with
 the message on stderr — `spawn`, `adopt` and `send` into a rate-limited
 quota scope are such errors. `wait` and `wait-any` exit **75** when the
 awaited turn ended `rate_limited` (the result carries the state, `resume_at`

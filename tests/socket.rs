@@ -79,7 +79,9 @@ impl Daemon {
 
     /// Run a client subcommand and return its stdout as JSON.
     fn call_json(&self, args: &[&str]) -> Value {
-        let output = self.run(args).expect("client runs");
+        let mut args = args.to_vec();
+        args.push("--json");
+        let output = self.run(&args).expect("client runs");
         assert!(
             output.status.success(),
             "{args:?} failed: {}",
@@ -220,7 +222,7 @@ fn client_starts_daemon_when_absent() {
     // No daemon running: `list` must spawn one and still succeed.
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpsub"));
     command
-        .args(["list", "--socket"])
+        .args(["list", "--json", "--socket"])
         .arg(&socket)
         .arg("--config")
         .arg(&config);

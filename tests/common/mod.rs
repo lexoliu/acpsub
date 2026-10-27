@@ -288,8 +288,10 @@ pub async fn call_with(
         .map_err(|error| error.to_string())
 }
 
-/// Call a tool and unwrap a non-error result as JSON.
-pub async fn call_json(tools: &Tools, name: &str, args: Value) -> Value {
+/// Call a tool and unwrap a non-error result as JSON — asserts the
+/// tool's `json` form, which is what every assertion here describes.
+pub async fn call_json(tools: &Tools, name: &str, mut args: Value) -> Value {
+    args["json"] = json!(true);
     let result = call(tools, name, args)
         .await
         .unwrap_or_else(|e| panic!("{name} failed: {e}"));
