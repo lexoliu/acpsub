@@ -1038,7 +1038,17 @@ async fn serve_connection(
         forwarding_tools(&state)
     }
     .map_err(|error| aither_mcp::McpError::InvalidConfig(format!("cannot build tools: {error}")))?;
-    let mut server = McpServer::new(transport, tools, "acpsub", env!("CARGO_PKG_VERSION"));
+    // `serverInfo.version` doubles as this daemon's instance identity:
+    // the pid — already the generation's name (`daemon.<pid>.sock`, the
+    // pid file) — rides as semver build metadata, so a client retrying a
+    // dropped call can tell the process that dropped it from its
+    // replacement.
+    let version = format!(
+        "{}+daemon.{}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
+    let mut server = McpServer::new(transport, tools, "acpsub", version);
     server.run().await
 }
 
