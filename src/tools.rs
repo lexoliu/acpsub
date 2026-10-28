@@ -2328,6 +2328,16 @@ mod tests {
 
     use super::*;
 
+    /// A restart with nothing to resume or hand over renders its prose
+    /// report: the view carries every list the prose reads, even empty.
+    #[test]
+    fn empty_resume_report_renders_prose() {
+        let view = serde_json::to_value(crate::state::ResumeReport::default())
+            .expect("the report serializes");
+        assert_eq!(view["pending"], json!([]), "{view}");
+        assert_eq!(prose::resumed(&view), "No sessions to resume.\n");
+    }
+
     /// A sink that swallows reports, standing in for a listening caller.
     struct Sink;
 

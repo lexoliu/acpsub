@@ -383,8 +383,8 @@ pub struct ResumeReport {
     pub failed: Vec<ResumeFailure>,
     /// Sessions the previous generation still owns or that are
     /// mid-resume — they land here when their turn ends and the handoff
-    /// completes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// completes. Always serialized, like the other lists: the prose view
+    /// reads all three.
     pub pending: Vec<String>,
 }
 
