@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use aither_acp::{
@@ -468,6 +469,25 @@ fn emit(json: bool, view: Value, prose: impl FnOnce(&Value) -> String) -> ToolRe
     }
 }
 
+/// The `emit` every `wait`/`wait_any` return shares: the wait-style view
+/// for `sub` — `unwatched_cancel_at` included while the turn stays
+/// running unwatched — against the call's `expect_secs` prose.
+fn emit_wait(
+    state: &AppState,
+    json: bool,
+    sub: &Subagent,
+    started: Instant,
+    outcome: WaitOutcome,
+    awaited: Option<u64>,
+    expect_secs: u64,
+) -> ToolResult {
+    emit(
+        json,
+        wait_view(sub, started, outcome, awaited, state.wait_grace),
+        |view| prose::wait(view, expect_secs),
+    )
+}
+
 /// The `steers` list of a wait result for the reported turn: the recorded
 /// resolutions, plus `"pending"` for any steer still in flight — on an
 /// `Ended` outcome there are none, since the wait held for them.
@@ -523,12 +543,15 @@ fn pending_view(perm: &crate::state::PendingPermission) -> Value {
 /// outlived `expect_secs`: the result reports `overrun`, the turn's own
 /// elapsed time, and its latest tool call. `awaited` is the turn the call
 /// bound to (see [`awaited_turn`]); `None` reports the latest turn, the
-/// shape a wait on a non-running subagent has always had.
+/// shape a wait on a non-running subagent has always had. A still-running
+/// turn the returned wait leaves unwatched also reports
+/// `unwatched_cancel_at` — the wall-clock moment the watchdog cancels it.
 fn wait_view(
     sub: &Subagent,
     started: Instant,
     outcome: WaitOutcome,
     awaited: Option<u64>,
+    wait_grace: Duration,
 ) -> Value {
     let snap = wait_snapshot(sub, awaited);
     let mut view = json!({
@@ -585,10 +608,33 @@ fn wait_view(
         view["resume_at"] = json!(resume_at.to_string());
         view["reason"] = json!(reason);
     }
+    // A wait that returns while its turn still runs leaves the watchdog's
+    // clock running once this call's own waiter detaches — the deadline
+    // is now plus `wait_grace`. Another attached waiter keeps feeding it,
+    // and a turn that settled meanwhile burns nothing, so the field is
+    // written only when the detach actually leaves it unwatched.
+    if matches!(outcome, WaitOutcome::Overrun | WaitOutcome::MaxWait)
+        && matches!(snap.status, Status::Running)
+        && sub.rt.waiters.load(Ordering::Relaxed) <= 1
+    {
+        view["unwatched_cancel_at"] = json!(unwatched_deadline(wait_grace));
+    }
     if let Some(pending) = snap.pending {
         view["pending_permission"] = pending;
     }
     view
+}
+
+/// The wall-clock moment the watchdog cancels a turn left unwatched from
+/// now: its own arithmetic — the monotonic clock it counts plus
+/// `wait_grace`, the same value — translated to a timestamp, never a
+/// second `now` that could drift from the deadline it enforces.
+fn unwatched_deadline(wait_grace: Duration) -> String {
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(wait_grace)
+        .expect("wait_grace overshoots the monotonic clock");
+    (jiff::Timestamp::now() + deadline.duration_since(now)).to_string()
 }
 
 /// The shared-state snapshot [`wait_view`] renders into its result.
@@ -1111,8 +1157,12 @@ async fn steer_send(
 /// turn, elapsed time against `expect_secs`, and `acpsub transcript` as
 /// the place to look; an overrun is to be investigated (`status`,
 /// `transcript`, a `send` steer), not re-waited with a larger
-/// expectation. `json` returns the structured form instead: `state`,
-/// `turn`, `reply`, `steers`, `pending_permission`, and
+/// expectation. When the returned wait leaves the turn unwatched, the
+/// paragraph also names the local wall-clock moment the watchdog cancels
+/// it — now plus `wait_grace` — and the ways to keep it: attach a new
+/// `wait`, take it over, or `cancel` it; the same sentence goes to
+/// stderr. `json` returns the structured form instead: `state`, `turn`,
+/// `reply`, `steers`, `pending_permission`, `unwatched_cancel_at`, and
 /// friends.
 ///
 /// While this call is in flight it feeds the session's watchdog: a
@@ -1133,9 +1183,10 @@ struct WaitArgs {
     /// when the wait began — unlike `expect_secs` it bounds the wait, not
     /// the turn. When it passes before the awaited turn ends or overruns,
     /// the wait reports the turn as still running and points at the
-    /// transcript, rather than dying silent under a caller-side kill
-    /// limit — set it just below the caller's own timeout. Values beyond
-    /// 1800 are rejected unless `long` is set.
+    /// transcript — and names the moment the watchdog will cancel the
+    /// now-unwatched turn — rather than dying silent under a caller-side
+    /// kill limit; set it just below the caller's own timeout. Values
+    /// beyond 1800 are rejected unless `long` is set.
     max_wait_secs: Option<u64>,
     /// Return the structured JSON form instead of prose.
     #[serde(default)]
@@ -1164,12 +1215,19 @@ impl Tool for WaitTool {
         check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let sub = self.state.get(&args.session_id)?;
         let started = Instant::now();
-        let Some(awaited) = awaited_turn(&sub)? else {
-            return Ok(emit(
+        let answer = |outcome, awaited| {
+            emit_wait(
+                &self.state,
                 args.json,
-                wait_view(&sub, started, WaitOutcome::Ended, None),
-                |view| prose::wait(view, args.expect_secs),
-            ));
+                &sub,
+                started,
+                outcome,
+                awaited,
+                args.expect_secs,
+            )
+        };
+        let Some(awaited) = awaited_turn(&sub)? else {
+            return Ok(answer(WaitOutcome::Ended, None));
         };
         // Refused before the wait attaches: an expectation the turn has
         // already reached could only overrun at once.
@@ -1250,11 +1308,7 @@ impl Tool for WaitTool {
                 }
             }
         };
-        Ok(emit(
-            args.json,
-            wait_view(&sub, started, outcome, Some(awaited)),
-            |view| prose::wait(view, args.expect_secs),
-        ))
+        Ok(answer(outcome, Some(awaited)))
     }
 }
 
@@ -1266,7 +1320,8 @@ impl Tool for WaitTool {
 ///
 /// On a `max_wait_secs` timeout the result reports the longest-running
 /// watched turn as still running — the same prose or JSON `wait` emits,
-/// documented there.
+/// documented there — naming the moment the watchdog cancels it while it
+/// stays unwatched.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitAnyArgs {
     /// Session ids to watch.
@@ -1335,6 +1390,17 @@ impl Tool for WaitAnyTool {
         let interval = self.interval;
         let mut next_report = started;
         loop {
+            let answer = |sub: &Subagent, outcome, awaited| {
+                emit_wait(
+                    &self.state,
+                    args.json,
+                    sub,
+                    started,
+                    outcome,
+                    awaited,
+                    args.expect_secs,
+                )
+            };
             let mut poll = WAIT_ANY_POLL;
             // Report the longest-running watched turn — by index, so a
             // rebind on park can update `awaited` in place.
@@ -1342,37 +1408,21 @@ impl Tool for WaitAnyTool {
             for index in 0..subs.len() {
                 let sub = &subs[index];
                 let Some(n) = awaited[index] else {
-                    return Ok(emit(
-                        args.json,
-                        wait_view(sub, started, WaitOutcome::Ended, None),
-                        |view| prose::wait(view, args.expect_secs),
-                    ));
+                    return Ok(answer(sub, WaitOutcome::Ended, None));
                 };
                 match awaited_elapsed(sub, n)? {
                     Awaited::Ended => {
-                        return Ok(emit(
-                            args.json,
-                            wait_view(sub, started, WaitOutcome::Ended, Some(n)),
-                            |view| prose::wait(view, args.expect_secs),
-                        ));
+                        return Ok(answer(sub, WaitOutcome::Ended, Some(n)));
                     }
                     Awaited::RateLimited => {
-                        return Ok(emit(
-                            args.json,
-                            wait_view(sub, started, WaitOutcome::RateLimited, Some(n)),
-                            |view| prose::wait(view, args.expect_secs),
-                        ));
+                        return Ok(answer(sub, WaitOutcome::RateLimited, Some(n)));
                     }
                     // Parked rate-limited: nothing running to compare.
                     Awaited::Paused => {}
                     // A steer hold counts like the turn it extends.
                     Awaited::Running(elapsed) | Awaited::Steers(elapsed) => {
                         if elapsed >= expect {
-                            return Ok(emit(
-                                args.json,
-                                wait_view(sub, started, WaitOutcome::Overrun, Some(n)),
-                                |view| prose::wait(view, args.expect_secs),
-                            ));
+                            return Ok(answer(sub, WaitOutcome::Overrun, Some(n)));
                         }
                         poll = poll.min(Duration::from_secs_f64(expect - elapsed));
                         if longest.is_none_or(|(max, _)| elapsed > max) {
@@ -1385,11 +1435,7 @@ impl Tool for WaitAnyTool {
             if deadline.is_some_and(|deadline| now >= deadline)
                 && let Some(index) = max_wait_index(longest, &awaited)
             {
-                return Ok(emit(
-                    args.json,
-                    wait_view(&subs[index], started, WaitOutcome::MaxWait, awaited[index]),
-                    |view| prose::wait(view, args.expect_secs),
-                ));
+                return Ok(answer(&subs[index], WaitOutcome::MaxWait, awaited[index]));
             }
             if now >= next_report {
                 report_longest(&mut cx, &subs, longest, started, args.expect_secs).await?;

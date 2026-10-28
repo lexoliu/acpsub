@@ -221,7 +221,11 @@ enum Command {
     /// wait at once with exit code 75 and the reset time in the result; a
     /// wait started on an already parked session blocks until the resumed
     /// turn ends, and --expect counts from that turn's start. Designed to
-    /// run in the background: exit means "check the result".
+    /// run in the background: exit means "check the result". A result that
+    /// returns with the turn still running (overrun, or --max-wait reached)
+    /// names the time the watchdog cancels the now-unwatched turn and the
+    /// ways to keep it — the same warning goes to stderr, so a host that
+    /// surfaces only the task's exit still shows it.
     Wait {
         /// Session id.
         session_id: String,
@@ -247,7 +251,10 @@ enum Command {
         #[command(flatten)]
         conn: DaemonConn,
     },
-    /// Block until the first of several subagents leaves `running`.
+    /// Block until the first of several subagents leaves `running`. A
+    /// result that returns with the turn still running names the time the
+    /// watchdog cancels it unwatched and the ways to keep it, as in
+    /// `wait` — on stderr too.
     WaitAny {
         /// Session ids to watch.
         session_ids: Vec<String>,
@@ -732,6 +739,11 @@ fn print_wait_result(result: &CallToolResult, as_json: bool, expect_secs: u64) -
         );
     } else {
         print!("{}", acpsub::prose::wait(&value, expect_secs));
+    }
+    // A turn left running unwatched: repeat the deadline on stderr, so a
+    // host that surfaces only a background task's exit still shows it.
+    if let Some(warning) = acpsub::prose::unwatched_warning(&value) {
+        eprintln!("{warning}");
     }
     if value["state"] == "rate_limited" {
         return ExitCode::from(RATE_LIMITED_EXIT);
