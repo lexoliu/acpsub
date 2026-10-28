@@ -355,6 +355,31 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// The daemon's `initialize` answer did not name its instance.
+    #[error("daemon at {path} did not identify itself: {detail}")]
+    DaemonIdentity {
+        /// Socket path the client was connected to.
+        path: PathBuf,
+        /// What was wrong with the answer.
+        detail: String,
+    },
+
+    /// The daemon that dropped an idempotent call still answers the
+    /// socket — the same instance served the retry's handshake — so the
+    /// drop is a failed call, not a restart, and re-issuing would loop
+    /// on the same failure.
+    #[error(
+        "daemon at {path} dropped {tool} and is still serving — a failed call, not a restart: {source}"
+    )]
+    DaemonDroppedCall {
+        /// Socket path the client was connected to.
+        path: PathBuf,
+        /// The tool whose call was dropped.
+        tool: String,
+        /// The drop's underlying transport error.
+        source: std::io::Error,
+    },
+
     /// A peer daemon answered a generation-protocol call with an error.
     #[error("daemon at {path} refused {tool}: {detail}")]
     PeerRefused {
