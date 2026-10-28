@@ -46,7 +46,8 @@ fn ids(list: &Value) -> Vec<&str> {
 /// A turn still running (`overrun`, or a `max_wait_secs` expiry's
 /// `running`) is one short paragraph naming the session and turn, the
 /// elapsed time against `expect_secs`, and `acpsub transcript` as the
-/// place to look.
+/// place to look — plus, while the turn is left unwatched, the
+/// [`unwatched_warning`] sentence naming when the watchdog cancels it.
 /// # Panics
 ///
 /// Panics when the view is missing a field its tool always writes — a bug in the view, not caller input.
@@ -65,6 +66,9 @@ pub fn wait(view: &Value, expect_secs: u64) -> String {
              against an --expect of {expect_secs}s — `acpsub transcript \
              {session}` shows what it is doing."
         );
+        if let Some(warning) = unwatched_warning(view) {
+            let _ = write!(text, " {warning}");
+        }
         // A parked session's report carries where the limit stands.
         if let Some(resume_at) = opt_str(view, "resume_at") {
             let _ = write!(
@@ -124,6 +128,40 @@ pub fn wait(view: &Value, expect_secs: u64) -> String {
         }
     }
     text
+}
+
+/// A still-running `wait`/`wait_any` result's unwatched-turn sentence.
+///
+/// It is the tail of [`wait`]'s paragraph, and the line the CLI repeats
+/// on stderr so a host that surfaces only a background task's exit
+/// still shows it. `None` when the view carries no
+/// `unwatched_cancel_at`: the turn settled meanwhile or another waiter
+/// still feeds the watchdog.
+/// # Panics
+///
+/// Panics when `unwatched_cancel_at` is not a timestamp — a bug in the view, not caller input.
+#[must_use]
+pub fn unwatched_warning(view: &Value) -> Option<String> {
+    let cancel_at = opt_str(view, "unwatched_cancel_at")?;
+    let session = str_field(view, "session_id");
+    Some(format!(
+        "It now has no waiter — the watchdog cancels the turn and closes \
+         the session at {}: attach a new `acpsub wait {session}` to keep \
+         watching, take it over, or `acpsub cancel {session}` to end it \
+         deliberately.",
+        local_wall(cancel_at)
+    ))
+}
+
+/// A view's RFC 3339 instant rendered as the local wall-clock time —
+/// `2026-10-27 14:32:05 EDT` — a warning names.
+fn local_wall(timestamp: &str) -> String {
+    timestamp
+        .parse::<jiff::Timestamp>()
+        .expect("a timestamp the view wrote parses")
+        .to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
 }
 
 /// `spawn`/`adopt`: the live session's handle, agent and state, where it

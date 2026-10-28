@@ -140,6 +140,63 @@ fn daemon_spawn_wait_result_close() {
     assert_eq!(closed["closed"], true, "{closed}");
 }
 
+/// A `wait` that returns with the turn still running repeats the
+/// watchdog's cancellation warning on stderr, so a host that surfaces
+/// only the background task's exit still shows it (#107).
+#[test]
+fn wait_overrun_writes_warning_to_stderr() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    let spawned = daemon.call_json(&[
+        "spawn",
+        "--cwd",
+        &dir.path().to_string_lossy(),
+        "--model",
+        "b",
+        "--mode",
+        "bypass",
+        "--prompt",
+        "wait",
+    ]);
+    let sid = spawned["session_id"].as_str().expect("session_id");
+
+    let output = daemon
+        .run(&["wait", sid, "--expect", "1"])
+        .expect("client runs");
+    assert!(
+        output.status.success(),
+        "wait failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("is still running"), "{stdout}");
+    assert!(stdout.contains("now has no waiter"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("now has no waiter"), "{stderr}");
+    assert!(stderr.contains("the watchdog cancels the turn"), "{stderr}");
+    assert!(stderr.contains(&format!("acpsub wait {sid}")), "{stderr}");
+    assert!(stderr.contains("take it over"), "{stderr}");
+    assert!(stderr.contains(&format!("acpsub cancel {sid}")), "{stderr}");
+
+    // --json carries the deadline as a timestamp field; the warning
+    // still goes to stderr.
+    let output = daemon
+        .run(&["wait", sid, "--expect", "60", "--max-wait", "1", "--json"])
+        .expect("client runs");
+    assert!(output.status.success());
+    let out: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(out["state"], "running", "{out}");
+    assert!(out["unwatched_cancel_at"].is_string(), "{out}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("now has no waiter"), "{stderr}");
+
+    daemon.call_json(&["cancel", sid]);
+}
+
 /// `--expect`/`--max-wait` over 1800 s (30 minutes) are rejected unless
 /// `--long` is passed; the limit itself passes, and `--long` lifts it.
 #[test]

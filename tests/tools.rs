@@ -867,6 +867,19 @@ async fn wait_overruns_past_expected_duration() {
     );
     assert_eq!(out["latest_tool_call"]["id"], "tc-1", "{out}");
 
+    // The returned wait leaves the turn unwatched: the result names the
+    // watchdog's cancellation moment — now plus the default 60 s grace.
+    let cancel_at = out["unwatched_cancel_at"]
+        .as_str()
+        .expect("unwatched_cancel_at")
+        .parse::<jiff::Timestamp>()
+        .expect("unwatched_cancel_at is a timestamp");
+    let remaining = cancel_at.duration_since(jiff::Timestamp::now());
+    assert!(
+        remaining.as_secs() > 55 && remaining.as_secs() <= 60,
+        "{out}"
+    );
+
     // The subagent itself is still running — overrun is a report, not a
     // state transition.
     let status = call_json(&tools, "status", json!({"session_id": sid})).await;
@@ -1160,14 +1173,23 @@ async fn wait_any_reports_overrun() {
         "{out}"
     );
     assert_eq!(out["latest_tool_call"]["id"], "tc-1", "{out}");
+    assert!(
+        out["unwatched_cancel_at"]
+            .as_str()
+            .expect("unwatched_cancel_at")
+            .parse::<jiff::Timestamp>()
+            .is_ok(),
+        "{out}"
+    );
     call_json(&tools, "cancel", json!({"session_id": sid})).await;
 }
 
 /// `--max-wait` is the wait's own deadline: it returns `state: "running"`
 /// — the turn's detail lives in the transcript, not the result — and the
 /// prose form is the short paragraph naming the session, turn, elapsed
-/// time against `--expect`, and `acpsub transcript`. `wait_any` takes the
-/// same bound on the longest-running watched turn.
+/// time against `--expect`, `acpsub transcript`, and — while the turn is
+/// left unwatched — the moment the watchdog cancels it. `wait_any` takes
+/// the same bound on the longest-running watched turn.
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_max_wait_reports_still_running() {
     if !python3() {
@@ -1186,9 +1208,18 @@ async fn wait_max_wait_reports_still_running() {
     .await;
     assert_eq!(out["state"], "running", "{out}");
     assert!(out.get("digest").is_none(), "{out}");
+    assert!(
+        out["unwatched_cancel_at"]
+            .as_str()
+            .expect("unwatched_cancel_at")
+            .parse::<jiff::Timestamp>()
+            .is_ok(),
+        "{out}"
+    );
 
     // The prose default: one short paragraph — session, turn, still
-    // running, elapsed vs --expect, and the transcript pointer.
+    // running, elapsed vs --expect, the transcript pointer, and the
+    // watchdog's cancellation moment for the now-unwatched turn.
     let text = call_text(
         &tools,
         "wait",
@@ -1201,6 +1232,11 @@ async fn wait_max_wait_reports_still_running() {
     );
     assert!(text.contains("--expect of 60s"), "{text}");
     assert!(text.contains(&format!("acpsub transcript {sid}")), "{text}");
+    assert!(text.contains("now has no waiter"), "{text}");
+    assert!(text.contains("the watchdog cancels the turn"), "{text}");
+    assert!(text.contains(&format!("acpsub wait {sid}")), "{text}");
+    assert!(text.contains("take it over"), "{text}");
+    assert!(text.contains(&format!("acpsub cancel {sid}")), "{text}");
 
     // An overrun reports the same paragraph shape.
     let over = call_text(
@@ -1214,6 +1250,7 @@ async fn wait_max_wait_reports_still_running() {
         "{over}"
     );
     assert!(over.contains("--expect of 4s"), "{over}");
+    assert!(over.contains("now has no waiter"), "{over}");
 
     // `wait_any` takes the same bound and reports the longest-running
     // watched turn.
@@ -1225,6 +1262,7 @@ async fn wait_max_wait_reports_still_running() {
     .await;
     assert_eq!(any["state"], "running", "{any}");
     assert_eq!(any["session_id"], sid, "{any}");
+    assert!(any["unwatched_cancel_at"].is_string(), "{any}");
     call_json(&tools, "cancel", json!({"session_id": sid})).await;
 }
 
