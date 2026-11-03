@@ -940,28 +940,12 @@ impl Tool for AdoptTool {
         if args.prompt.is_some() {
             crate::ratelimit::refuse_if_limited(&self.0, agent)?;
         }
-        let cwd = if let Some(cwd) = args
+        let cwd = match args
             .cwd
             .or_else(|| registered.as_ref().map(|entry| entry.cwd.clone()))
         {
-            cwd
-        } else {
-            let unknown = |reason: String| Error::SessionCwdUnknown {
-                session_id: args.session_id.clone(),
-                reason,
-            };
-            match agent_cfg.session_db_path() {
-                Some(db) => match crate::state::discover_session_cwd(&db, &args.session_id) {
-                    Ok(Some(cwd)) => cwd,
-                    Ok(None) => {
-                        return Err(unknown(format!("not found in {}", db.display())).into());
-                    }
-                    Err(error) => return Err(unknown(error.to_string()).into()),
-                },
-                None => {
-                    return Err(unknown("no session database configured".to_string()).into());
-                }
-            }
+            Some(cwd) => cwd,
+            None => discover_cwd(agent_cfg, &args.session_id)?,
         };
         let sub = launch(
             &self.0,
@@ -2568,6 +2552,34 @@ impl Tool for ResumedTool {
         let view = serde_json::to_value(report).unwrap_or_default();
         std::future::ready(Ok(emit(args.json, view, prose::resumed)))
     }
+}
+
+/// Find the working directory of a session the registry does not know, in the
+/// agent's session database.
+#[cfg(feature = "sessions-db")]
+fn discover_cwd(agent_cfg: &crate::config::AgentConfig, session_id: &str) -> Result<PathBuf> {
+    let unknown = |reason: String| Error::SessionCwdUnknown {
+        session_id: session_id.to_string(),
+        reason,
+    };
+    let Some(db) = agent_cfg.session_db_path() else {
+        return Err(unknown("no session database configured".to_string()));
+    };
+    match crate::state::discover_session_cwd(&db, session_id) {
+        Ok(Some(cwd)) => Ok(cwd),
+        Ok(None) => Err(unknown(format!("not found in {}", db.display()))),
+        Err(error) => Err(unknown(error.to_string())),
+    }
+}
+
+/// Without the `sessions-db` feature a session the registry does not know
+/// cannot be located, so `cwd` is required.
+#[cfg(not(feature = "sessions-db"))]
+fn discover_cwd(_agent_cfg: &crate::config::AgentConfig, session_id: &str) -> Result<PathBuf> {
+    Err(Error::SessionCwdUnknown {
+        session_id: session_id.to_string(),
+        reason: "`cwd` is required: built without the `sessions-db` feature".to_string(),
+    })
 }
 
 #[cfg(test)]

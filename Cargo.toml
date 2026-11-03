@@ -10,6 +10,18 @@ repository = "https://github.com/lexoliu/acpsub"
 keywords = ["acp", "mcp", "agent", "subagent"]
 categories = ["api-bindings", "command-line-utilities"]
 
+[features]
+default = ["cli", "sessions-db"]
+# Find an adopted session's cwd in the agent's SQLite session database.
+sessions-db = ["dep:rusqlite"]
+# The `acpsub` binary and its own dependencies.
+cli = ["dep:clap", "dep:tracing-subscriber"]
+
+[[bin]]
+name = "acpsub"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
 aither-core = { version = "0.12.0", default-features = false }
 aither-mcp = { version = "0.12.0", default-features = false, features = ["server", "client"] }
@@ -22,14 +34,14 @@ dirs = "6"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process", "sync", "time", "io-util"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
 futures-lite = "2"
 async-process = "2"
 async-net = "2"
 libc = "0.2"
 jiff = { version = "0.2", features = ["serde"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
