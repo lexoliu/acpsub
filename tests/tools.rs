@@ -1605,6 +1605,7 @@ async fn adopt_without_discoverable_cwd_errors() {
 
 /// A `sessions_db` maps unknown session ids to their working directory, so
 /// `adopt` does not need `cwd`.
+#[cfg(feature = "sessions-db")]
 #[tokio::test(flavor = "multi_thread")]
 async fn adopt_discovers_cwd_from_sessions_db() {
     if !python3() {

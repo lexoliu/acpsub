@@ -2762,6 +2762,7 @@ async fn record_turn_end(
 /// # Errors
 ///
 /// Returns an error when the database cannot be opened or queried.
+#[cfg(feature = "sessions-db")]
 pub fn discover_session_cwd(db: &std::path::Path, session_id: &str) -> Result<Option<PathBuf>> {
     use rusqlite::OptionalExtension;
     let context = || format!("cannot query {}", db.display());
