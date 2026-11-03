@@ -259,10 +259,12 @@ pub enum Error {
 
     /// The agent advertises a `model` config option, so `model` is
     /// required.
-    #[error("agent '{agent}' advertises a 'model' config option; 'model' is required")]
+    #[error("agent '{agent}' advertises a 'model' config option; 'model' is required{}", if valid.is_empty() { String::new() } else { format!(" (valid: {})", valid.join(", ")) })]
     ModelRequired {
         /// Agent config key.
         agent: String,
+        /// Model values the agent advertised.
+        valid: Vec<String>,
     },
 
     /// The requested mode is not among the agent's advertised modes.

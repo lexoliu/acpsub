@@ -1636,10 +1636,11 @@ fn check_advertised(
     if let Some(model) = args.model.as_deref() {
         options.insert("model".to_string(), ConfigValue::Select(model.to_string()));
     }
-    if config_options.iter().any(|option| option.id == "model") {
+    if let Some(option) = config_options.iter().find(|option| option.id == "model") {
         if !options.contains_key("model") {
             return Err(Error::ModelRequired {
                 agent: agent.to_string(),
+                valid: select_values(option),
             });
         }
     } else if let Some(model) = args.model.as_deref() {
@@ -1693,6 +1694,24 @@ fn confirmed_mode(inner: &mut Inner) -> Option<String> {
     }
 }
 
+/// The values a select config option advertises, flat or grouped; empty for
+/// an option that lists none.
+fn select_values(option: &ConfigOption) -> Vec<String> {
+    option
+        .options
+        .as_ref()
+        .map(|options| match options {
+            ConfigSelectOptions::Flat(flat) => {
+                flat.iter().map(|option| option.value.clone()).collect()
+            }
+            ConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter().map(|option| option.value.clone()))
+                .collect(),
+        })
+        .unwrap_or_default()
+}
+
 /// Check a `model`/`config` value against the options the agent advertised
 /// in `session/new`/`session/load`: the option must be advertised at all,
 /// and a `select` value must be one of its listed values — an option with
@@ -1711,19 +1730,7 @@ fn check_config_option(
             id: id.to_string(),
             known: options.iter().map(|option| option.id.clone()).collect(),
         })?;
-    let valid: Vec<String> = option
-        .options
-        .as_ref()
-        .map(|options| match options {
-            ConfigSelectOptions::Flat(flat) => {
-                flat.iter().map(|option| option.value.clone()).collect()
-            }
-            ConfigSelectOptions::Grouped(groups) => groups
-                .iter()
-                .flat_map(|group| group.options.iter().map(|option| option.value.clone()))
-                .collect(),
-        })
-        .unwrap_or_default();
+    let valid = select_values(option);
     let uncheckable = |value: String| Error::ConfigOptionValuesMissing {
         agent: agent.to_string(),
         id: id.to_string(),
