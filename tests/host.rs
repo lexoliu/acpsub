@@ -164,7 +164,10 @@ async fn spawn_errors_like_launch() {
     let mut missing = spec(dir.path());
     missing.model = None;
     let error = host.spawn(missing).await.expect_err("model is required");
-    assert!(error.to_string().contains("model"), "{error}");
+    assert!(
+        matches!(&error, acpsub::Error::ModelRequired { valid, .. } if !valid.is_empty()),
+        "the advertised models come with the error: {error:?}"
+    );
     let mut missing = spec(dir.path());
     missing.mode = None;
     let error = host.spawn(missing).await.expect_err("mode is required");
