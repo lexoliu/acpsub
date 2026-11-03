@@ -260,7 +260,7 @@ pub fn test_state_full(
 ) -> (Arc<AppState>, Tools) {
     let path = write_config(dir, default_agent, agents, None);
     let config = Config::load(&path).expect("config loads");
-    let state = AppState::new(config, path).expect("app state");
+    let state = AppState::new(config, acpsub::FileConfigSource::new(path)).expect("app state");
     // The test-harness constructor: a short report interval so progress
     // tests see several reports inside a test-length wait.
     let tools =
@@ -300,7 +300,7 @@ pub async fn call_json(tools: &Tools, name: &str, mut args: Value) -> Value {
         "{name} returned error: {}",
         result.error_message().unwrap_or("?")
     );
-    let text = result.render_for_model().expect("render");
+    let text = result.render_for_model();
     serde_json::from_str(&text).expect("tool result is json")
 }
 
@@ -311,17 +311,14 @@ pub async fn call_err(tools: &Tools, name: &str, args: Value) -> String {
         Ok(result) if result.is_error() => {
             result.error_message().expect("error message").to_string()
         }
-        Ok(result) => panic!(
-            "expected error, got {}",
-            result.render_for_model().unwrap_or_default()
-        ),
+        Ok(result) => panic!("expected error, got {}", result.render_for_model()),
     }
 }
 
 /// Call a tool returning plain text.
 pub async fn call_text(tools: &Tools, name: &str, args: Value) -> String {
     let result = call(tools, name, args).await.expect("call failed");
-    result.render_for_model().expect("render")
+    result.render_for_model()
 }
 
 /// Spawn args for the fake agent rooted at `cwd`.

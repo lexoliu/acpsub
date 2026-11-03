@@ -443,7 +443,7 @@ async fn bound_wait_result(
         .expect("wait task panicked")
         .expect("wait call failed");
     assert!(!result.is_error(), "wait returned an error result");
-    serde_json::from_str(&result.render_for_model().expect("render")).expect("json")
+    serde_json::from_str(&result.render_for_model()).expect("json")
 }
 
 /// `status` lists a steer while its `session/prompt` is in flight, and
@@ -2198,7 +2198,7 @@ fn adopt_error(outcome: Result<ToolResult, String>) -> String {
         }
         Ok(result) => panic!(
             "adopt returned a session after the end: {}",
-            result.render_for_model().unwrap_or_default()
+            result.render_for_model()
         ),
     }
 }

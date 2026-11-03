@@ -25,7 +25,10 @@ use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::config::{AgentConfig, Config, ConfigValue, PermissionPolicy, SteerSemantics};
+use crate::config::{
+    AgentConfig, AnyConfigSource, Config, ConfigSource, ConfigValue, PermissionPolicy,
+    SteerSemantics,
+};
 use crate::error::{Error, Result};
 use crate::handler::{SubagentHandler, note_tool_call, note_tool_call_update};
 use crate::registry::{LastTurn, Registry, RegistryEntry, persist};
@@ -40,9 +43,9 @@ const STDERR_QUOTE_LINES: usize = 20;
 /// Shared app state behind every tool.
 #[derive(Debug)]
 pub struct AppState {
-    /// Path of the config file; re-read on every `spawn`/`adopt`/`agents`
-    /// call so the running server always reflects the file on disk.
-    pub config_path: PathBuf,
+    /// Where the current config comes from; read on every `spawn`/`adopt`/
+    /// `agents` call so the running server always reflects its source.
+    pub config_source: AnyConfigSource,
     /// Directory holding `<session_id>.jsonl` transcript files (from the
     /// config loaded at startup).
     pub transcript_dir: PathBuf,
@@ -99,14 +102,14 @@ impl AppState {
     /// # Panics
     ///
     /// Panics if the registry mutex is poisoned.
-    pub fn new(config: Config, config_path: PathBuf) -> Result<Arc<Self>> {
+    pub fn new(config: Config, source: impl ConfigSource + 'static) -> Result<Arc<Self>> {
         let registry_path = config.defaults.registry;
         let registry = Registry::load(&registry_path)?;
         // Quota gates survive a restart through the registry's parked
         // flags: a prompt against a still-limited scope keeps parking.
         let limits = crate::ratelimit::restored_limits(&registry);
         let state = Arc::new(Self {
-            config_path,
+            config_source: AnyConfigSource::new(source),
             transcript_dir: config.defaults.transcript_dir,
             live: Mutex::new(HashMap::new()),
             reserved: Mutex::new(HashMap::new()),
@@ -127,19 +130,20 @@ impl AppState {
         Ok(state)
     }
 
-    /// Re-read and parse the config file.
+    /// Read the current config from the source.
     ///
     /// `spawn`, `adopt`, and `agents` call this so a running server always
-    /// reflects the file on disk: edits take effect without a restart, and
-    /// a missing or unparsable file is an error — never a fallback to a
-    /// previously loaded config.
+    /// reflects its source: a file source's edits take effect without a
+    /// restart, and a source that has no valid config is an error — never
+    /// a fallback to a previously loaded config.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ConfigMissing`], [`Error::ConfigRead`], or
+    /// Whatever the source returns; the file source gives
+    /// [`Error::ConfigMissing`], [`Error::ConfigRead`], or
     /// [`Error::ConfigParse`].
-    pub fn load_config(&self) -> Result<Config> {
-        Config::load(&self.config_path)
+    pub fn load_config(&self) -> impl Future<Output = Result<Config>> + Send + '_ {
+        self.config_source.load()
     }
 
     /// Get a live subagent by session id.
@@ -1085,11 +1089,11 @@ pub async fn launch(state: &Arc<AppState>, config: &Config, args: Launch) -> Res
 /// The per-session runtime bundle for a just-connected agent: `adopt`
 /// knows its session id up front; `spawn` fills it in during the
 /// handshake.
-fn new_runtime(args: &Launch, steer: SteerSemantics) -> Arc<SubRuntime> {
+pub(crate) fn new_runtime(session_id: String, steer: SteerSemantics) -> Arc<SubRuntime> {
     Arc::new(SubRuntime {
         inner: Mutex::new(Inner {
             status: Status::Idle,
-            session_id: args.load.clone().unwrap_or_default(),
+            session_id,
             agent_info: None,
             modes: None,
             config_options: Vec::new(),
@@ -1133,7 +1137,7 @@ async fn launch_inner(
         .permission
         .or(agent_cfg.permission)
         .unwrap_or(config.defaults.permission);
-    let rt = new_runtime(args, agent_cfg.steer);
+    let rt = new_runtime(args.load.clone().unwrap_or_default(), agent_cfg.steer);
 
     let handler = SubagentHandler::new(
         rt.clone(),
@@ -1336,7 +1340,7 @@ async fn release_reservation(
 ///
 /// Returns [`Error::SpawnFailed`] when the process cannot be spawned, or
 /// [`Error::Agent`] when the transport cannot be built from it.
-fn connect(
+pub(crate) fn connect(
     agent_cfg: &AgentConfig,
     cwd: &std::path::Path,
     handler: SubagentHandler,

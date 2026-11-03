@@ -37,7 +37,7 @@ fn prune_state(dir: &Path, retention: &str) -> (Arc<AppState>, Tools) {
         );
     std::fs::write(&path, text).expect("write config");
     let config = Config::load(&path).expect("config loads");
-    let state = AppState::new(config, path).expect("app state");
+    let state = AppState::new(config, acpsub::FileConfigSource::new(path)).expect("app state");
     let tools = acpsub::build_tools(state.clone()).expect("tools");
     (state, tools)
 }

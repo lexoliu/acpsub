@@ -194,10 +194,7 @@ async fn long_wait_requires_the_opt_in() {
             Ok(result) if result.is_error() => {
                 result.error_message().expect("error message").to_string()
             }
-            Ok(result) => panic!(
-                "{name}: expected error, got {}",
-                result.render_for_model().unwrap_or_default()
-            ),
+            Ok(result) => panic!("{name}: expected error, got {}", result.render_for_model()),
         };
         assert!(error.contains(field), "{name}: {error}");
         assert!(error.contains("1801"), "{name}: {error}");
@@ -328,7 +325,7 @@ async fn wait_returns_the_turn_it_started_on() {
     .await
     .expect("wait returned once its own turn ended");
     assert!(!result.is_error(), "call returned an error result");
-    let text = result.render_for_model().expect("render");
+    let text = result.render_for_model();
     let waited: Value = serde_json::from_str(&text).expect("tool result is json");
     assert_eq!(waited["state"], "done", "{waited}");
     assert_eq!(waited["turn"], 1, "{waited}");
@@ -435,7 +432,7 @@ async fn collect_until_return(
     .await
     .expect("the wait returned");
     assert!(!result.is_error(), "call returned an error result");
-    let text = result.render_for_model().expect("render");
+    let text = result.render_for_model();
     serde_json::from_str(&text).expect("tool result is json")
 }
 

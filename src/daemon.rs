@@ -63,7 +63,7 @@ use crate::state::{
     AppState, Closing, HeldLock, Inner, Launch, ResumeFailure, ResumeReport, Status, Subagent,
     close_sub, launch, start_turn,
 };
-use crate::tools::build_tools;
+use crate::tools::{build_tools, json_text};
 
 /// Upper bound on dispatch reclassification while a session moves
 /// between generations mid-call.
@@ -763,7 +763,7 @@ async fn released_one(state: &Arc<AppState>, next: &Path, session_id: &str) {
 /// waits instead of seeing an unknown session.
 async fn resume_handed(state: Arc<AppState>, session_id: String, entry: RegistryEntry) {
     let mut report = ResumeReport::default();
-    match state.load_config() {
+    match state.load_config().await {
         Ok(config) => {
             resume_one(&state, &config, session_id.clone(), entry, &mut report).await;
         }
@@ -806,7 +806,7 @@ async fn resume_marked(state: &Arc<AppState>) {
         .collect();
     let mut report = ResumeReport::default();
     if !marked.is_empty() {
-        match state.load_config() {
+        match state.load_config().await {
             Ok(config) => {
                 for (session_id, entry) in marked {
                     resume_one(state, &config, session_id, entry, &mut report).await;
@@ -1080,9 +1080,9 @@ impl Tool for TakeoverTool {
         Cow::Borrowed("daemon/takeover")
     }
     type Arguments = TakeoverArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: TakeoverArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: TakeoverArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         let state = &self.0;
         // The liveness connection to the successor: its private listener
         // is bound before it calls this, and the connection closes when
@@ -1144,7 +1144,8 @@ impl Tool for TakeoverTool {
         // loss, and a `wait` gets a fresh window to reattach through the
         // successor's forwarding.
         state.handover.progressed.notify_waiters();
-        serde_json::to_value(TakeoverReport { kept, handed }).map_err(Into::into)
+        let report = serde_json::to_value(TakeoverReport { kept, handed })?;
+        Ok(json_text(&report))
     }
 }
 
@@ -1262,9 +1263,9 @@ impl Tool for HandoffTool {
         Cow::Borrowed("daemon/handoff")
     }
     type Arguments = HandoffArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: HandoffArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: HandoffArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         let state = &self.0;
         // Superseded itself: the session is relayed to the newer
         // generation rather than resumed here.
@@ -1280,7 +1281,7 @@ impl Tool for HandoffTool {
             )
             .await?;
             stop_relaying(state, &args.session_id);
-            return Ok(relayed);
+            return Ok(json_text(&relayed));
         }
         let session_id = args.session_id;
         let entry = args.entry;
@@ -1319,7 +1320,7 @@ impl Tool for HandoffTool {
             .remove(&session_id);
         info!(%session_id, "session handed over; resuming");
         tokio::spawn(resume_handed(state.clone(), session_id, entry));
-        Ok(json!({}))
+        Ok(json_text(&json!({})))
     }
 }
 
@@ -1343,9 +1344,9 @@ impl Tool for ReleaseTool {
         Cow::Borrowed("daemon/release")
     }
     type Arguments = ReleaseArgs;
-    type Res = Value;
+    type Res = ToolResult;
 
-    async fn call(&self, args: ReleaseArgs, _cx: ToolContext) -> aither_core::Result<Value> {
+    async fn call(&self, args: ReleaseArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         let state = &self.0;
         let next = state.handover.next.lock().expect("next poisoned").clone();
         if let Some(next) = next {
@@ -1359,7 +1360,7 @@ impl Tool for ReleaseTool {
             )
             .await?;
             stop_relaying(state, &args.session_id);
-            return Ok(relayed);
+            return Ok(json_text(&relayed));
         }
         let session_id = args.session_id;
         // The final entry lands before the forward drops, so a call in
@@ -1380,7 +1381,7 @@ impl Tool for ReleaseTool {
             .lock()
             .expect("foreign poisoned")
             .remove(&session_id);
-        Ok(json!({}))
+        Ok(json_text(&json!({})))
     }
 }
 
