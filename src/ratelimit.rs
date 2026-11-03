@@ -573,7 +573,7 @@ async fn resume_loaded(state: &Arc<AppState>, session_id: &str) {
     let Some(parked) = entry.rate_limited else {
         return;
     };
-    let config = match state.load_config() {
+    let config = match state.load_config().await {
         Ok(config) => config,
         Err(error) => {
             warn!(%session_id, %error, "cannot load config to resume rate-limited session");

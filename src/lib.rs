@@ -19,6 +19,7 @@ pub mod config;
 pub mod daemon;
 pub mod error;
 pub mod handler;
+pub mod host;
 pub mod prose;
 pub mod prune;
 pub mod ratelimit;
@@ -30,9 +31,11 @@ pub mod transcript;
 mod watchdog;
 
 pub use config::{
-    AgentConfig, Config, Defaults, PermissionPolicy, SteerSemantics, default_config_path,
+    AgentConfig, AnyConfigSource, Config, ConfigSource, Defaults, FileConfigSource,
+    PermissionPolicy, SteerSemantics, default_config_path,
 };
 pub use error::{Error, Result};
+pub use host::{Host, Session, SessionSpec, TurnEnd, TurnOutcome, probe};
 pub use registry::{Registry, RegistryEntry};
 pub use state::{AppState, Status, Subagent};
 pub use tools::{build_tools, build_tools_with_progress_interval};

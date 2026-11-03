@@ -1,7 +1,9 @@
 //! Config file loading (`~/.config/acpsub/config.toml`).
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -19,6 +21,93 @@ pub fn default_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".config/acpsub/config.toml"))
 }
 
+/// Where the current [`Config`] comes from.
+///
+/// `spawn`, `adopt`, `agents` and the rate-limit resume read it on every
+/// call, so a source that reads a file reflects edits without a restart.
+/// A source that cannot produce a config returns an error — callers never
+/// fall back to a previously loaded one.
+pub trait ConfigSource: Send + Sync {
+    /// The current configuration.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the source reports when it has no valid config to give.
+    fn load(&self) -> impl Future<Output = Result<Config>> + Send;
+}
+
+/// Object-safe twin of [`ConfigSource`].
+trait ConfigSourceImpl: Send + Sync {
+    fn load<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Config>> + Send + 'a>>;
+}
+
+impl<T: ConfigSource> ConfigSourceImpl for T {
+    fn load<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Config>> + Send + 'a>> {
+        Box::pin(ConfigSource::load(self))
+    }
+}
+
+/// A type-erased [`ConfigSource`], as [`crate::AppState`] stores it.
+///
+/// Boxing lives inside this wrapper: [`load`](Self::load) returns
+/// `impl Future` like the trait it stands in for.
+pub struct AnyConfigSource {
+    inner: Box<dyn ConfigSourceImpl>,
+}
+
+impl std::fmt::Debug for AnyConfigSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnyConfigSource")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnyConfigSource {
+    /// Erase the concrete type of `source`.
+    #[must_use]
+    pub fn new<T: ConfigSource + 'static>(source: T) -> Self {
+        Self {
+            inner: Box::new(source),
+        }
+    }
+
+    /// See [`ConfigSource::load`].
+    pub fn load(&self) -> impl Future<Output = Result<Config>> + Send + '_ {
+        self.inner.load()
+    }
+}
+
+/// The config file as a [`ConfigSource`]: re-read and parsed on every
+/// call, a missing or unparsable file an error.
+#[derive(Debug, Clone)]
+pub struct FileConfigSource {
+    path: PathBuf,
+}
+
+impl FileConfigSource {
+    /// A source reading `path` on every [`load`](ConfigSource::load).
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// The file this source reads.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl ConfigSource for FileConfigSource {
+    async fn load(&self) -> Result<Config> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || Config::load(&path))
+            .await
+            .expect("config read task panicked")
+    }
+}
+
 /// Loaded acpsub configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -29,6 +118,24 @@ pub struct Config {
 }
 
 impl Config {
+    /// A configuration with the given defaults and no agents; add them
+    /// with [`with_agent`](Self::with_agent). This is how a host builds a
+    /// config in memory.
+    #[must_use]
+    pub const fn new(defaults: Defaults) -> Self {
+        Self {
+            defaults,
+            agents: BTreeMap::new(),
+        }
+    }
+
+    /// Add (or replace) the agent configured under `name`.
+    #[must_use]
+    pub fn with_agent(mut self, name: impl Into<String>, agent: AgentConfig) -> Self {
+        self.agents.insert(name.into(), agent);
+        self
+    }
+
     /// Load and parse a config file.
     ///
     /// A missing file is an error naming the path; so is a file that does not
@@ -131,6 +238,23 @@ pub struct Defaults {
     pub transcript_retention: Duration,
 }
 
+impl Defaults {
+    /// Defaults storing transcripts under `transcript_dir` and the
+    /// registry at `registry`; every other field takes the value a config
+    /// file would give it when unset.
+    #[must_use]
+    pub fn new(transcript_dir: impl Into<PathBuf>, registry: impl Into<PathBuf>) -> Self {
+        Self {
+            agent: None,
+            permission: PermissionPolicy::default(),
+            transcript_dir: transcript_dir.into(),
+            registry: registry.into(),
+            wait_grace: crate::watchdog::WAIT_GRACE,
+            transcript_retention: crate::prune::TRANSCRIPT_RETENTION,
+        }
+    }
+}
+
 /// How `session/request_permission` requests are answered.
 #[derive(
     Debug,
@@ -213,6 +337,22 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    /// An agent running `command` with no arguments, no extra
+    /// environment, confined to the session cwd, with the default
+    /// permission and steer contracts.
+    #[must_use]
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            allow_outside_cwd: false,
+            permission: None,
+            steer: SteerSemantics::default(),
+            sessions_db: None,
+        }
+    }
+
     /// The session database `adopt` should consult for `cwd` discovery.
     ///
     /// Beyond the configured path, a `devin` agent falls back to the devin

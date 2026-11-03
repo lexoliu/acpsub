@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use acpsub::config::PermissionPolicy;
-use acpsub::{AppState, Config, RenderOptions, build_tools, default_config_path, render};
+use acpsub::{
+    AppState, Config, FileConfigSource, RenderOptions, build_tools, default_config_path, render,
+};
 use aither_mcp::protocol::{CallToolResult, Content};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
@@ -805,7 +807,7 @@ async fn serve(
     init_logging(log_file)?;
     let config_path = config_path(config)?;
     let config = Config::load(&config_path)?;
-    let state = AppState::new(config, config_path)?;
+    let state = AppState::new(config, FileConfigSource::new(config_path))?;
     let tools = build_tools(state)?;
     let mut server = aither_mcp::McpServer::stdio(tools, "acpsub", env!("CARGO_PKG_VERSION"));
     server.run().await.map_err(|error| {
@@ -831,7 +833,7 @@ async fn daemon(
     init_logging(log_file)?;
     let config_path = config_path(config)?;
     let config = Config::load(&config_path)?;
-    let state = AppState::new(config, config_path)?;
+    let state = AppState::new(config, FileConfigSource::new(config_path))?;
     acpsub::daemon::run(state, &socket).await?;
     Ok(())
 }

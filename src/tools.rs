@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
+use crate::host::{SessionSpec, TurnEnd, TurnOutcome, spawn_session};
 use crate::prose;
 use crate::registry::RegistryEntry;
 use crate::state::{
@@ -165,7 +166,7 @@ fn spawned_view(sub: &Subagent) -> Value {
 /// Returns [`Error::Internal`] when the status is `running` but no turn
 /// start is recorded — a broken invariant, never a case to wait through
 /// unbounded.
-fn awaited_turn(sub: &Subagent) -> Result<Option<u64>> {
+pub(crate) fn awaited_turn(sub: &Subagent) -> Result<Option<u64>> {
     let inner = sub.rt.inner.lock().expect("inner poisoned");
     // A turn whose end is not yet recorded is still in flight — unless a
     // steered turn materialized meanwhile: that one is newer, and its end
@@ -443,7 +444,7 @@ fn check_all_expect_not_past(
 
 /// How a `wait`/`wait_any` ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WaitOutcome {
+pub(crate) enum WaitOutcome {
     /// The awaited turn left `running` — ended, parked on a permission,
     /// or gone with the session — and the result reports that state.
     Ended,
@@ -458,12 +459,21 @@ enum WaitOutcome {
     MaxWait,
 }
 
+/// A structured value as the compact JSON text a tool answers with.
+pub(crate) fn json_text(value: &Value) -> ToolResult {
+    ToolResult::text(value.to_string())
+}
+
 /// Answer a tool call: the structured `view` when `json` was set, its
 /// prose rendering otherwise. Both describe the same value, so the two
 /// forms can never disagree.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every caller hands over a view built for this one answer"
+)]
 fn emit(json: bool, view: Value, prose: impl FnOnce(&Value) -> String) -> ToolResult {
     if json {
-        ToolResult::json_value(view)
+        json_text(&view)
     } else {
         ToolResult::text(prose(&view))
     }
@@ -625,6 +635,78 @@ fn wait_view(
     view
 }
 
+/// The typed form of what `wait` reports for a turn that ended: the same
+/// snapshot [`wait_view`] renders, as a [`TurnOutcome`]. `awaited` is the
+/// turn the wait bound to (see [`awaited_turn`]).
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] when the snapshot holds no turn or a
+/// status that has not ended one.
+///
+/// # Panics
+///
+/// Panics on an `Overrun` or `MaxWait` outcome: only a bounded wait
+/// produces one, and this reports unbounded waits.
+pub(crate) fn turn_outcome(
+    sub: &Subagent,
+    awaited: Option<u64>,
+    outcome: WaitOutcome,
+) -> Result<TurnOutcome> {
+    assert!(
+        matches!(outcome, WaitOutcome::Ended | WaitOutcome::RateLimited),
+        "an unbounded wait cannot overrun or time out"
+    );
+    let snap = wait_snapshot(sub, awaited);
+    let internal = |detail: String| Error::Internal {
+        session_id: sub.session_id.clone(),
+        detail,
+    };
+    let turn = snap
+        .turn_n
+        .ok_or_else(|| internal("a finished wait found no turn".to_string()))?;
+    let end = match (&snap.status, snap.ended_reason) {
+        (
+            Status::RateLimited {
+                resume_at, reason, ..
+            },
+            _,
+        ) => TurnEnd::RateLimited {
+            resume_at: *resume_at,
+            reason: reason.clone(),
+        },
+        (_, _) if outcome == WaitOutcome::RateLimited => {
+            return Err(internal(
+                "the turn was rate limited but the session is not parked".to_string(),
+            ));
+        }
+        // The awaited turn's own end wins over the session status, which
+        // may already show the turn that chained after it.
+        (_, Some(reason)) => TurnEnd::Stopped(reason),
+        (Status::Done(reason), None) => TurnEnd::Stopped(*reason),
+        (Status::Cancelled, None) => TurnEnd::Stopped(StopReason::Cancelled),
+        (Status::Failed(reason), None) => TurnEnd::Failed(reason.clone()),
+        (Status::Exited(reason), None) => TurnEnd::Exited(reason.clone()),
+        (Status::NeedsPermission, None) => {
+            let (request_id, title) = snap
+                .pending_request
+                .ok_or_else(|| internal("needs_permission with no queued request".to_string()))?;
+            TurnEnd::NeedsPermission { request_id, title }
+        }
+        (status @ (Status::Idle | Status::Running), None) => {
+            return Err(internal(format!(
+                "a finished wait left the session {}",
+                status.name()
+            )));
+        }
+    };
+    Ok(TurnOutcome {
+        turn,
+        reply: snap.reply,
+        end,
+    })
+}
+
 /// The wall-clock moment the watchdog cancels a turn left unwatched from
 /// now: its own arithmetic — the monotonic clock it counts plus
 /// `wait_grace`, the same value — translated to a timestamp, never a
@@ -645,6 +727,8 @@ struct WaitSnapshot {
     reply: String,
     /// The first queued permission request's view, when any wait.
     pending: Option<Value>,
+    /// The first queued permission request's id and tool call title.
+    pending_request: Option<(String, String)>,
     /// The reported turn's number — the awaited turn's when it is bound.
     turn_n: Option<u64>,
     /// Client-side queued prompt count.
@@ -681,6 +765,10 @@ fn wait_snapshot(sub: &Subagent, awaited: Option<u64>) -> WaitSnapshot {
         status: inner.status.clone(),
         reply: turn.map_or_else(String::new, |turn| turn.reply.clone()),
         pending: inner.pending.first().map(pending_view),
+        pending_request: inner
+            .pending
+            .first()
+            .map(|perm| (perm.request_id.clone(), perm.tool_call.title.clone())),
         turn_n,
         queued: inner.queue.len(),
         elapsed: turn
@@ -758,26 +846,15 @@ impl Tool for SpawnTool {
     type Res = ToolResult;
 
     async fn call(&self, args: SpawnArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
-        let config = self.0.load_config()?;
-        let (agent, _) = config.resolve_agent(args.agent.as_deref())?;
-        // A limited quota scope refuses the prompt before any process
-        // starts: it would burn against a limit the daemon already knows.
-        crate::ratelimit::refuse_if_limited(&self.0, agent)?;
-        let sub = launch(
-            &self.0,
-            &config,
-            Launch {
-                agent: agent.clone(),
-                cwd: args.cwd,
-                prompt: Some(args.prompt),
-                mode: args.mode,
-                model: args.model,
-                config: args.config.unwrap_or_default(),
-                permission: args.permission,
-                load: None,
-            },
-        )
-        .await?;
+        let spec = SessionSpec {
+            agent: args.agent,
+            cwd: args.cwd,
+            model: args.model,
+            mode: args.mode,
+            config: args.config.unwrap_or_default(),
+            permission: args.permission,
+        };
+        let sub = spawn_session(&self.0, spec, Some(args.prompt)).await?;
         Ok(emit(args.json, spawned_view(&sub), prose::spawned))
     }
 }
@@ -858,7 +935,7 @@ impl Tool for AdoptTool {
             .agent
             .as_deref()
             .or_else(|| registered.as_ref().map(|entry| entry.agent.as_str()));
-        let config = self.0.load_config()?;
+        let config = self.0.load_config().await?;
         let (agent, agent_cfg) = config.resolve_agent(requested)?;
         if args.prompt.is_some() {
             crate::ratelimit::refuse_if_limited(&self.0, agent)?;
@@ -1242,74 +1319,169 @@ impl Tool for WaitTool {
             .max_wait_secs
             .and_then(|secs| started.checked_add(Duration::from_secs(secs)));
         #[expect(clippy::cast_precision_loss, reason = "sub-second precision is enough")]
-        let expect = args.expect_secs as f64;
-        let interval = self.interval;
-        let mut next_report = started;
-        let outcome = loop {
-            // Armed before the state is read, so a wake that lands between
-            // the read and the await is not lost.
-            let notified = sub.rt.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let state = awaited_elapsed(&sub, awaited)?;
-            // A running turn is re-sampled every 0.25 s. A steer hold
-            // makes no turn progress: it wakes on the notify every steer
-            // resolution sends — `steer_resolved` (a closed connection
-            // fails the steer's request, so `close` lands there too), a
-            // fold at a turn's end, agent exit — or on a deadline.
-            let resample = if matches!(state, Awaited::Running(_)) {
-                0.25
-            } else {
-                f64::MAX
-            };
-            match state {
-                Awaited::Ended => break WaitOutcome::Ended,
-                Awaited::RateLimited => break WaitOutcome::RateLimited,
-                Awaited::Running(elapsed) | Awaited::Steers(elapsed) => {
-                    if elapsed >= expect {
-                        break WaitOutcome::Overrun;
-                    }
-                    let now = Instant::now();
-                    if deadline.is_some_and(|deadline| now >= deadline) {
-                        break WaitOutcome::MaxWait;
-                    }
-                    if now >= next_report {
-                        cx.report_progress(wait_progress(&sub, started, elapsed, args.expect_secs))
-                            .await?;
-                        next_report = now + interval;
-                    }
-                    let wake = (expect - elapsed)
-                        .min(resample)
-                        .min(next_report.saturating_duration_since(now).as_secs_f64())
-                        .min(deadline.map_or(f64::MAX, |deadline| {
-                            deadline.saturating_duration_since(now).as_secs_f64()
-                        }));
-                    tokio::select! {
-                        () = notified => {},
-                        () = tokio::time::sleep(Duration::from_secs_f64(wake)) => {},
-                    }
-                }
-                // The session is parked rate-limited and the awaited turn
-                // is the resume's continuation: freeze — bound by the
-                // wait's own deadline alone. No turn progress happens
-                // while parked, so there is nothing new to report.
-                Awaited::Paused => {
-                    let now = Instant::now();
-                    if deadline.is_some_and(|deadline| now >= deadline) {
-                        break WaitOutcome::MaxWait;
-                    }
-                    let wake = 0.25_f64.min(deadline.map_or(f64::MAX, |deadline| {
-                        deadline.saturating_duration_since(now).as_secs_f64()
-                    }));
-                    tokio::select! {
-                        () = notified => {},
-                        () = tokio::time::sleep(Duration::from_secs_f64(wake)) => {},
-                    }
-                }
-            }
+        let bound = WaitBound {
+            expect: args.expect_secs as f64,
+            deadline,
         };
+        let mut reporter = ToolReporter {
+            cx: &mut cx,
+            interval: self.interval,
+            expect_secs: args.expect_secs,
+        };
+        let outcome = wait_for_turn(&sub, awaited, started, &bound, &mut reporter).await?;
         Ok(answer(outcome, Some(awaited)))
     }
+}
+
+/// The bound a [`wait_for_turn`] runs under.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WaitBound {
+    /// Seconds from the awaited turn's start after which the wait ends as
+    /// an overrun; infinite for a wait the turn alone ends.
+    pub expect: f64,
+    /// The wait call's own deadline, if any.
+    pub deadline: Option<Instant>,
+}
+
+/// Where a blocked [`wait_for_turn`] sends its interval progress reports.
+pub(crate) trait WaitReporter {
+    /// What a rejected report fails the wait with.
+    type Error: From<Error>;
+
+    /// How often to report; `None` reports never.
+    fn interval(&self) -> Option<Duration>;
+
+    /// Send one report for `sub`'s awaited turn, `elapsed` seconds in.
+    fn report(
+        &mut self,
+        sub: &Subagent,
+        started: Instant,
+        elapsed: f64,
+    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
+}
+
+/// The `wait` tool's reporter: progress notifications on the call's
+/// [`ToolContext`].
+struct ToolReporter<'a> {
+    cx: &'a mut ToolContext,
+    interval: Duration,
+    expect_secs: u64,
+}
+
+impl WaitReporter for ToolReporter<'_> {
+    type Error = aither_core::Error;
+
+    fn interval(&self) -> Option<Duration> {
+        Some(self.interval)
+    }
+
+    async fn report(
+        &mut self,
+        sub: &Subagent,
+        started: Instant,
+        elapsed: f64,
+    ) -> aither_core::Result<()> {
+        self.cx
+            .report_progress(wait_progress(sub, started, elapsed, self.expect_secs))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Block until the turn `awaited` that `sub` is running ends, a
+/// permission request needs an answer, the turn has run past
+/// `bound.expect`, or `bound.deadline` passes — the loop behind `wait`
+/// and the library's `prompt`.
+///
+/// The caller holds a [`crate::watchdog::Waiter`] for the duration: the
+/// attachment is what keeps the watchdog from cancelling the turn.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] when the turn's start is not recorded, and
+/// the reporter's error when it rejects a report.
+pub(crate) async fn wait_for_turn<R: WaitReporter + Send>(
+    sub: &Subagent,
+    awaited: u64,
+    started: Instant,
+    bound: &WaitBound,
+    reporter: &mut R,
+) -> std::result::Result<WaitOutcome, R::Error> {
+    let expect = bound.expect;
+    let deadline = bound.deadline;
+    let mut next_report = started;
+    loop {
+        // Armed before the state is read, so a wake that lands between
+        // the read and the await is not lost.
+        let notified = sub.rt.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let state = awaited_elapsed(sub, awaited)?;
+        // A running turn is re-sampled every 0.25 s. A steer hold
+        // makes no turn progress: it wakes on the notify every steer
+        // resolution sends — `steer_resolved` (a closed connection
+        // fails the steer's request, so `close` lands there too), a
+        // fold at a turn's end, agent exit — or on a deadline.
+        let resample = if matches!(state, Awaited::Running(_)) {
+            0.25
+        } else {
+            f64::MAX
+        };
+        match state {
+            Awaited::Ended => return Ok(WaitOutcome::Ended),
+            Awaited::RateLimited => return Ok(WaitOutcome::RateLimited),
+            Awaited::Running(elapsed) | Awaited::Steers(elapsed) => {
+                if elapsed >= expect {
+                    return Ok(WaitOutcome::Overrun);
+                }
+                let now = Instant::now();
+                if deadline.is_some_and(|deadline| now >= deadline) {
+                    return Ok(WaitOutcome::MaxWait);
+                }
+                let report_in = if let Some(interval) = reporter.interval() {
+                    if now >= next_report {
+                        reporter.report(sub, started, elapsed).await?;
+                        next_report = now + interval;
+                    }
+                    next_report.saturating_duration_since(now).as_secs_f64()
+                } else {
+                    f64::MAX
+                };
+                let wake = (expect - elapsed).min(resample).min(report_in).min(
+                    deadline.map_or(f64::MAX, |deadline| {
+                        deadline.saturating_duration_since(now).as_secs_f64()
+                    }),
+                );
+                tokio::select! {
+                    () = notified => {},
+                    () = tokio::time::sleep(wake_after(wake)) => {},
+                }
+            }
+            // The session is parked rate-limited and the awaited turn
+            // is the resume's continuation: freeze — bound by the
+            // wait's own deadline alone. No turn progress happens
+            // while parked, so there is nothing new to report.
+            Awaited::Paused => {
+                let now = Instant::now();
+                if deadline.is_some_and(|deadline| now >= deadline) {
+                    return Ok(WaitOutcome::MaxWait);
+                }
+                let wake = 0.25_f64.min(deadline.map_or(f64::MAX, |deadline| {
+                    deadline.saturating_duration_since(now).as_secs_f64()
+                }));
+                tokio::select! {
+                    () = notified => {},
+                    () = tokio::time::sleep(wake_after(wake)) => {},
+                }
+            }
+        }
+    }
+}
+
+/// `secs` as a sleep span; one no clock reaches is a sleep only a notify
+/// ends.
+fn wake_after(secs: f64) -> Duration {
+    Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
 }
 
 /// Block until the first of several subagents' awaited turn ends — each
@@ -1715,34 +1887,49 @@ impl Tool for CancelTool {
 
     async fn call(&self, args: CancelArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
         let sub = self.0.get(&args.session_id)?;
-        let (dropped, turn_n) = {
-            let mut inner = sub.rt.inner.lock().expect("inner poisoned");
-            if !matches!(inner.status, Status::Running | Status::NeedsPermission) {
-                return Err(Error::NotRunning(args.session_id.clone()).into());
-            }
-            for pending in inner.pending.drain(..) {
-                let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
-            }
-            (
-                std::mem::take(&mut inner.queue),
-                inner.current.as_ref().map(|turn| turn.n),
-            )
-        };
-        record_queue_dropped(&sub.rt, turn_n, dropped).await;
-        sub.rt.notify.notify_waiters();
-        sub.client
-            .cancel(sub.session_id.as_str())
-            .await
-            .map_err(|source| Error::Agent {
-                agent: args.session_id.clone(),
-                source,
-            })?;
+        cancel_turn(&sub).await?;
         Ok(emit(
             args.json,
             json!({"session_id": args.session_id, "cancelled": true}),
             prose::cancel,
         ))
     }
+}
+
+/// Cancel `sub`'s running turn: answer every queued permission request
+/// `cancelled`, drop the prompts parked behind the turn, then send
+/// `session/cancel`. The turn ends with the agent's `cancelled` stop
+/// reason.
+///
+/// Shared by the `cancel` tool and the library's `Session::cancel`.
+///
+/// # Errors
+///
+/// Returns [`Error::NotRunning`] when no turn is in flight, and
+/// [`Error::Agent`] when the agent rejects the cancel.
+pub(crate) async fn cancel_turn(sub: &Subagent) -> Result<()> {
+    let (dropped, turn_n) = {
+        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+        if !matches!(inner.status, Status::Running | Status::NeedsPermission) {
+            return Err(Error::NotRunning(sub.session_id.clone()));
+        }
+        for pending in inner.pending.drain(..) {
+            let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
+        }
+        (
+            std::mem::take(&mut inner.queue),
+            inner.current.as_ref().map(|turn| turn.n),
+        )
+    };
+    record_queue_dropped(&sub.rt, turn_n, dropped).await;
+    sub.rt.notify.notify_waiters();
+    sub.client
+        .cancel(sub.session_id.as_str())
+        .await
+        .map_err(|source| Error::Agent {
+            agent: sub.session_id.clone(),
+            source,
+        })
 }
 
 /// Answer a permission request queued by the `ask` policy.
@@ -2070,49 +2257,72 @@ impl Tool for CloseTool {
     type Res = ToolResult;
 
     async fn call(&self, args: CloseArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
-        let found = end_target(&self.0, &args.session_id, false);
-        if matches!(found, SessionEnd::Missing) {
-            self.0.not_shipped(&args.session_id)?;
+        let closed = close_session(&self.0, &args.session_id).await?;
+        let view = match closed {
+            Closed::Live => json!({"session_id": args.session_id, "closed": true}),
+            Closed::Launching => json!({
+                "session_id": args.session_id,
+                "closed": true,
+                "launch_in_flight": true,
+            }),
+            Closed::Registered => {
+                json!({"session_id": args.session_id, "closed": true, "was_live": false})
+            }
+        };
+        Ok(emit(args.json, view, prose::close))
+    }
+}
+
+/// What [`close_session`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Closed {
+    /// A live session: its agent process was torn down.
+    Live,
+    /// A `session/load` launch still in flight: it ends the session as
+    /// soon as it lands.
+    Launching,
+    /// A registered session with no live process: its resume schedule was
+    /// consumed.
+    Registered,
+}
+
+/// End a session on purpose: tear a live one down, mark a launching one
+/// closed, or consume the resume schedule of a registered one. The
+/// registry entry stays, so `adopt` can resume the session.
+///
+/// Shared by the `close` tool and the library's `Session::close`.
+///
+/// # Errors
+///
+/// Returns [`Error::UnknownSession`] when the id is neither live,
+/// launching nor registered, and the handed-off errors
+/// [`AppState::not_shipped`] reports.
+pub(crate) async fn close_session(state: &Arc<AppState>, session_id: &str) -> Result<Closed> {
+    let found = end_target(state, session_id, false);
+    if matches!(found, SessionEnd::Missing) {
+        state.not_shipped(session_id)?;
+    }
+    match found {
+        SessionEnd::Live(sub) => {
+            end_session(state, &sub).await;
+            Ok(Closed::Live)
         }
-        match found {
-            SessionEnd::Live(sub) => {
-                end_session(&self.0, &sub).await;
-                Ok(emit(
-                    args.json,
-                    json!({"session_id": args.session_id, "closed": true}),
-                    prose::close,
-                ))
-            }
-            SessionEnd::Launching => {
-                unschedule_resume(&self.0, &args.session_id).await;
-                Ok(emit(
-                    args.json,
-                    json!({
-                        "session_id": args.session_id,
-                        "closed": true,
-                        "launch_in_flight": true,
-                    }),
-                    prose::close,
-                ))
-            }
-            SessionEnd::Missing
-                if self
-                    .0
-                    .registry
-                    .lock()
-                    .expect("registry poisoned")
-                    .get(&args.session_id)
-                    .is_some() =>
-            {
-                unschedule_resume(&self.0, &args.session_id).await;
-                Ok(emit(
-                    args.json,
-                    json!({"session_id": args.session_id, "closed": true, "was_live": false}),
-                    prose::close,
-                ))
-            }
-            SessionEnd::Missing => Err(Error::UnknownSession(args.session_id).into()),
+        SessionEnd::Launching => {
+            unschedule_resume(state, session_id).await;
+            Ok(Closed::Launching)
         }
+        SessionEnd::Missing
+            if state
+                .registry
+                .lock()
+                .expect("registry poisoned")
+                .get(session_id)
+                .is_some() =>
+        {
+            unschedule_resume(state, session_id).await;
+            Ok(Closed::Registered)
+        }
+        SessionEnd::Missing => Err(Error::UnknownSession(session_id.to_string())),
     }
 }
 
@@ -2193,24 +2403,16 @@ impl Tool for AgentsTool {
     type Arguments = AgentsArgs;
     type Res = ToolResult;
 
-    fn call(
-        &self,
-        args: AgentsArgs,
-        _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<ToolResult>> + Send {
-        std::future::ready(
-            self.agents()
-                .map(|view| emit(args.json, view, prose::agents))
-                .map_err(Into::into),
-        )
+    async fn call(&self, args: AgentsArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+        let view = self.agents().await?;
+        Ok(emit(args.json, view, prose::agents))
     }
 }
 
 impl AgentsTool {
-    /// Synchronous body: `agents` re-reads the config file and reads shared
-    /// state.
-    fn agents(&self) -> Result<Value> {
-        let config = self.0.load_config()?;
+    /// `agents` re-reads the config and reads shared state.
+    async fn agents(&self) -> Result<Value> {
+        let config = self.0.load_config().await?;
         // Per-agent: ids of its live subagents and the info the first such
         // process reported (agent_info, modes, config options).
         let live: Vec<Arc<Subagent>> = self
