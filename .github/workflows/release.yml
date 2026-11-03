@@ -145,6 +145,8 @@ jobs:
     if: always() && (github.event_name == 'workflow_dispatch' || needs.release.outputs.tag != '')
     permissions:
       contents: read
+      attestations: write
+      id-token: write
     env:
       TAG: ${{ needs.release.outputs.tag || inputs.tag }}
     strategy:
@@ -183,6 +185,14 @@ jobs:
             --artifacts=local \
             --target "${{ matrix.target }}"
 
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            target/distrib/*${{ matrix.target }}*.tar.xz
+            target/distrib/*${{ matrix.target }}*.zip
+            target/distrib/*${{ matrix.target }}*.sha256
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -202,6 +212,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: write
+      id-token: write
     env:
       TAG: ${{ needs.release.outputs.tag || inputs.tag }}
     steps:
@@ -223,6 +235,14 @@ jobs:
 
       - name: Build global release artifacts
         run: dist build --tag "${{ env.TAG }}" --artifacts=global
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            target/distrib/*.sh
+            target/distrib/*.ps1
+            target/distrib/sha256.sum
 
       # The patterns must not overlap. `*.tar.*` would also match every
       # `…tar.xz.sha256` that `*.sha256` matches again, listing each checksum
