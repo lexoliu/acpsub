@@ -126,6 +126,56 @@ async fn cancel_ends_the_pending_prompt() {
         .expect("close");
 }
 
+/// A cancel accepted before the turn's prompt is on the wire is sent
+/// right behind the prompt instead of being lost. Holding the transcript
+/// lock parks `begin_turn` after it marks the turn `Running` and before
+/// it enqueues `session/prompt`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_before_the_prompt_is_on_the_wire() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (host, _) = host(dir.path(), fake_agent_config(), Duration::from_secs(60));
+    let session = Arc::new(host.spawn(spec(dir.path())).await.expect("spawn"));
+    let sub = host.state().get(session.session_id()).expect("live");
+
+    let guard = sub.rt.transcript.lock().await;
+    let turn = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("wait").await }
+    });
+    // `begin_turn` is parked on the transcript once the turn is current.
+    let mut cancelled = false;
+    for _ in 0..200 {
+        if session.cancel().await.is_ok() {
+            cancelled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(cancelled, "the turn never started");
+    assert!(
+        sub.rt
+            .inner
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .is_some_and(|turn| !turn.on_wire && turn.cancel_requested),
+        "the cancel must land inside the window"
+    );
+    drop(guard);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(30), turn)
+        .await
+        .expect("the cancelled turn hung")
+        .unwrap()
+        .expect("prompt");
+    assert_eq!(outcome.end, TurnEnd::Stopped(StopReason::Cancelled));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn awaited_prompt_feeds_the_watchdog() {
     if !python3() {

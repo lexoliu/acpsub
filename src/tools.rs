@@ -1892,7 +1892,7 @@ impl Tool for CancelTool {
 /// Returns [`Error::NotRunning`] when no turn is in flight, and
 /// [`Error::Agent`] when the agent rejects the cancel.
 pub(crate) async fn cancel_turn(sub: &Subagent) -> Result<()> {
-    let (dropped, turn_n) = {
+    let (dropped, turn_n, deferred) = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         if !matches!(inner.status, Status::Running | Status::NeedsPermission) {
             return Err(Error::NotRunning(sub.session_id.clone()));
@@ -1900,13 +1900,24 @@ pub(crate) async fn cancel_turn(sub: &Subagent) -> Result<()> {
         for pending in inner.pending.drain(..) {
             let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
         }
+        // A turn whose prompt is not on the wire yet would see the cancel
+        // first and ignore it: `begin_turn` sends it behind the prompt.
+        let deferred = inner.current.as_mut().is_some_and(|turn| {
+            let defer = !turn.on_wire;
+            turn.cancel_requested |= defer;
+            defer
+        });
         (
             std::mem::take(&mut inner.queue),
             inner.current.as_ref().map(|turn| turn.n),
+            deferred,
         )
     };
     record_queue_dropped(&sub.rt, turn_n, dropped).await;
     sub.rt.notify.notify_waiters();
+    if deferred {
+        return Ok(());
+    }
     sub.client
         .cancel(sub.session_id.as_str())
         .await

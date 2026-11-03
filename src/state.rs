@@ -556,6 +556,13 @@ pub struct Turn {
     /// Resolutions of the steers that targeted this turn, in the order
     /// they resolved — `wait` lists them.
     pub steers: Vec<SteerEnd>,
+    /// The turn's `session/prompt` is on the wire: a `session/cancel`
+    /// sent before that reaches the agent ahead of the prompt and is
+    /// ignored.
+    pub on_wire: bool,
+    /// A cancel arrived while the prompt was not yet on the wire;
+    /// [`begin_turn`] sends it right after the prompt is enqueued.
+    pub cancel_requested: bool,
 }
 
 /// A steered `session/prompt` still in flight on the wire.
@@ -2137,6 +2144,22 @@ pub(crate) async fn begin_turn(
     sub.rt.notify.notify_waiters();
 
     let fut = enqueue_prompt(&sub.client, &sub.session_id, prompt).await;
+    // The prompt is on the wire: a cancel that landed before it was
+    // recorded, not sent, and goes out now, behind the prompt.
+    let cancel_now = {
+        let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+        inner
+            .current
+            .as_mut()
+            .filter(|turn| turn.n == turn_n)
+            .is_some_and(|turn| {
+                turn.on_wire = true;
+                std::mem::take(&mut turn.cancel_requested)
+            })
+    };
+    if cancel_now && let Err(error) = sub.client.cancel(sub.session_id.as_str()).await {
+        warn!(%error, "deferred cancel failed");
+    }
     Ok((turn_n, fut))
 }
 
