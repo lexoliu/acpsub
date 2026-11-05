@@ -25,6 +25,8 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::error::Error;
+use crate::executor::Executor;
+use crate::permission::PermissionHandler;
 use crate::registry::{Registry, ResumePlan};
 use crate::state::{
     AppState, Gate, Launch, Status, Subagent, begin_turn, launch, now, spawn_turn_task, start_turn,
@@ -191,7 +193,7 @@ pub(crate) fn restored_limits(registry: &Registry) -> BTreeMap<QuotaScope, Limit
 /// The quota gate for `agent`'s scope: `Some(limit)` while its reported
 /// `resume_at` is still ahead — a prompt now would burn against an
 /// already-known limit. An expired gate is dropped on read.
-pub(crate) fn active_limit(state: &AppState, agent: &str) -> Option<Limit> {
+pub(crate) fn active_limit<E, P>(state: &AppState<E, P>, agent: &str) -> Option<Limit> {
     let mut limits = state.limits.lock().expect("limits poisoned");
     let scope = QuotaScope::for_agent(agent);
     match limits.get(&scope) {
@@ -219,7 +221,7 @@ pub(crate) fn active_limit(state: &AppState, agent: &str) -> Option<Limit> {
 /// # Panics
 ///
 /// Panics if the limits mutex is poisoned.
-pub(crate) fn refuse_if_limited(state: &AppState, agent: &str) -> crate::Result<()> {
+pub(crate) fn refuse_if_limited<E, P>(state: &AppState<E, P>, agent: &str) -> crate::Result<()> {
     let Some(limit) = active_limit(state, agent) else {
         return Ok(());
     };
@@ -239,8 +241,8 @@ pub(crate) fn refuse_if_limited(state: &AppState, agent: &str) -> crate::Result<
 /// # Panics
 ///
 /// Panics if a state mutex is poisoned.
-pub(crate) async fn repark_prompt(
-    state: &Arc<AppState>,
+pub(crate) async fn repark_prompt<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
     sub: &Arc<Subagent>,
     prompt: &str,
     limit: &Limit,
@@ -273,8 +275,8 @@ pub(crate) async fn repark_prompt(
 /// registry's `rate_limited` flag — with the session's queue, so a dead
 /// agent process cannot take the parked prompts with it — and a `notify`
 /// for `wait` callers.
-async fn record_park(
-    state: &Arc<AppState>,
+async fn record_park<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
     sub: &Subagent,
     prompt: &str,
     resume_at: jiff::Timestamp,
@@ -322,7 +324,11 @@ async fn record_park(
 /// # Panics
 ///
 /// Panics if a state mutex is poisoned.
-pub(crate) async fn note_limit(state: &Arc<AppState>, agent: &str, hit: &RateLimit) {
+pub(crate) async fn note_limit<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    agent: &str,
+    hit: &RateLimit,
+) {
     let scope = QuotaScope::for_agent(agent);
     let resume_at = {
         let mut limits = state.limits.lock().expect("limits poisoned");
@@ -375,7 +381,7 @@ pub(crate) async fn note_limit(state: &Arc<AppState>, agent: &str, hit: &RateLim
 /// # Panics
 ///
 /// Panics if called outside a Tokio runtime — every caller is async.
-pub(crate) fn ensure_scheduler(state: &Arc<AppState>) {
+pub(crate) fn ensure_scheduler<E: Executor, P: PermissionHandler>(state: &Arc<AppState<E, P>>) {
     if state.scheduler_started.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -387,7 +393,7 @@ pub(crate) fn ensure_scheduler(state: &Arc<AppState>) {
 /// they do not burst — then sleeps until the next one or the next
 /// parked limit. Exits when nothing outside the task holds the
 /// `AppState`: a `serve`/`daemon` shutdown, or a test dropping it.
-async fn limit_scheduler(state: Arc<AppState>) {
+async fn limit_scheduler<E: Executor, P: PermissionHandler>(state: Arc<AppState<E, P>>) {
     loop {
         if Arc::strong_count(&state) <= 1 {
             return;
@@ -411,7 +417,7 @@ async fn limit_scheduler(state: Arc<AppState>) {
 
 /// Every registry-parked session whose `resume_at` has passed, in
 /// session-id order — stable, so the stagger is deterministic.
-fn parked_due(state: &AppState, now: jiff::Timestamp) -> Vec<String> {
+fn parked_due<E, P>(state: &AppState<E, P>, now: jiff::Timestamp) -> Vec<String> {
     state
         .registry
         .lock()
@@ -429,7 +435,7 @@ fn parked_due(state: &AppState, now: jiff::Timestamp) -> Vec<String> {
 }
 
 /// The earliest `resume_at` still parked — the scheduler's next wake.
-fn parked_next(state: &AppState) -> Option<jiff::Timestamp> {
+fn parked_next<E, P>(state: &AppState<E, P>) -> Option<jiff::Timestamp> {
     state
         .registry
         .lock()
@@ -455,7 +461,10 @@ fn parked_next(state: &AppState) -> Option<jiff::Timestamp> {
 /// that scheduler skips any session an older generation still owns, one
 /// whose own handoff-resume or `session/load` launch is already in
 /// flight.
-async fn resume_parked(state: &Arc<AppState>, session_id: &str) {
+async fn resume_parked<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    session_id: &str,
+) {
     if state.handover.superseded.load(Ordering::Relaxed)
         || state
             .handover
@@ -521,7 +530,10 @@ fn reserve_resume_turn(sub: &Subagent) -> Option<(String, bool)> {
 }
 
 /// Resume a parked session whose process lives, in its own ACP session.
-async fn resume_live(state: &Arc<AppState>, sub: &Arc<Subagent>) {
+async fn resume_live<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    sub: &Arc<Subagent>,
+) {
     let session_id = sub.session_id.as_str();
     if let Some((prompt, queued)) = reserve_resume_turn(sub) {
         clear_parked(state, session_id).await;
@@ -557,7 +569,10 @@ async fn resume_live(state: &Arc<AppState>, sub: &Arc<Subagent>) {
 
 /// The process is gone — resume the same ACP session on a fresh one with
 /// `session/load`.
-async fn resume_loaded(state: &Arc<AppState>, session_id: &str) {
+async fn resume_loaded<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    session_id: &str,
+) {
     let entry = state
         .registry
         .lock()
@@ -641,7 +656,10 @@ async fn resume_loaded(state: &Arc<AppState>, session_id: &str) {
 
 /// Consume the registry's parked flag for a session — the resume
 /// schedule does not fire twice.
-async fn clear_parked(state: &Arc<AppState>, session_id: &str) {
+async fn clear_parked<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    session_id: &str,
+) {
     let result = state
         .update_registry(|registry| {
             if let Some(entry) = registry.get_mut(session_id) {

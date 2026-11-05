@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
+use crate::executor::Executor;
+use crate::permission::PermissionHandler;
 use crate::state::{
     AppState, SessionEnd, Status, Subagent, end_session, end_target, next_turn_number,
 };
@@ -51,7 +53,10 @@ impl Drop for Waiter {
 /// session leaves `live`. Each loop either sleeps out the rest of the
 /// grace for the unwatched turn — waking early on any waiter or status
 /// change — or waits for the next change while watched or idle.
-pub async fn run(state: Arc<AppState>, sub: Arc<Subagent>) {
+pub async fn run<E: Executor, P: PermissionHandler>(
+    state: Arc<AppState<E, P>>,
+    sub: Arc<Subagent>,
+) {
     let grace = state.wait_grace;
     // The unwatched turn and when its grace began: `None` while no turn
     // runs unwatched. A turn boundary — a chained turn under a still

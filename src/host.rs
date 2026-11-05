@@ -29,7 +29,10 @@ use tokio::task::JoinHandle;
 
 use crate::config::{AgentConfig, Config, ConfigSource, ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
+use crate::executor::{Executor, HostExecutor};
 use crate::handler::SubagentHandler;
+use crate::permission::{PermissionHandler, PolicyPermissions};
+use crate::services::Services;
 use crate::state::{AppState, Launch, Subagent, connect, launch, new_runtime, start_turn};
 use crate::tools::{
     WaitBound, WaitOutcome, WaitReporter, awaited_turn, cancel_turn, close_session, turn_outcome,
@@ -89,8 +92,8 @@ impl SessionSpec {
 /// [`Error::AgentUnspecified`] for an agent that cannot be resolved, the
 /// quota refusal of a rate-limited scope, and everything [`launch`]
 /// reports.
-pub(crate) async fn spawn_session(
-    state: &Arc<AppState>,
+pub(crate) async fn spawn_session<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
     spec: SessionSpec,
     prompt: Option<String>,
 ) -> Result<Arc<Subagent>> {
@@ -118,18 +121,20 @@ pub(crate) async fn spawn_session(
 }
 
 /// A host's entry point: spawns sessions and probes agent commands.
-#[derive(Debug, Clone)]
-pub struct Host {
-    state: Arc<AppState>,
+#[derive(Debug)]
+pub struct Host<E = HostExecutor, P = PolicyPermissions> {
+    state: Arc<AppState<E, P>>,
+}
+
+impl<E, P> Clone for Host<E, P> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+        }
+    }
 }
 
 impl Host {
-    /// A host over an existing app state.
-    #[must_use]
-    pub const fn new(state: Arc<AppState>) -> Self {
-        Self { state }
-    }
-
     /// A host that builds its own app state from `config` — which fixes
     /// the transcript directory, the registry file and the watchdog
     /// grace — and re-reads `source` on every spawn.
@@ -140,11 +145,33 @@ impl Host {
     pub fn from_config(config: Config, source: impl ConfigSource + 'static) -> Result<Self> {
         AppState::new(config, source).map(Self::new)
     }
+}
 
-    /// The app state under this host, for building the MCP tools over the
-    /// same sessions.
+impl<E: Executor, P: PermissionHandler> Host<E, P> {
+    /// A host over an existing app state.
     #[must_use]
-    pub const fn state(&self) -> &Arc<AppState> {
+    pub const fn new(state: Arc<AppState<E, P>>) -> Self {
+        Self { state }
+    }
+
+    /// Like [`from_config`](Host::from_config), with `services` supplying
+    /// where the agent and its terminal commands start and who answers
+    /// the agent's permission requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry file exists but cannot be parsed.
+    pub fn from_config_with(
+        config: Config,
+        source: impl ConfigSource + 'static,
+        services: Services<E, P>,
+    ) -> Result<Self> {
+        AppState::with_services(config, source, services).map(Self::new)
+    }
+
+    /// The app state under this host.
+    #[must_use]
+    pub const fn state(&self) -> &Arc<AppState<E, P>> {
         &self.state
     }
 
@@ -158,7 +185,7 @@ impl Host {
     /// the model and mode checks — a value the agent advertises but the
     /// spec omits, or one the spec gives but the agent does not advertise,
     /// is an error. The process is killed on any error.
-    pub fn spawn(&self, spec: SessionSpec) -> impl Future<Output = Result<Session>> + Send {
+    pub fn spawn(&self, spec: SessionSpec) -> impl Future<Output = Result<Session<E, P>>> + Send {
         let state = self.state.clone();
         async move {
             let sub = spawn_session(&state, spec, None).await?;
@@ -214,12 +241,12 @@ pub struct TurnOutcome {
 /// [`close`](Self::close) to end it.
 #[derive(Debug)]
 #[must_use = "a session stays open until `close` is called"]
-pub struct Session {
-    state: Arc<AppState>,
+pub struct Session<E = HostExecutor, P = PolicyPermissions> {
+    state: Arc<AppState<E, P>>,
     sub: Arc<Subagent>,
 }
 
-impl Session {
+impl<E: Executor, P: PermissionHandler> Session<E, P> {
     /// The agent-assigned session id: the handle every tool addresses.
     #[must_use]
     pub fn session_id(&self) -> &str {
@@ -341,13 +368,30 @@ impl WaitReporter for Silent {
 /// Returns [`Error::SpawnFailed`] when the process cannot start and
 /// [`Error::Agent`] when it does not answer `initialize`.
 pub fn probe(agent: &AgentConfig) -> impl Future<Output = Result<InitializeResult>> + Send {
+    probe_with(
+        agent,
+        Services::<HostExecutor, PolicyPermissions>::default(),
+    )
+}
+
+/// [`probe`], starting the command through `services`' executor — the
+/// place the host will run the agent.
+///
+/// # Errors
+///
+/// As [`probe`].
+pub fn probe_with<E: Executor, P: PermissionHandler>(
+    agent: &AgentConfig,
+    services: Services<E, P>,
+) -> impl Future<Output = Result<InitializeResult>> + Send {
     let agent = agent.clone();
     async move {
         let cwd = std::env::current_dir()
             .map_err(|source| Error::io("cannot resolve the current directory", source))?;
+        let services = Arc::new(services);
         let rt = new_runtime(String::new(), agent.steer);
-        let handler = SubagentHandler::new(rt.clone(), cwd.clone(), PermissionPolicy::Deny, false);
-        let (client, conn, pump) = connect(&agent, &cwd, handler, rt.clone())?;
+        let (client, conn, pump) =
+            connect(&services, &agent, &cwd, PermissionPolicy::Deny, rt.clone()).await?;
         let mut process = Probed {
             rt,
             client: client.clone(),
