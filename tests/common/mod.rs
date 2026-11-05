@@ -9,7 +9,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use acpsub::config::{AgentConfig, SteerSemantics};
+use acpsub::config::{AgentConfig, FileAccess, SteerSemantics};
 use acpsub::{AppState, Config};
 use aither_core::llm::tool::{ToolContext, ToolResult, Tools};
 use serde_json::{Value, json};
@@ -67,7 +67,7 @@ pub fn fake_agent_config() -> AgentConfig {
         command: "python3".to_string(),
         args: vec![fake_agent_script().to_string_lossy().into_owned()],
         env: BTreeMap::new(),
-        allow_outside_cwd: false,
+        file_access: FileAccess::Cwd,
         permission: None,
         steer: SteerSemantics::Answered,
         sessions_db: None,
@@ -145,8 +145,12 @@ pub fn write_config(
                 .join(", ");
             let _ = write!(text, "\nenv = {{ {env} }}");
         }
-        if agent.allow_outside_cwd {
-            text.push_str("\nallow_outside_cwd = true");
+        if agent.file_access != FileAccess::Cwd {
+            let name = serde_json::to_value(agent.file_access)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let _ = write!(text, "\nfile_access = \"{name}\"");
         }
         if let Some(permission) = agent.permission {
             let name = serde_json::to_value(permission)
@@ -237,7 +241,7 @@ pub fn test_state(dir: &Path) -> (Arc<AppState>, Tools) {
     agents.insert(
         "wideopen".to_string(),
         AgentConfig {
-            allow_outside_cwd: true,
+            file_access: FileAccess::Anywhere,
             ..fake
         },
     );

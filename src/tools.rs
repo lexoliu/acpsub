@@ -807,8 +807,8 @@ struct SpawnArgs {
     /// Configured agent key (`[agents.<key>]` in the config file). Optional:
     /// falls back to `[defaults] agent`, then to the only configured agent.
     agent: Option<String>,
-    /// Working directory of the session. Agent fs/terminal access is confined
-    /// to it unless the agent config sets `allow_outside_cwd`.
+    /// Working directory of the session. The agent's fs requests are
+    /// confined to it unless the agent config sets another `file_access`.
     cwd: PathBuf,
     /// The first turn's prompt — the task for the subagent.
     prompt: String,
@@ -2438,7 +2438,7 @@ impl AgentsTool {
                 "name": name,
                 "command": agent.command,
                 "args": agent.args,
-                "allow_outside_cwd": agent.allow_outside_cwd,
+                "file_access": agent.file_access,
                 "default": implicit_default.as_ref() == Some(name),
                 "subagents": subs,
             });

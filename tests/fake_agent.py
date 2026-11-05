@@ -11,6 +11,8 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
   first 40 chars (or the error) are recorded into the reply.
 - "WRITE <path>" in the prompt -> an fs/write_text_file request; "fsw:ok" or
   the error is recorded into the reply.
+- "CAPS" in the prompt -> the client's fs capabilities from initialize are
+  recorded into the reply as "caps:read=<bool>,write=<bool>".
 - "RUN <cmd>" / "RUNLINE <cmd>" in the prompt -> terminal/create,
   wait_for_exit, output; the output, exit code, signal, and truncation flag
   are recorded into the reply.
@@ -129,6 +131,7 @@ outbound = {}       # request id -> kind: perm | fs | fsw | term-create |
                     #   term-output | term-release
 terminal_id = None
 collected = []      # markers appended to the final reply
+client_fs = {}      # the client's fs capabilities, as initialize sent them
 
 
 def new_request(method, params, kind):
@@ -319,6 +322,14 @@ def begin_turn(request_id, text):
                 ],
             },
             "perm",
+        )
+    if "CAPS" in text:
+        collected.append(
+            "caps:read=%s,write=%s"
+            % (
+                json.dumps(client_fs.get("readTextFile", False)),
+                json.dumps(client_fs.get("writeTextFile", False)),
+            )
         )
     if text.startswith("READ "):
         path = text[5:].strip()
@@ -670,6 +681,7 @@ for line in sys.stdin:
     if "method" in msg and "id" in msg:
         method, request_id, params = msg["method"], msg["id"], msg.get("params") or {}
         if method == "initialize":
+            client_fs = (params.get("clientCapabilities") or {}).get("fs") or {}
             respond(
                 request_id,
                 {

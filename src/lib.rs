@@ -6,8 +6,9 @@
 //! `acpsub daemon` (the same tool set over a Unix socket, driven by the
 //! `acpsub` CLI). It starts the process, opens an ACP session, streams
 //! every `session/update` to a per-session JSONL transcript, and serves
-//! the agent's `fs/*`, `terminal/*`, and permission requests under a
-//! configurable policy.
+//! the agent's `terminal/*` and permission requests, and its `fs/*`
+//! requests unless the agent's file access is off, under a configurable
+//! policy.
 //!
 //! The agent-assigned `session_id` is the handle every operation
 //! addresses. Sessions persist in a registry keyed by that id, so `adopt`
@@ -35,7 +36,7 @@ mod transport;
 mod watchdog;
 
 pub use config::{
-    AgentConfig, AnyConfigSource, Config, ConfigSource, Defaults, FileConfigSource,
+    AgentConfig, AnyConfigSource, Config, ConfigSource, Defaults, FileAccess, FileConfigSource,
     PermissionPolicy, SteerSemantics, default_config_path,
 };
 pub use error::{Error, Result};

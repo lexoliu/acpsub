@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use acpsub::config::{AgentConfig, ConfigSource, Defaults, PermissionPolicy};
+use acpsub::config::{AgentConfig, ConfigSource, Defaults, FileAccess, PermissionPolicy};
 use acpsub::{Config, Error, Host, SessionSpec, TurnEnd, probe};
 use aither_acp::StopReason;
 use common::*;
@@ -275,4 +275,65 @@ async fn probe_tells_acp_from_other_commands() {
         probe(&missing).await,
         Err(Error::SpawnFailed { .. })
     ));
+}
+
+/// What an agent with `access` sees of the client's file access: the
+/// replies to a `CAPS` prompt (the capabilities `initialize` advertised),
+/// a read of a file in its cwd and a write of a new one, and whether that
+/// file exists afterwards.
+async fn file_access_seen(access: FileAccess) -> (String, String, String, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let existing = dir.path().join("existing.txt");
+    std::fs::write(&existing, "host-side text").unwrap();
+    let created = dir.path().join("created.txt");
+    let agent = AgentConfig {
+        file_access: access,
+        ..fake_agent_config()
+    };
+    let (host, _) = host_with(dir.path(), agent);
+    let session = host.spawn(spec(dir.path())).await.expect("spawn");
+    let caps = session.prompt("CAPS").await.expect("caps prompt").reply;
+    let read = session
+        .prompt(format!("READ {}", existing.display()))
+        .await
+        .expect("read prompt")
+        .reply;
+    let write = session
+        .prompt(format!("WRITE {}", created.display()))
+        .await
+        .expect("write prompt")
+        .reply;
+    session.close().await.expect("close");
+    (caps, read, write, created.exists())
+}
+
+/// With file access off, `initialize` advertises neither fs method and
+/// both are refused, so nothing is read or written on the agent's behalf.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_access_off_advertises_and_serves_no_fs() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let (caps, read, write, created) = file_access_seen(FileAccess::Off).await;
+    assert!(caps.contains("caps:read=false,write=false"), "{caps}");
+    assert!(read.contains("fserr:Method not found"), "{read}");
+    assert!(!read.contains("host-side text"), "{read}");
+    assert!(write.contains("fswerr:Method not found"), "{write}");
+    assert!(!created, "a refused write created its file");
+}
+
+/// The default file access advertises both fs methods and serves them in
+/// the session cwd.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_access_cwd_advertises_and_serves_fs() {
+    if !python3() {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let (caps, read, write, created) = file_access_seen(FileAccess::Cwd).await;
+    assert!(caps.contains("caps:read=true,write=true"), "{caps}");
+    assert!(read.contains("fs:host-side text"), "{read}");
+    assert!(write.contains("fsw:ok"), "{write}");
+    assert!(created, "the served write created its file");
 }

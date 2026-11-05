@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::config::{
-    AgentConfig, AnyConfigSource, Config, ConfigSource, ConfigValue, PermissionPolicy,
+    AgentConfig, AnyConfigSource, Config, ConfigSource, ConfigValue, FileAccess, PermissionPolicy,
     SteerSemantics,
 };
 use crate::error::{Error, Result};
@@ -896,8 +896,8 @@ pub struct Subagent {
     pub cwd: PathBuf,
     /// Effective permission policy.
     pub permission: PermissionPolicy,
-    /// Whether agent fs/* requests may leave `cwd`.
-    pub allow_outside_cwd: bool,
+    /// What the agent's fs/* requests are served.
+    pub file_access: FileAccess,
     /// The model the agent accepted (`session/set_config_option` `model`),
     /// `None` when the agent advertises no `model` option.
     pub model: Option<serde_json::Value>,
@@ -1211,7 +1211,7 @@ async fn launch_inner<E: Executor, P: PermissionHandler>(
         agent: args.agent.clone(),
         cwd,
         permission,
-        allow_outside_cwd: agent_cfg.allow_outside_cwd,
+        file_access: agent_cfg.file_access,
         model: accepted.model,
         mode: accepted.mode,
         transcript_path,
@@ -1398,7 +1398,7 @@ pub(crate) async fn connect<E: Executor, P: PermissionHandler>(
         rt.clone(),
         cwd.to_path_buf(),
         permission,
-        agent_cfg.allow_outside_cwd,
+        agent_cfg.file_access,
         calls,
     );
     let (client, connection) = AcpClient::connect(transport, handler);

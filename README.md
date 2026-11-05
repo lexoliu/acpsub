@@ -65,7 +65,7 @@ registry = "~/.local/share/acpsub/registry.json"
 [agents.devin]
 command = "devin"
 args = ["acp"]
-allow_outside_cwd = false                  # refuse fs/* paths outside cwd
+file_access = "cwd"                        # cwd | anywhere | off — what fs/* serves
 # sessions_db = "~/Library/Application Support/devin/sessions.db"
 
 [agents.claude]
@@ -261,8 +261,12 @@ instead of dying silent. What the turn was doing lives in
   `steer_end: folded` transcript record — and stops blocking the session,
   while one that landed behind the turn's end still runs and resolves as a
   turn of its own.
-- **cwd boundary**: `fs/*` and `terminal/*` requests are refused outside the
-  subagent's `cwd` unless the agent has `allow_outside_cwd = true`.
+- **file access**: `fs/*` requests are served with acpsub's own filesystem
+  access and refused outside the subagent's `cwd` under the default
+  `file_access = "cwd"`; `"anywhere"` lifts that boundary, and `"off"`
+  advertises no `fs` capability and refuses every `fs/*` request, so an
+  agent a host confines through its executor does its file IO in its own
+  confined process.
 
 ## CLI
 
