@@ -18,16 +18,20 @@ pub mod client;
 pub mod config;
 pub mod daemon;
 pub mod error;
+pub mod executor;
 pub mod handler;
 pub mod host;
+pub mod permission;
 pub mod prose;
 pub mod prune;
 pub mod ratelimit;
 pub mod registry;
+pub mod services;
 pub mod state;
 pub mod terminal;
 pub mod tools;
 pub mod transcript;
+mod transport;
 mod watchdog;
 
 pub use config::{
@@ -35,8 +39,13 @@ pub use config::{
     PermissionPolicy, SteerSemantics, default_config_path,
 };
 pub use error::{Error, Result};
-pub use host::{Host, Session, SessionSpec, TurnEnd, TurnOutcome, probe};
+pub use executor::{
+    AnyExecutor, Executor, HostExecutor, Process, ProcessControl, ProcessHandle, Purpose, SpawnSpec,
+};
+pub use host::{Host, Session, SessionSpec, TurnEnd, TurnOutcome, probe, probe_with};
+pub use permission::{AnyPermissionHandler, PermissionHandler, PermissionRequest};
 pub use registry::{Registry, RegistryEntry};
+pub use services::Services;
 pub use state::{AppState, Status, Subagent};
 pub use tools::{build_tools, build_tools_with_progress_interval};
 pub use transcript::{RenderOptions, TranscriptWriter, render};

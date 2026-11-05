@@ -18,6 +18,8 @@ use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::config::PermissionPolicy;
+use crate::permission::PermissionRequest;
+use crate::services::Services;
 use crate::state::{
     PendingPermission, Status, SubRuntime, ToolCallSummary, Turn, now, oldest_steer,
     terminal_status,
@@ -36,6 +38,9 @@ pub struct SubagentHandler {
     permission: PermissionPolicy,
     /// Allow fs access outside `cwd`.
     allow_outside_cwd: bool,
+    /// Where terminal commands start, and who answers permission requests
+    /// instead of the policy.
+    services: Services,
 }
 
 impl SubagentHandler {
@@ -46,12 +51,14 @@ impl SubagentHandler {
         cwd: PathBuf,
         permission: PermissionPolicy,
         allow_outside_cwd: bool,
+        services: Services,
     ) -> Self {
         Self {
             rt,
             cwd,
             permission,
             allow_outside_cwd,
+            services,
         }
     }
 }
@@ -152,6 +159,19 @@ impl ClientHandler for SubagentHandler {
         &self,
         params: RequestPermissionParams,
     ) -> Result<RequestPermissionResult, JsonRpcError> {
+        if let Some(handler) = &self.services.permissions {
+            let outcome = handler
+                .decide(PermissionRequest {
+                    session_id: self.rt.session_label(),
+                    cwd: self.cwd.clone(),
+                    params,
+                })
+                .await;
+            return Ok(RequestPermissionResult {
+                outcome,
+                meta: None,
+            });
+        }
         let outcome = match self.permission {
             PermissionPolicy::Allow => params
                 .options
@@ -231,7 +251,14 @@ impl ClientHandler for SubagentHandler {
         &self,
         params: TerminalCreateParams,
     ) -> Result<TerminalCreateResult, JsonRpcError> {
-        terminal::create(&self.rt.terminals, &self.rt.next_term, params, &self.cwd).await
+        terminal::create(
+            &self.rt.terminals,
+            &self.rt.next_term,
+            params,
+            &self.cwd,
+            &self.services.executor,
+        )
+        .await
     }
 
     async fn terminal_output(
@@ -255,7 +282,7 @@ impl ClientHandler for SubagentHandler {
         &self,
         params: TerminalKillParams,
     ) -> Result<TerminalKillResult, JsonRpcError> {
-        self.terminal(&params.terminal_id).await?.kill().await?;
+        self.terminal(&params.terminal_id).await?.kill();
         Ok(TerminalKillResult { meta: None })
     }
 
@@ -268,7 +295,7 @@ impl ClientHandler for SubagentHandler {
         // the terminal — alive until they exit.
         let terminal = self.rt.terminals.lock().await.remove(&params.terminal_id);
         if let Some(terminal) = terminal {
-            let _ = terminal.kill().await;
+            terminal.kill();
         }
         Ok(TerminalReleaseResult { meta: None })
     }

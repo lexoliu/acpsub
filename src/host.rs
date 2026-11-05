@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use crate::config::{AgentConfig, Config, ConfigSource, ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::handler::SubagentHandler;
+use crate::services::Services;
 use crate::state::{AppState, Launch, Subagent, connect, launch, new_runtime, start_turn};
 use crate::tools::{
     WaitBound, WaitOutcome, WaitReporter, awaited_turn, cancel_turn, close_session, turn_outcome,
@@ -139,6 +140,21 @@ impl Host {
     /// Returns an error if the registry file exists but cannot be parsed.
     pub fn from_config(config: Config, source: impl ConfigSource + 'static) -> Result<Self> {
         AppState::new(config, source).map(Self::new)
+    }
+
+    /// Like [`from_config`](Self::from_config), with `services` supplying
+    /// where the agent and its terminal commands start and who answers
+    /// the agent's permission requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry file exists but cannot be parsed.
+    pub fn from_config_with(
+        config: Config,
+        source: impl ConfigSource + 'static,
+        services: Services,
+    ) -> Result<Self> {
+        AppState::with_services(config, source, services).map(Self::new)
     }
 
     /// The app state under this host, for building the MCP tools over the
@@ -341,13 +357,35 @@ impl WaitReporter for Silent {
 /// Returns [`Error::SpawnFailed`] when the process cannot start and
 /// [`Error::Agent`] when it does not answer `initialize`.
 pub fn probe(agent: &AgentConfig) -> impl Future<Output = Result<InitializeResult>> + Send {
-    let agent = agent.clone();
-    async move {
+    probe_in(agent.clone(), Services::default())
+}
+
+/// [`probe`], starting the command through `services`' executor — the
+/// place the host will run the agent.
+///
+/// # Errors
+///
+/// As [`probe`].
+pub fn probe_with(
+    agent: &AgentConfig,
+    services: &Services,
+) -> impl Future<Output = Result<InitializeResult>> + Send {
+    probe_in(agent.clone(), services.clone())
+}
+
+async fn probe_in(agent: AgentConfig, services: Services) -> Result<InitializeResult> {
+    {
         let cwd = std::env::current_dir()
             .map_err(|source| Error::io("cannot resolve the current directory", source))?;
         let rt = new_runtime(String::new(), agent.steer);
-        let handler = SubagentHandler::new(rt.clone(), cwd.clone(), PermissionPolicy::Deny, false);
-        let (client, conn, pump) = connect(&agent, &cwd, handler, rt.clone())?;
+        let handler = SubagentHandler::new(
+            rt.clone(),
+            cwd.clone(),
+            PermissionPolicy::Deny,
+            false,
+            services.clone(),
+        );
+        let (client, conn, pump) = connect(&services, &agent, &cwd, handler, rt.clone()).await?;
         let mut process = Probed {
             rt,
             client: client.clone(),

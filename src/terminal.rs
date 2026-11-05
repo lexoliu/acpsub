@@ -2,15 +2,16 @@
 //! agent-to-client requests.
 
 use std::collections::HashMap;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aither_acp::{
     TerminalCreateParams, TerminalCreateResult, TerminalExitStatus, TerminalOutputResult,
 };
 use aither_mcp::protocol::JsonRpcError;
-use tokio::io::AsyncReadExt;
+use futures_lite::io::AsyncReadExt;
+
+use crate::executor::{AnyExecutor, ProcessHandle, ProcessOutput, Purpose, SpawnSpec};
 
 /// Output retained when `output_byte_limit` is unset: 1 MiB.
 const DEFAULT_OUTPUT_LIMIT: usize = 1 << 20;
@@ -47,23 +48,18 @@ impl Tail {
 /// One spawned terminal process.
 #[derive(Debug)]
 pub struct Terminal {
-    /// The child; `None` once reaped by `wait_for_exit`/`kill`.
-    child: tokio::sync::Mutex<Option<tokio::process::Child>>,
-    /// The child's process group id — the child leads it (`process_group(0)`),
-    /// so this sweeps grandchildren the child orphaned to launchd.
-    pgid: AtomicU32,
+    /// Kills the process tree and waits for its exit.
+    control: ProcessHandle,
     /// Merged stdout+stderr tail, bounded by `output_byte_limit`.
     output: Mutex<Tail>,
     /// Exit status once the process has exited.
     status: Mutex<Option<TerminalExitStatus>>,
 }
 
-#[cfg(unix)]
 impl Drop for Terminal {
-    /// The child's `kill_on_drop` only reaches the leader; sweep the group so
-    /// descendants the leader orphaned die with it.
+    /// Kill the whole tree so descendants the leader orphaned die with it.
     fn drop(&mut self) {
-        crate::state::kill_process_group(self.pgid.load(Ordering::Relaxed));
+        self.control.kill();
     }
 }
 
@@ -113,45 +109,24 @@ impl Terminal {
         if let Some(status) = status {
             return Ok(status);
         }
-        let mut guard = self.child.lock().await;
-        let Some(child) = guard.as_mut() else {
-            return Err(JsonRpcError::internal_error(
-                "terminal vanished before exit status was recorded",
-            ));
-        };
-        let status = exit_status(child.wait().await.map_err(|source| {
+        let status = exit_status(self.control.wait().await.map_err(|source| {
             JsonRpcError::internal_error(format!("cannot wait for terminal: {source}"))
         })?);
-        *guard = None;
-        drop(guard);
         *self.status.lock().expect("terminal status poisoned") = Some(status.clone());
         Ok(status)
     }
 
-    /// SIGKILL the process group, for `terminal/kill`. Succeeds on an
+    /// SIGKILL the process tree, for `terminal/kill`. Succeeds on an
     /// already-dead terminal.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal error if the kill signal fails.
-    pub async fn kill(&self) -> Result<(), JsonRpcError> {
-        #[cfg(unix)]
-        crate::state::kill_process_group(self.pgid.load(Ordering::Relaxed));
-        let mut guard = self.child.lock().await;
-        if let Some(child) = guard.as_mut() {
-            // The group kill above already reached this child; `start_kill`
-            // on it can only ESRCH, which is not a failure worth reporting.
-            let _ = child.start_kill();
-        }
-        drop(guard);
-        Ok(())
+    pub fn kill(&self) {
+        self.control.kill();
     }
 }
 
 /// A pump appending one pipe's bytes into the terminal's tail buffer.
 ///
 /// Dropping the future is safe: whatever was already read stays recorded.
-fn pump(mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static, terminal: Arc<Terminal>) {
+fn pump(mut pipe: ProcessOutput, terminal: Arc<Terminal>) {
     tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
@@ -165,16 +140,6 @@ fn pump(mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static, terminal: 
             }
         }
     });
-}
-
-/// Register the pumps for a fresh child; call before storing it.
-fn tee_pipes(child: &mut tokio::process::Child, terminal: &Arc<Terminal>) {
-    if let Some(stdout) = child.stdout.take() {
-        pump(stdout, terminal.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        pump(stderr, terminal.clone());
-    }
 }
 
 /// Convert a process exit into the wire shape.
@@ -197,6 +162,7 @@ fn exit_status(status: std::process::ExitStatus) -> TerminalExitStatus {
 /// pumps, registration under a fresh `term-N` id.
 ///
 /// `cwd` is the session working directory used when the params carry none.
+/// The process is started through `executor`.
 ///
 /// # Errors
 ///
@@ -206,41 +172,37 @@ pub async fn create(
     next_id: &AtomicU64,
     params: TerminalCreateParams,
     cwd: &std::path::Path,
+    executor: &AnyExecutor,
 ) -> Result<TerminalCreateResult, JsonRpcError> {
     // With no `args`, `command` is a shell command line (agents like `devin
     // acp` send e.g. "cd /repo && cargo test"), so run it through a shell.
     // With `args`, `command` is the executable per the ACP wire contract.
-    let mut command = if params.args.is_empty() {
-        let mut shell = tokio::process::Command::new("bash");
-        shell.arg("-c").arg(&params.command);
-        shell
+    let (program, args) = if params.args.is_empty() {
+        (
+            "bash".to_string(),
+            vec!["-c".to_string(), params.command.clone()],
+        )
     } else {
-        let mut direct = tokio::process::Command::new(&params.command);
-        direct.args(&params.args);
-        direct
+        (params.command.clone(), params.args.clone())
     };
-    command
-        .envs(
-            params
+    let process = executor
+        .spawn(SpawnSpec {
+            purpose: Purpose::Terminal,
+            program,
+            args,
+            env: params
                 .env
                 .iter()
-                .map(|var| (var.name.clone(), var.value.clone())),
-        )
-        .current_dir(params.cwd.clone().unwrap_or_else(|| cwd.to_path_buf()))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // The terminal leads its own process group so `kill`/drop can reap
-    // grandchildren (e.g. `bash -c` background jobs) along with it.
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().map_err(|source| {
-        JsonRpcError::internal_error(format!("cannot spawn '{}': {source}", params.command))
-    })?;
+                .map(|var| (var.name.clone(), var.value.clone()))
+                .collect(),
+            cwd: params.cwd.clone().unwrap_or_else(|| cwd.to_path_buf()),
+        })
+        .await
+        .map_err(|source| {
+            JsonRpcError::internal_error(format!("cannot spawn '{}': {source}", params.command))
+        })?;
     let terminal = Arc::new(Terminal {
-        child: tokio::sync::Mutex::new(None),
-        pgid: AtomicU32::new(child.id().unwrap_or(0)),
+        control: process.control,
         output: Mutex::new(Tail {
             data: Vec::new(),
             cap: params
@@ -252,8 +214,8 @@ pub async fn create(
         }),
         status: Mutex::new(None),
     });
-    tee_pipes(&mut child, &terminal);
-    *terminal.child.lock().await = Some(child);
+    pump(process.stdout, terminal.clone());
+    pump(process.stderr, terminal.clone());
     let id = format!("term-{}", next_id.fetch_add(1, Ordering::Relaxed));
     terminals.lock().await.insert(id.clone(), terminal);
     Ok(TerminalCreateResult {

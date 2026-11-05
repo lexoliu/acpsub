@@ -3,12 +3,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::future::Future;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,7 +16,6 @@ use aither_acp::{
     SessionSetConfigOptionParams, SessionSetModeParams, SessionUpdate, StopReason, TextContent,
     ToolCall, ToolCallLocation, ToolCallStatus, ToolKind,
 };
-use aither_mcp::transport::ChildProcessTransport;
 use serde::Serialize;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
@@ -30,10 +26,13 @@ use crate::config::{
     SteerSemantics,
 };
 use crate::error::{Error, Result};
+use crate::executor::{Process, ProcessHandle, ProcessOutput, Purpose, SpawnSpec};
 use crate::handler::{SubagentHandler, note_tool_call, note_tool_call_update};
 use crate::registry::{LastTurn, Registry, RegistryEntry, persist};
+use crate::services::Services;
 use crate::terminal::Terminals;
 use crate::transcript::TranscriptWriter;
+use crate::transport::ProcessTransport;
 
 /// Number of agent stderr lines retained for error reporting.
 const STDERR_TAIL_LINES: usize = 100;
@@ -90,10 +89,15 @@ pub struct AppState {
     /// [`crate::daemon::run`] before it accepts clients; empty everywhere
     /// else.
     pub resume_report: Mutex<ResumeReport>,
+    /// What the host plugs into every session: where the agent and its
+    /// terminal commands start, and who answers permission requests.
+    pub services: Services,
 }
 
 impl AppState {
-    /// Build app state, loading the registry file if it exists.
+    /// Build app state, loading the registry file if it exists. Agents
+    /// and their terminal commands run on the host, and the session
+    /// policy answers permission requests.
     ///
     /// # Errors
     ///
@@ -103,6 +107,24 @@ impl AppState {
     ///
     /// Panics if the registry mutex is poisoned.
     pub fn new(config: Config, source: impl ConfigSource + 'static) -> Result<Arc<Self>> {
+        Self::with_services(config, source, Services::default())
+    }
+
+    /// Like [`new`](Self::new), with the host's `services` in place of the
+    /// defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry file exists but cannot be parsed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry mutex is poisoned.
+    pub fn with_services(
+        config: Config,
+        source: impl ConfigSource + 'static,
+        services: Services,
+    ) -> Result<Arc<Self>> {
         let registry_path = config.defaults.registry;
         let registry = Registry::load(&registry_path)?;
         // Quota gates survive a restart through the registry's parked
@@ -123,6 +145,7 @@ impl AppState {
             transcript_retention: config.defaults.transcript_retention,
             handover: Handover::default(),
             resume_report: Mutex::new(ResumeReport::default()),
+            services,
         });
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::ratelimit::ensure_scheduler(&state);
@@ -780,9 +803,8 @@ pub struct SubRuntime {
     pub waiters: AtomicU64,
     /// Wakes the turn watchdog on a waiter attach or detach.
     pub watch: Notify,
-    /// The agent child process id — also its process group id, since the
-    /// child is spawned with `process_group(0)`. 0 until spawned.
-    pub agent_pid: AtomicU32,
+    /// Kills the agent's process tree; `None` until spawned.
+    pub agent_process: Mutex<Option<ProcessHandle>>,
 }
 
 impl SubRuntime {
@@ -849,38 +871,21 @@ impl SubRuntime {
             .clone()
     }
 
-    /// SIGKILL the agent's whole process group — the agent leads the group
-    /// (`process_group(0)`), so this sweeps the `bash -c` children it
-    /// exec'd, including ones already orphaned to launchd.
+    /// Kill the agent's whole process tree through its executor's
+    /// handle — for the host executor, the process group the agent leads,
+    /// which sweeps the `bash -c` children it exec'd, including ones
+    /// already orphaned to launchd.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process mutex is poisoned.
     pub fn kill_process_tree(&self) {
-        kill_process_group(self.agent_pid.load(Ordering::Relaxed));
-    }
-}
-
-/// SIGKILL the process group led by `pgid`. A process group outlives its
-/// leader, so this still reaches a dead agent's leaked descendants. Probes
-/// the group first; a pgid meanwhile recycled by a foreign group leader is
-/// the accepted residual.
-///
-/// On unix; a no-op elsewhere.
-#[cfg(unix)]
-pub(crate) fn kill_process_group(pgid: u32) {
-    if pgid == 0 {
-        return;
-    }
-    // SAFETY: kill(2) only delivers a signal; a stale pgid is narrowed by
-    // the existence probe.
-    unsafe {
-        let pgid = pgid as libc::pid_t;
-        if libc::kill(-pgid, 0) == 0 {
-            libc::kill(-pgid, libc::SIGKILL);
+        let process = self.agent_process.lock().expect("process poisoned").clone();
+        if let Some(process) = process {
+            process.kill();
         }
     }
 }
-
-/// No-op on platforms without process groups.
-#[cfg(not(unix))]
-pub(crate) fn kill_process_group(_pgid: u32) {}
 
 /// A live subagent: one agent process, one ACP session, one transcript.
 #[derive(Debug)]
@@ -1127,7 +1132,7 @@ pub(crate) fn new_runtime(session_id: String, steer: SteerSemantics) -> Arc<SubR
         closing: ClosingFlag::default(),
         waiters: AtomicU64::new(0),
         watch: Notify::new(),
-        agent_pid: AtomicU32::new(0),
+        agent_process: Mutex::new(None),
     })
 }
 
@@ -1151,8 +1156,10 @@ async fn launch_inner(
         cwd.clone(),
         permission,
         agent_cfg.allow_outside_cwd,
+        state.services.clone(),
     );
-    let (client, conn, stderr_pump) = connect(&agent_cfg, &cwd, handler, rt.clone())?;
+    let (client, conn, stderr_pump) =
+        connect(&state.services, &agent_cfg, &cwd, handler, rt.clone()).await?;
 
     // On any handshake failure, kill the child before returning the error.
     let accepted = match handshake(state, &client, &rt, args).await {
@@ -1341,56 +1348,49 @@ async fn release_reservation(
     Err(Error::ClosedWhileLaunching(session_id.to_string()))
 }
 
-/// Spawn the child process, capture its stderr, and connect the ACP client.
+/// Start the agent process through the services' executor, capture its
+/// stderr, and connect the ACP client.
 ///
 /// # Errors
 ///
 /// Returns [`Error::SpawnFailed`] when the process cannot be spawned, or
 /// [`Error::Agent`] when the transport cannot be built from it.
-pub(crate) fn connect(
+pub(crate) async fn connect(
+    services: &Services,
     agent_cfg: &AgentConfig,
     cwd: &std::path::Path,
     handler: SubagentHandler,
     rt: Arc<SubRuntime>,
 ) -> Result<(AcpClient<SubagentHandler>, JoinHandle<()>, JoinHandle<()>)> {
-    let mut std_command = std::process::Command::new(&agent_cfg.command);
-    std_command
-        .args(&agent_cfg.args)
-        .envs(agent_cfg.env.clone())
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // The agent leads its own process group so `kill_process_group` can
-    // reap every `bash -c` descendant it spawned — orphaned ones reparent
-    // to launchd but stay in the group.
-    #[cfg(unix)]
-    std_command.process_group(0);
-    // `From` resets async-process's stdio flags, so re-apply the pipes on
-    // the wrapper or `spawn` downgrades them to `inherit`.
-    let mut command = async_process::Command::from(std_command);
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|source| Error::SpawnFailed {
-        agent: agent_cfg.command.clone(),
-        command: format!("{} {}", agent_cfg.command, agent_cfg.args.join(" ")),
-        source,
-    })?;
-    rt.agent_pid.store(child.id(), Ordering::Relaxed);
-    let stderr = child.stderr.take().ok_or_else(|| {
-        Error::io(
-            "agent stderr pipe",
-            std::io::Error::other("stderr was not piped"),
-        )
-    })?;
-    let transport = ChildProcessTransport::from_child(child)
-        .map_err(|error| ClientError::Transport(error.to_string()))
-        .map_err(|source| Error::Agent {
+    let Process {
+        stdin,
+        stdout,
+        stderr,
+        control,
+    } = services
+        .executor
+        .spawn(SpawnSpec {
+            purpose: Purpose::Agent,
+            program: agent_cfg.command.clone(),
+            args: agent_cfg.args.clone(),
+            env: agent_cfg.env.clone(),
+            cwd: cwd.to_path_buf(),
+        })
+        .await
+        .map_err(|source| Error::SpawnFailed {
             agent: agent_cfg.command.clone(),
+            command: format!("{} {}", agent_cfg.command, agent_cfg.args.join(" ")),
             source,
         })?;
+    *rt.agent_process.lock().expect("process poisoned") = Some(control.clone());
+    let Some(stdin) = stdin else {
+        control.kill();
+        return Err(Error::io(
+            "agent stdin pipe",
+            std::io::Error::other("the executor gave an agent no stdin"),
+        ));
+    };
+    let transport = ProcessTransport::new(stdout, stdin, control);
     let (client, connection) = AcpClient::connect(transport, handler);
     let conn_rt = rt.clone();
     let conn = tokio::spawn(async move {
@@ -1865,7 +1865,7 @@ pub async fn close_sub(sub: &Subagent) {
         .map(|(_, t)| t)
         .collect();
     for terminal in terminals {
-        let _ = terminal.kill().await;
+        terminal.kill();
     }
     {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
@@ -1941,7 +1941,7 @@ pub async fn end_session(state: &Arc<AppState>, sub: &Subagent) {
 }
 
 /// Pump agent stderr into the tail buffer and tracing.
-async fn pump_stderr(stderr: async_process::ChildStderr, rt: Arc<SubRuntime>) {
+async fn pump_stderr(stderr: ProcessOutput, rt: Arc<SubRuntime>) {
     use futures_lite::{AsyncBufReadExt, StreamExt};
     let mut lines = futures_lite::io::BufReader::new(stderr).lines();
     while let Some(line) = lines.next().await {
