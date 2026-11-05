@@ -6,7 +6,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aither_acp::{
@@ -26,8 +26,9 @@ use crate::config::{
     SteerSemantics,
 };
 use crate::error::{Error, Result};
-use crate::executor::{Process, ProcessHandle, ProcessOutput, Purpose, SpawnSpec};
+use crate::executor::{AgentProcess, Executor, HostExecutor, ProcessHandle, SpawnSpec};
 use crate::handler::{SubagentHandler, note_tool_call, note_tool_call_update};
+use crate::permission::{PermissionHandler, PolicyPermissions};
 use crate::registry::{LastTurn, Registry, RegistryEntry, persist};
 use crate::services::Services;
 use crate::terminal::Terminals;
@@ -41,7 +42,7 @@ const STDERR_QUOTE_LINES: usize = 20;
 
 /// Shared app state behind every tool.
 #[derive(Debug)]
-pub struct AppState {
+pub struct AppState<E = HostExecutor, P = PolicyPermissions> {
     /// Where the current config comes from; read on every `spawn`/`adopt`/
     /// `agents` call so the running server always reflects its source.
     pub config_source: AnyConfigSource,
@@ -91,7 +92,7 @@ pub struct AppState {
     pub resume_report: Mutex<ResumeReport>,
     /// What the host plugs into every session: where the agent and its
     /// terminal commands start, and who answers permission requests.
-    pub services: Services,
+    pub services: Arc<Services<E, P>>,
 }
 
 impl AppState {
@@ -109,9 +110,11 @@ impl AppState {
     pub fn new(config: Config, source: impl ConfigSource + 'static) -> Result<Arc<Self>> {
         Self::with_services(config, source, Services::default())
     }
+}
 
-    /// Like [`new`](Self::new), with the host's `services` in place of the
-    /// defaults.
+impl<E: Executor, P: PermissionHandler> AppState<E, P> {
+    /// Like [`new`](AppState::new), with the host's `services` in place of
+    /// the defaults.
     ///
     /// # Errors
     ///
@@ -123,7 +126,7 @@ impl AppState {
     pub fn with_services(
         config: Config,
         source: impl ConfigSource + 'static,
-        services: Services,
+        services: Services<E, P>,
     ) -> Result<Arc<Self>> {
         let registry_path = config.defaults.registry;
         let registry = Registry::load(&registry_path)?;
@@ -145,7 +148,7 @@ impl AppState {
             transcript_retention: config.defaults.transcript_retention,
             handover: Handover::default(),
             resume_report: Mutex::new(ResumeReport::default()),
-            services,
+            services: Arc::new(services),
         });
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::ratelimit::ensure_scheduler(&state);
@@ -804,7 +807,7 @@ pub struct SubRuntime {
     /// Wakes the turn watchdog on a waiter attach or detach.
     pub watch: Notify,
     /// Kills the agent's process tree; `None` until spawned.
-    pub agent_process: Mutex<Option<ProcessHandle>>,
+    pub agent_process: OnceLock<ProcessHandle>,
 }
 
 impl SubRuntime {
@@ -875,13 +878,8 @@ impl SubRuntime {
     /// handle — for the host executor, the process group the agent leads,
     /// which sweeps the `bash -c` children it exec'd, including ones
     /// already orphaned to launchd.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the process mutex is poisoned.
     pub fn kill_process_tree(&self) {
-        let process = self.agent_process.lock().expect("process poisoned").clone();
-        if let Some(process) = process {
+        if let Some(process) = self.agent_process.get() {
             process.kill();
         }
     }
@@ -1047,7 +1045,11 @@ pub struct Launch {
 /// # Panics
 ///
 /// Panics if a state mutex is poisoned.
-pub async fn launch(state: &Arc<AppState>, config: &Config, args: Launch) -> Result<Arc<Subagent>> {
+pub async fn launch<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    config: &Config,
+    args: Launch,
+) -> Result<Arc<Subagent>> {
     let agent_cfg = config.agent(&args.agent)?.clone();
     let cwd = args.cwd.canonicalize().map_err(|source| {
         Error::io(format!("cannot resolve cwd {}", args.cwd.display()), source)
@@ -1132,14 +1134,14 @@ pub(crate) fn new_runtime(session_id: String, steer: SteerSemantics) -> Arc<SubR
         closing: ClosingFlag::default(),
         waiters: AtomicU64::new(0),
         watch: Notify::new(),
-        agent_process: Mutex::new(None),
+        agent_process: OnceLock::new(),
     })
 }
 
 /// Everything `launch` does once preflight passed: spawn the process, run
 /// the handshake, register and go live, start the first turn if prompted.
-async fn launch_inner(
-    state: &Arc<AppState>,
+async fn launch_inner<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
     config: &Config,
     args: &Launch,
     agent_cfg: AgentConfig,
@@ -1151,15 +1153,8 @@ async fn launch_inner(
         .unwrap_or(config.defaults.permission);
     let rt = new_runtime(args.load.clone().unwrap_or_default(), agent_cfg.steer);
 
-    let handler = SubagentHandler::new(
-        rt.clone(),
-        cwd.clone(),
-        permission,
-        agent_cfg.allow_outside_cwd,
-        state.services.clone(),
-    );
     let (client, conn, stderr_pump) =
-        connect(&state.services, &agent_cfg, &cwd, handler, rt.clone()).await?;
+        connect(&state.services, &agent_cfg, &cwd, permission, rt.clone()).await?;
 
     // On any handshake failure, kill the child before returning the error.
     let accepted = match handshake(state, &client, &rt, args).await {
@@ -1245,7 +1240,10 @@ async fn launch_inner(
 
 /// Insert the subagent into the live map, refusing (and killing its
 /// process) when an agent produced a session id that is already live.
-async fn go_live(state: &Arc<AppState>, sub: &Arc<Subagent>) -> Result<()> {
+async fn go_live<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    sub: &Arc<Subagent>,
+) -> Result<()> {
     let collision = {
         let mut live = state.live.lock().expect("live poisoned");
         if live.contains_key(&sub.session_id) {
@@ -1281,8 +1279,8 @@ async fn go_live(state: &Arc<AppState>, sub: &Arc<Subagent>) -> Result<()> {
 /// session is already ending). Either way the result is
 /// [`Error::ClosedWhileLaunching`]; only a clean reservation and a still
 /// present live entry let the launch proceed.
-async fn release_reservation(
-    state: &Arc<AppState>,
+async fn release_reservation<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
     sub: &Arc<Subagent>,
     session_id: &str,
 ) -> Result<()> {
@@ -1355,22 +1353,21 @@ async fn release_reservation(
 ///
 /// Returns [`Error::SpawnFailed`] when the process cannot be spawned, or
 /// [`Error::Agent`] when the transport cannot be built from it.
-pub(crate) async fn connect(
-    services: &Services,
+pub(crate) async fn connect<E: Executor, P: PermissionHandler>(
+    services: &Arc<Services<E, P>>,
     agent_cfg: &AgentConfig,
     cwd: &std::path::Path,
-    handler: SubagentHandler,
+    permission: PermissionPolicy,
     rt: Arc<SubRuntime>,
 ) -> Result<(AcpClient<SubagentHandler>, JoinHandle<()>, JoinHandle<()>)> {
-    let Process {
+    let AgentProcess {
         stdin,
         stdout,
         stderr,
         control,
     } = services
         .executor
-        .spawn(SpawnSpec {
-            purpose: Purpose::Agent,
+        .spawn_agent(SpawnSpec {
             program: agent_cfg.command.clone(),
             args: agent_cfg.args.clone(),
             env: agent_cfg.env.clone(),
@@ -1382,15 +1379,28 @@ pub(crate) async fn connect(
             command: format!("{} {}", agent_cfg.command, agent_cfg.args.join(" ")),
             source,
         })?;
-    *rt.agent_process.lock().expect("process poisoned") = Some(control.clone());
-    let Some(stdin) = stdin else {
-        control.kill();
-        return Err(Error::io(
-            "agent stdin pipe",
-            std::io::Error::other("the executor gave an agent no stdin"),
-        ));
-    };
-    let transport = ProcessTransport::new(stdout, stdin, control);
+    let process = ProcessHandle::supervise(control);
+    assert!(
+        rt.agent_process.set(process.clone()).is_ok(),
+        "a runtime connects one agent process"
+    );
+    let transport = ProcessTransport::new(stdout, stdin, process);
+    // The handler is one concrete type; the host's services answer it over
+    // a channel, for as long as the handler lives.
+    let (calls, requests) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(crate::services::serve(
+        services.clone(),
+        cwd.to_path_buf(),
+        rt.clone(),
+        requests,
+    ));
+    let handler = SubagentHandler::new(
+        rt.clone(),
+        cwd.to_path_buf(),
+        permission,
+        agent_cfg.allow_outside_cwd,
+        calls,
+    );
     let (client, connection) = AcpClient::connect(transport, handler);
     let conn_rt = rt.clone();
     let conn = tokio::spawn(async move {
@@ -1447,8 +1457,8 @@ async fn open_session(
 /// `initialize`, `session/new` or `session/load`, `set_mode` when a mode
 /// was given, and the `set_config_option` calls; upserts the registry
 /// entry. Returns the session id and the model/mode the agent accepted.
-async fn handshake(
-    state: &Arc<AppState>,
+async fn handshake<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
     client: &AcpClient<SubagentHandler>,
     rt: &SubRuntime,
     args: &Launch,
@@ -1548,7 +1558,11 @@ async fn handshake(
 /// # Errors
 ///
 /// Returns an error when the registry cannot be persisted.
-async fn register_session(state: &Arc<AppState>, session_id: &str, args: &Launch) -> Result<()> {
+async fn register_session<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    session_id: &str,
+    args: &Launch,
+) -> Result<()> {
     state
         .update_registry(|registry| match registry.get_mut(session_id) {
             Some(entry) => {
@@ -1824,7 +1838,11 @@ pub(crate) enum SessionEnd {
     clippy::option_if_let_else,
     reason = "the else arm mutates under the `reserved` lock — a match keeps the lock order legible"
 )]
-pub(crate) fn end_target(state: &AppState, session_id: &str, forgotten: bool) -> SessionEnd {
+pub(crate) fn end_target<E, P>(
+    state: &AppState<E, P>,
+    session_id: &str,
+    forgotten: bool,
+) -> SessionEnd {
     let mut live = state.live.lock().expect("live poisoned");
     let mut reserved = state.reserved.lock().expect("reserved poisoned");
     let end = match live.remove(session_id) {
@@ -1906,7 +1924,10 @@ pub async fn close_sub(sub: &Subagent) {
 ///
 /// Shared by every path that ends a session deliberately: the `close`
 /// tool and the turn watchdog.
-pub async fn unschedule_resume(state: &Arc<AppState>, session_id: &str) {
+pub async fn unschedule_resume<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    session_id: &str,
+) {
     let result = state
         .update_registry(|registry| {
             if let Some(entry) = registry.get_mut(session_id) {
@@ -1933,7 +1954,10 @@ pub async fn unschedule_resume(state: &Arc<AppState>, session_id: &str) {
 /// tool and the turn watchdog. `close` on a registry-only
 /// session — no `Subagent`, nothing to flag or tear down — calls
 /// `unschedule_resume` alone.
-pub async fn end_session(state: &Arc<AppState>, sub: &Subagent) {
+pub async fn end_session<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    sub: &Subagent,
+) {
     sub.rt.closing.set(Closing::Ending);
     unschedule_resume(state, &sub.session_id).await;
     close_sub(sub).await;
@@ -1941,7 +1965,7 @@ pub async fn end_session(state: &Arc<AppState>, sub: &Subagent) {
 }
 
 /// Pump agent stderr into the tail buffer and tracing.
-async fn pump_stderr(stderr: ProcessOutput, rt: Arc<SubRuntime>) {
+async fn pump_stderr(stderr: impl futures_lite::io::AsyncRead + Unpin, rt: Arc<SubRuntime>) {
     use futures_lite::{AsyncBufReadExt, StreamExt};
     let mut lines = futures_lite::io::BufReader::new(stderr).lines();
     while let Some(line) = lines.next().await {
@@ -2003,7 +2027,11 @@ pub(crate) fn oldest_steer(inner: &Inner) -> Option<u64> {
 /// # Panics
 ///
 /// Panics if a state mutex is poisoned.
-pub async fn start_turn(state: Arc<AppState>, sub: &Arc<Subagent>, prompt: String) -> Result<()> {
+pub async fn start_turn<E: Executor, P: PermissionHandler>(
+    state: Arc<AppState<E, P>>,
+    sub: &Arc<Subagent>,
+    prompt: String,
+) -> Result<()> {
     let _wire = sub.rt.prompt_send.lock().await;
     let (turn_n, fut) = begin_turn(&state, sub, prompt, Gate::Check, false).await?;
     spawn_turn_task(state, sub, fut, turn_n);
@@ -2044,8 +2072,8 @@ pub(crate) const fn next_turn_number(inner: &Inner) -> u64 {
 /// # Panics
 ///
 /// Panics if a state mutex is poisoned.
-pub(crate) async fn begin_turn(
-    state: &Arc<AppState>,
+pub(crate) async fn begin_turn<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
     sub: &Arc<Subagent>,
     prompt: String,
     gate: Gate,
@@ -2169,7 +2197,10 @@ pub(crate) async fn begin_turn(
 /// wakes ride `handover.progressed`; no polling, no sleep.
 ///
 /// Returns `false` once the session has left `live` — it shipped.
-pub(crate) async fn wait_out_handoff(state: &AppState, sub: &Arc<Subagent>) -> bool {
+pub(crate) async fn wait_out_handoff<E: Executor, P: PermissionHandler>(
+    state: &AppState<E, P>,
+    sub: &Arc<Subagent>,
+) -> bool {
     loop {
         // Register the waiter BEFORE the check: a resolve between them
         // still wakes us.
@@ -2192,8 +2223,8 @@ pub(crate) async fn wait_out_handoff(state: &AppState, sub: &Arc<Subagent>) -> b
 }
 
 /// Spawn the turn-end task for a [`begin_turn`] result.
-pub(crate) fn spawn_turn_task(
-    state: Arc<AppState>,
+pub(crate) fn spawn_turn_task<E: Executor, P: PermissionHandler>(
+    state: Arc<AppState<E, P>>,
     sub: &Arc<Subagent>,
     prompt: PromptFut,
     turn_n: u64,
@@ -2349,8 +2380,8 @@ fn record_steer_end(inner: &mut Inner, steer_id: u64, target_turn: u64, outcome:
 /// The resolution lands on the target turn's `steers` list — what `wait`
 /// reports — and the call's `rt.notify` wake is what releases a wait
 /// holding for it.
-pub(crate) async fn steer_resolved(
-    state: Arc<AppState>,
+pub(crate) async fn steer_resolved<E: Executor, P: PermissionHandler>(
+    state: Arc<AppState<E, P>>,
     sub: &Arc<Subagent>,
     steer_id: u64,
     target_turn: u64,
@@ -2436,8 +2467,8 @@ pub(crate) async fn steer_resolved(
 }
 
 /// Await a steered prompt's resolution, then [`steer_resolved`] it.
-pub(crate) async fn steer_waiter(
-    state: Arc<AppState>,
+pub(crate) async fn steer_waiter<E: Executor, P: PermissionHandler>(
+    state: Arc<AppState<E, P>>,
     sub: Arc<Subagent>,
     steer_id: u64,
     target_turn: u64,
@@ -2594,7 +2625,12 @@ async fn record_steers_folded(rt: &SubRuntime, turn_n: u64, steers: Vec<u64>) {
 }
 
 /// Await `session/prompt`, then [`finish_turn`].
-async fn turn_task(state: Arc<AppState>, prompt: PromptFut, turn_n: u64, sub: Arc<Subagent>) {
+async fn turn_task<E: Executor, P: PermissionHandler>(
+    state: Arc<AppState<E, P>>,
+    prompt: PromptFut,
+    turn_n: u64,
+    sub: Arc<Subagent>,
+) {
     let outcome = prompt.await;
     finish_turn(state, &sub, turn_n, outcome).await;
 }
@@ -2602,8 +2638,8 @@ async fn turn_task(state: Arc<AppState>, prompt: PromptFut, turn_n: u64, sub: Ar
 /// Spawn the queued-turn handoff: the wire guard moves into the task so the
 /// queued prompt reaches the wire ahead of any `send` that lands between
 /// the turns.
-fn spawn_chained(
-    state: Arc<AppState>,
+fn spawn_chained<E: Executor, P: PermissionHandler>(
+    state: Arc<AppState<E, P>>,
     session_id: String,
     prompt: String,
     wire: tokio::sync::OwnedMutexGuard<()>,
@@ -2645,8 +2681,8 @@ fn spawn_chained(
 /// interlude, starting once the end is recorded — the record never clears
 /// the next turn's `turn_started`; a `cancelled` or failed turn drops the
 /// queue instead.
-async fn finish_turn(
-    state: Arc<AppState>,
+async fn finish_turn<E: Executor, P: PermissionHandler>(
+    state: Arc<AppState<E, P>>,
     sub: &Arc<Subagent>,
     turn_n: u64,
     outcome: std::result::Result<PromptResult, ClientError>,
@@ -2731,8 +2767,8 @@ async fn finish_turn(
 /// that settles unparked disarms the flag: a parked queue chained into
 /// turns while the limit held would otherwise rerun prompts that
 /// already ran.
-async fn record_turn_end(
-    state: &Arc<AppState>,
+async fn record_turn_end<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
     rt: &SubRuntime,
     session_id: &str,
     hit: Option<&crate::ratelimit::RateLimit>,

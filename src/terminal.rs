@@ -11,7 +11,9 @@ use aither_acp::{
 use aither_mcp::protocol::JsonRpcError;
 use futures_lite::io::AsyncReadExt;
 
-use crate::executor::{AnyExecutor, ProcessHandle, ProcessOutput, Purpose, SpawnSpec};
+use futures_lite::io::AsyncRead;
+
+use crate::executor::{Executor, ProcessHandle, SpawnSpec, TerminalProcess};
 
 /// Output retained when `output_byte_limit` is unset: 1 MiB.
 const DEFAULT_OUTPUT_LIMIT: usize = 1 << 20;
@@ -126,7 +128,7 @@ impl Terminal {
 /// A pump appending one pipe's bytes into the terminal's tail buffer.
 ///
 /// Dropping the future is safe: whatever was already read stays recorded.
-fn pump(mut pipe: ProcessOutput, terminal: Arc<Terminal>) {
+fn pump(mut pipe: impl AsyncRead + Send + Unpin + 'static, terminal: Arc<Terminal>) {
     tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
@@ -167,12 +169,12 @@ fn exit_status(status: std::process::ExitStatus) -> TerminalExitStatus {
 /// # Errors
 ///
 /// Returns an internal error if the command cannot be spawned.
-pub async fn create(
+pub async fn create<E: Executor>(
     terminals: &Terminals,
     next_id: &AtomicU64,
     params: TerminalCreateParams,
     cwd: &std::path::Path,
-    executor: &AnyExecutor,
+    executor: &E,
 ) -> Result<TerminalCreateResult, JsonRpcError> {
     // With no `args`, `command` is a shell command line (agents like `devin
     // acp` send e.g. "cd /repo && cargo test"), so run it through a shell.
@@ -185,9 +187,12 @@ pub async fn create(
     } else {
         (params.command.clone(), params.args.clone())
     };
-    let process = executor
-        .spawn(SpawnSpec {
-            purpose: Purpose::Terminal,
+    let TerminalProcess {
+        stdout,
+        stderr,
+        control,
+    } = executor
+        .spawn_terminal(SpawnSpec {
             program,
             args,
             env: params
@@ -202,7 +207,7 @@ pub async fn create(
             JsonRpcError::internal_error(format!("cannot spawn '{}': {source}", params.command))
         })?;
     let terminal = Arc::new(Terminal {
-        control: process.control,
+        control: ProcessHandle::supervise(control),
         output: Mutex::new(Tail {
             data: Vec::new(),
             cap: params
@@ -214,8 +219,8 @@ pub async fn create(
         }),
         status: Mutex::new(None),
     });
-    pump(process.stdout, terminal.clone());
-    pump(process.stderr, terminal.clone());
+    pump(stdout, terminal.clone());
+    pump(stderr, terminal.clone());
     let id = format!("term-{}", next_id.fetch_add(1, Ordering::Relaxed));
     terminals.lock().await.insert(id.clone(), terminal);
     Ok(TerminalCreateResult {

@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use aither_acp::{
     ClientCapabilities, ClientHandler, ContentBlock, FileSystemCapability, ReadTextFileParams,
@@ -15,16 +14,13 @@ use aither_acp::{
 };
 use aither_mcp::protocol::JsonRpcError;
 use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::config::PermissionPolicy;
 use crate::permission::PermissionRequest;
-use crate::services::Services;
-use crate::state::{
-    PendingPermission, Status, SubRuntime, ToolCallSummary, Turn, now, oldest_steer,
-    terminal_status,
-};
-use crate::terminal::{self, Terminal};
+use crate::services::{ServiceCall, ServiceCalls};
+use crate::state::{Status, SubRuntime, ToolCallSummary, Turn, now, oldest_steer, terminal_status};
+use crate::terminal::Terminal;
 
 /// Handles one subagent's agent-to-client traffic.
 #[derive(Debug)]
@@ -38,20 +34,21 @@ pub struct SubagentHandler {
     permission: PermissionPolicy,
     /// Allow fs access outside `cwd`.
     allow_outside_cwd: bool,
-    /// Where terminal commands start, and who answers permission requests
-    /// instead of the policy.
-    services: Services,
+    /// The host's services, which start terminal commands and answer
+    /// permission requests.
+    services: ServiceCalls,
 }
 
 impl SubagentHandler {
-    /// Construct the handler for a subagent being launched.
+    /// Construct the handler for a subagent being launched; `services`
+    /// reaches the task serving the host's [`Services`](crate::Services).
     #[must_use]
-    pub const fn new(
+    pub(crate) const fn new(
         rt: Arc<SubRuntime>,
         cwd: PathBuf,
         permission: PermissionPolicy,
         allow_outside_cwd: bool,
-        services: Services,
+        services: ServiceCalls,
     ) -> Self {
         Self {
             rt,
@@ -159,51 +156,22 @@ impl ClientHandler for SubagentHandler {
         &self,
         params: RequestPermissionParams,
     ) -> Result<RequestPermissionResult, JsonRpcError> {
-        if let Some(handler) = &self.services.permissions {
-            let outcome = handler
-                .decide(PermissionRequest {
-                    session_id: self.rt.session_label(),
-                    cwd: self.cwd.clone(),
-                    params,
-                })
-                .await;
-            return Ok(RequestPermissionResult {
-                outcome,
-                meta: None,
-            });
-        }
-        let outcome = match self.permission {
-            PermissionPolicy::Allow => params
-                .options
-                .iter()
-                .find(|o| {
-                    matches!(
-                        o.kind,
-                        aither_acp::PermissionOptionKind::AllowOnce
-                            | aither_acp::PermissionOptionKind::AllowAlways
-                    )
-                })
-                .map_or(RequestPermissionOutcome::Cancelled, |o| {
-                    RequestPermissionOutcome::Selected {
-                        option_id: o.option_id.clone(),
-                    }
-                }),
-            PermissionPolicy::Deny => params
-                .options
-                .iter()
-                .find(|o| {
-                    matches!(
-                        o.kind,
-                        aither_acp::PermissionOptionKind::RejectOnce
-                            | aither_acp::PermissionOptionKind::RejectAlways
-                    )
-                })
-                .map_or(RequestPermissionOutcome::Cancelled, |o| {
-                    RequestPermissionOutcome::Selected {
-                        option_id: o.option_id.clone(),
-                    }
-                }),
-            PermissionPolicy::Ask => self.queue_permission(params).await,
+        let (reply, answer) = oneshot::channel();
+        let request = PermissionRequest::new(
+            self.rt.session_label(),
+            self.cwd.clone(),
+            self.permission,
+            params,
+            self.rt.clone(),
+        );
+        let outcome = if self
+            .services
+            .send(ServiceCall::Permission { request, reply })
+            .is_ok()
+        {
+            answer.await.unwrap_or(RequestPermissionOutcome::Cancelled)
+        } else {
+            RequestPermissionOutcome::Cancelled
         };
         Ok(RequestPermissionResult {
             outcome,
@@ -251,14 +219,13 @@ impl ClientHandler for SubagentHandler {
         &self,
         params: TerminalCreateParams,
     ) -> Result<TerminalCreateResult, JsonRpcError> {
-        terminal::create(
-            &self.rt.terminals,
-            &self.rt.next_term,
-            params,
-            &self.cwd,
-            &self.services.executor,
-        )
-        .await
+        let (reply, answer) = oneshot::channel();
+        self.services
+            .send(ServiceCall::Terminal { params, reply })
+            .map_err(|_| JsonRpcError::internal_error("the session's services have shut down"))?;
+        answer.await.map_err(|_| {
+            JsonRpcError::internal_error("the session's services dropped the terminal request")
+        })?
     }
 
     async fn terminal_output(
@@ -357,34 +324,6 @@ pub(crate) fn note_tool_call_update(turn: &mut Turn, update: ToolCallUpdate) {
 }
 
 impl SubagentHandler {
-    /// Queue a permission request and await the `permit` tool's answer.
-    async fn queue_permission(&self, params: RequestPermissionParams) -> RequestPermissionOutcome {
-        let (tx, rx) = oneshot::channel();
-        let request_id = {
-            let mut inner = self.rt.inner.lock().expect("inner poisoned");
-            let id = format!("perm-{}", self.rt.next_perm.fetch_add(1, Ordering::Relaxed));
-            inner.pending.push(PendingPermission {
-                request_id: id.clone(),
-                tool_call: params.tool_call.clone(),
-                options: params.options,
-                answer: tx,
-            });
-            inner.status = Status::NeedsPermission;
-            id
-        };
-        debug!(subagent = %self.rt.session_label(), %request_id, "permission request queued");
-        self.rt.notify.notify_waiters();
-        let outcome = rx.await.unwrap_or(RequestPermissionOutcome::Cancelled);
-        {
-            let mut inner = self.rt.inner.lock().expect("inner poisoned");
-            if inner.pending.is_empty() && matches!(inner.status, Status::NeedsPermission) {
-                inner.status = Status::Running;
-            }
-        }
-        self.rt.notify.notify_waiters();
-        outcome
-    }
-
     /// Look up a terminal by id.
     async fn terminal(&self, id: &str) -> Result<Arc<Terminal>, JsonRpcError> {
         self.rt

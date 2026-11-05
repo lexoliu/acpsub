@@ -40,10 +40,11 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use executor::{
-    AnyExecutor, Executor, HostExecutor, Process, ProcessControl, ProcessHandle, Purpose, SpawnSpec,
+    AgentProcess, Executor, HostExecutor, HostProcess, ProcessControl, ProcessHandle, SpawnSpec,
+    TerminalProcess,
 };
 pub use host::{Host, Session, SessionSpec, TurnEnd, TurnOutcome, probe, probe_with};
-pub use permission::{AnyPermissionHandler, PermissionHandler, PermissionRequest};
+pub use permission::{PermissionHandler, PermissionRequest, PolicyPermissions};
 pub use registry::{Registry, RegistryEntry};
 pub use services::Services;
 pub use state::{AppState, Status, Subagent};

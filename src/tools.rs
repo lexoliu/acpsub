@@ -21,7 +21,9 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
+use crate::executor::Executor;
 use crate::host::{SessionSpec, TurnEnd, TurnOutcome, spawn_session};
+use crate::permission::PermissionHandler;
 use crate::prose;
 use crate::registry::RegistryEntry;
 use crate::state::{
@@ -2292,7 +2294,10 @@ pub(crate) enum Closed {
 /// Returns [`Error::UnknownSession`] when the id is neither live,
 /// launching nor registered, and the handed-off errors
 /// [`AppState::not_shipped`] reports.
-pub(crate) async fn close_session(state: &Arc<AppState>, session_id: &str) -> Result<Closed> {
+pub(crate) async fn close_session<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    session_id: &str,
+) -> Result<Closed> {
     let found = end_target(state, session_id, false);
     if matches!(found, SessionEnd::Missing) {
         state.not_shipped(session_id)?;

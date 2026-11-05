@@ -7,21 +7,21 @@ use aither_mcp::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError,
 };
 use aither_mcp::transport::{BidirectionalTransport, StreamTransport, Transport};
-use futures_lite::io::BufReader;
+use futures_lite::io::{AsyncRead, AsyncWrite, BufReader};
 
-use crate::executor::{ProcessHandle, ProcessOutput, ProcessStdin};
+use crate::executor::ProcessHandle;
 
 type Result<T> = std::result::Result<T, McpError>;
 
 /// Newline-delimited JSON-RPC over the agent's stdout and stdin. Closing
 /// it, or asking for the exit status of a process that is still running,
 /// kills the agent's process tree and reaps it.
-pub struct ProcessTransport {
-    stream: StreamTransport<BufReader<ProcessOutput>, ProcessStdin>,
+pub struct ProcessTransport<R, W> {
+    stream: StreamTransport<BufReader<R>, W>,
     process: ProcessHandle,
 }
 
-impl fmt::Debug for ProcessTransport {
+impl<R, W> fmt::Debug for ProcessTransport<R, W> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProcessTransport")
@@ -29,8 +29,9 @@ impl fmt::Debug for ProcessTransport {
     }
 }
 
-impl ProcessTransport {
-    pub fn new(stdout: ProcessOutput, stdin: ProcessStdin, process: ProcessHandle) -> Self {
+impl<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin> ProcessTransport<R, W> {
+    /// A transport reading `stdout` and writing `stdin` of `process`.
+    pub fn new(stdout: R, stdin: W, process: ProcessHandle) -> Self {
         Self {
             stream: StreamTransport::new(BufReader::new(stdout), stdin),
             process,
@@ -38,7 +39,9 @@ impl ProcessTransport {
     }
 }
 
-impl Transport for ProcessTransport {
+impl<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin> Transport
+    for ProcessTransport<R, W>
+{
     fn request(
         &mut self,
         req: JsonRpcRequest,
@@ -58,7 +61,7 @@ impl Transport for ProcessTransport {
     }
 
     async fn exit_status(&mut self) -> Option<ExitStatus> {
-        if let Ok(Some(status)) = self.process.try_wait() {
+        if let Some(status) = self.process.exited() {
             Some(status)
         } else {
             // The pipe is gone but the process is still running; it can no
@@ -69,7 +72,9 @@ impl Transport for ProcessTransport {
     }
 }
 
-impl BidirectionalTransport for ProcessTransport {
+impl<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin> BidirectionalTransport
+    for ProcessTransport<R, W>
+{
     fn recv(&mut self) -> impl Future<Output = Result<Option<JsonRpcMessage>>> + Send {
         self.stream.recv()
     }

@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use acpsub::config::{ConfigSource, Defaults, PermissionPolicy};
 use acpsub::{
-    Config, Executor, Host, HostExecutor, PermissionHandler, PermissionRequest, Process, Purpose,
-    Services, SessionSpec, SpawnSpec, TurnEnd, probe_with,
+    AgentProcess, Config, Executor, Host, HostExecutor, PermissionHandler, PermissionRequest,
+    PolicyPermissions, Services, SessionSpec, SpawnSpec, TerminalProcess, TurnEnd, probe_with,
 };
 use aither_acp::{RequestPermissionOutcome, StopReason};
 use common::*;
@@ -30,22 +30,66 @@ impl ConfigSource for MemorySource {
     }
 }
 
+/// Which start an executor was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    Agent,
+    Terminal,
+}
+
 /// An executor that records every spawn and runs it on the host, except
 /// that a terminal command is replaced by `terminal_script` when given.
 #[derive(Clone, Default)]
 struct Recording {
-    spawns: Arc<Mutex<Vec<SpawnSpec>>>,
+    spawns: Arc<Mutex<Vec<(Start, SpawnSpec)>>>,
     terminal_script: Option<String>,
 }
 
 impl Executor for Recording {
-    fn spawn(&self, mut spec: SpawnSpec) -> impl Future<Output = io::Result<Process>> + Send {
-        self.spawns.lock().unwrap().push(spec.clone());
-        if let (Purpose::Terminal, Some(script)) = (spec.purpose, &self.terminal_script) {
+    type Process = <HostExecutor as Executor>::Process;
+    type Stdin = <HostExecutor as Executor>::Stdin;
+    type Stdout = <HostExecutor as Executor>::Stdout;
+    type Stderr = <HostExecutor as Executor>::Stderr;
+
+    fn spawn_agent(
+        &self,
+        spec: SpawnSpec,
+    ) -> impl Future<Output = io::Result<AgentProcess<Self>>> + Send {
+        self.spawns
+            .lock()
+            .unwrap()
+            .push((Start::Agent, spec.clone()));
+        async move {
+            let process = HostExecutor.spawn_agent(spec).await?;
+            Ok(AgentProcess {
+                stdin: process.stdin,
+                stdout: process.stdout,
+                stderr: process.stderr,
+                control: process.control,
+            })
+        }
+    }
+
+    fn spawn_terminal(
+        &self,
+        mut spec: SpawnSpec,
+    ) -> impl Future<Output = io::Result<TerminalProcess<Self>>> + Send {
+        self.spawns
+            .lock()
+            .unwrap()
+            .push((Start::Terminal, spec.clone()));
+        if let Some(script) = &self.terminal_script {
             spec.program = "sh".to_string();
             spec.args = vec!["-c".to_string(), script.clone()];
         }
-        HostExecutor.spawn(spec)
+        async move {
+            let process = HostExecutor.spawn_terminal(spec).await?;
+            Ok(TerminalProcess {
+                stdout: process.stdout,
+                stderr: process.stderr,
+                control: process.control,
+            })
+        }
     }
 }
 
@@ -68,11 +112,19 @@ impl PermissionHandler for Selecting {
     }
 }
 
-fn recorded(spawns: &Mutex<Vec<SpawnSpec>>) -> Vec<SpawnSpec> {
+fn recorded(spawns: &Mutex<Vec<(Start, SpawnSpec)>>) -> Vec<(Start, SpawnSpec)> {
     spawns.lock().unwrap().clone()
 }
 
-fn host(dir: &Path, policy: PermissionPolicy, services: Services) -> Host {
+fn default_services() -> Services {
+    Services::<HostExecutor, PolicyPermissions>::default()
+}
+
+fn host<E: Executor, P: PermissionHandler>(
+    dir: &Path,
+    policy: PermissionPolicy,
+    services: Services<E, P>,
+) -> Host<E, P> {
     let mut defaults = Defaults::new(dir.join("transcripts"), dir.join("registry.json"));
     defaults.permission = policy;
     defaults.wait_grace = Duration::from_secs(60);
@@ -103,14 +155,14 @@ async fn supplied_executor_starts_the_agent_and_its_terminal_commands() {
     let host = host(
         dir.path(),
         PermissionPolicy::Allow,
-        Services::default().with_executor(executor),
+        default_services().with_executor(executor),
     );
     let session = host.spawn(spec(&cwd)).await.expect("spawn");
 
     let seen = recorded(&spawns);
     assert_eq!(seen.len(), 1, "only the agent so far: {seen:?}");
-    let agent = &seen[0];
-    assert_eq!(agent.purpose, Purpose::Agent);
+    let (start, agent) = &seen[0];
+    assert_eq!(*start, Start::Agent);
     assert_eq!(agent.program, "python3");
     assert_eq!(agent.args, [fake_agent_script().to_string_lossy()]);
     assert_eq!(agent.cwd, cwd);
@@ -122,8 +174,8 @@ async fn supplied_executor_starts_the_agent_and_its_terminal_commands() {
     assert!(turn.reply.contains("term:via-executor"), "{}", turn.reply);
     let seen = recorded(&spawns);
     assert_eq!(seen.len(), 2, "{seen:?}");
-    let terminal = &seen[1];
-    assert_eq!(terminal.purpose, Purpose::Terminal);
+    let (start, terminal) = &seen[1];
+    assert_eq!(*start, Start::Terminal);
     assert_eq!(terminal.program, "echo");
     assert_eq!(terminal.args, ["asked"]);
     assert_eq!(terminal.cwd, cwd);
@@ -135,8 +187,9 @@ async fn supplied_executor_starts_the_agent_and_its_terminal_commands() {
         .expect("prompt");
     assert!(turn.reply.contains("term:via-executor"), "{}", turn.reply);
     let seen = recorded(&spawns);
-    assert_eq!(seen[2].program, "bash");
-    assert_eq!(seen[2].args, ["-c", "echo one && echo two"]);
+    assert_eq!(seen[2].0, Start::Terminal);
+    assert_eq!(seen[2].1.program, "bash");
+    assert_eq!(seen[2].1.args, ["-c", "echo one && echo two"]);
     session.close().await.expect("close");
 }
 
@@ -157,7 +210,7 @@ async fn supplied_permission_handler_answers_instead_of_the_policy() {
     let host = host(
         dir.path(),
         PermissionPolicy::Deny,
-        Services::default().with_permissions(handler),
+        default_services().with_permissions(handler),
     );
     let session = host.spawn(spec(&cwd)).await.expect("spawn");
     let turn = session.prompt("PERMISSION").await.expect("prompt");
@@ -169,6 +222,7 @@ async fn supplied_permission_handler_answers_instead_of_the_policy() {
     let request = &seen[0];
     assert_eq!(request.session_id, session.session_id());
     assert_eq!(request.cwd, cwd);
+    assert_eq!(request.policy, PermissionPolicy::Deny);
     assert_eq!(request.params.tool_call.tool_call_id, "tc-1");
     let options: Vec<_> = request
         .params
@@ -188,7 +242,7 @@ async fn default_services_run_on_the_host_under_the_policy() {
     }
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().canonicalize().unwrap();
-    let host = host(dir.path(), PermissionPolicy::Deny, Services::default());
+    let host = host(dir.path(), PermissionPolicy::Deny, default_services());
     let session = host.spawn(spec(&cwd)).await.expect("spawn");
     let turn = session.prompt("RUN echo on-host").await.expect("prompt");
     assert!(turn.reply.contains("term:on-host"), "{}", turn.reply);
@@ -205,12 +259,14 @@ async fn probe_runs_through_the_supplied_executor() {
     }
     let executor = Recording::default();
     let spawns = executor.spawns.clone();
-    let services = Services::default().with_executor(executor);
-    let init = probe_with(&fake_agent_config(), &services)
-        .await
-        .expect("fake speaks ACP");
+    let init = probe_with(
+        &fake_agent_config(),
+        default_services().with_executor(executor),
+    )
+    .await
+    .expect("fake speaks ACP");
     assert!(init.agent_info.is_some());
     let seen = recorded(&spawns);
     assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].purpose, Purpose::Agent);
+    assert_eq!(seen[0].0, Start::Agent);
 }
