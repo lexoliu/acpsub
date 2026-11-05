@@ -57,9 +57,9 @@ dependencies = [
 
 [[package]]
 name = "aither-acp"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05dd02f33932ce2e41129d5d6cf56f5d1453cd8af7b59ac722d285f9dc0a60e8"
+checksum = "92d6b8a23f51cd6412c97384af8ebfb3221a19664bf36d2905365e182dc908de"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -77,9 +77,9 @@ dependencies = [
 
 [[package]]
 name = "aither-agent"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "082ab769dd47a82246a6895c5d09b02ddfbf2605e4b9d425d20a94b475ee7dfd"
+checksum = "f521b7e0c3892a63900956cd5cd5be24658cfeef5439dfafd5e752b1ad5bcc75"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -92,6 +92,7 @@ dependencies = [
  "async-io",
  "async-process",
  "async-stream",
+ "basic-toml",
  "blocking",
  "dunce",
  "event-listener",
@@ -99,16 +100,15 @@ dependencies = [
  "futures",
  "futures-core",
  "futures-lite",
- "heck",
  "indexmap",
  "jiff",
+ "libc",
  "notify",
  "num-traits",
  "rustix",
  "schemars",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "similar",
  "sync_wrapper",
@@ -120,9 +120,9 @@ dependencies = [
 
 [[package]]
 name = "aither-attachments"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04489b6d0e75787e4f3a3133ce8c552370663aa9cd72ac27531358bf3ebdff3a"
+checksum = "a82e6cb690a2aa6e39bb33639d4fc07a20928ecebcf8b25df0f7d6ee851a7ab3"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -134,9 +134,9 @@ dependencies = [
 
 [[package]]
 name = "aither-core"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1f0e8388ee6d03a6a62dae911d68831fdf7b606b638027833fc28312e2374f7"
+checksum = "12bd91d45e855c4cddf7761d3a41561a6d36cc76a8b79e4c06ab0db158dfef99"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -152,9 +152,9 @@ dependencies = [
 
 [[package]]
 name = "aither-derive"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "867d9df32b5cd668259a4b95401590bcc60908eff695e81ece6262eda2d5b1e5"
+checksum = "6a61b6bdb97e951a5b89c73f376765b32a701d25325a924a2be27387854d04b6"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -164,9 +164,9 @@ dependencies = [
 
 [[package]]
 name = "aither-mcp"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d6864f16f6245e32bf098ac86ca7747d91cf07b66524d26339ed8d4ed0ed2b1"
+checksum = "ceebe0ef2debb757554a864e2d8553352426125541d7f35d001591baa258065f"
 dependencies = [
  "aither-core",
  "aither-sandbox",
@@ -188,9 +188,9 @@ dependencies = [
 
 [[package]]
 name = "aither-sandbox"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "535c681393a41b0d15dfe5cfe2233f1a7aa5d9feafebc00c459ba9550df45d3f"
+checksum = "c77a591116f0c86612602af578fee61a40b529b37962c225341d27c47be6b01d"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -214,6 +214,7 @@ dependencies = [
  "hex",
  "human-hash",
  "image",
+ "jiff",
  "libc",
  "lzma-rust2",
  "regex",
@@ -1792,9 +1793,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.7.4"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d483b82223401ff6c169a2bfa3ea348837cefeb3ada4e1feb2edf27d9a03861"
+checksum = "783190e84edad24743d7e1136be79240e9556cf4b078f91b896b4619d260a4c9"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -2324,9 +2325,9 @@ dependencies = [
 
 [[package]]
 name = "jiff"
-version = "0.2.35"
+version = "0.2.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "668b7183bd07af9a4885f5c35b0cc5c83c4607a913c16b7e17291832910d2dcc"
+checksum = "3ac703058abac89e5c39b0b879dce2b6b14a4ba36600c7e7e3d0c60a6883ef3c"
 dependencies = [
  "defmt",
  "jiff-core",
@@ -2341,18 +2342,19 @@ dependencies = [
 
 [[package]]
 name = "jiff-core"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7feca88439efe53da3754500c1851dedf3cb36c524dd5cf8225cc0794de95d09"
+checksum = "aee43309eb53bafb8c36d35d6e444769c8f8e6206a9fbf7546f5db9d7d4a0e93"
 dependencies = [
  "defmt",
+ "log",
 ]
 
 [[package]]
 name = "jiff-static"
-version = "0.2.35"
+version = "0.2.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a69dcb3a21cfb32ce1cd056169337ca284af0766dd766e7878819b251a49204"
+checksum = "6dc32470c67eb7d0e9ccb74303fa925313dc04cecb1aa048beaa6f391e36a93d"
 dependencies = [
  "jiff-core",
  "proc-macro2",
@@ -3603,19 +3605,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4226,12 +4215,6 @@ name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
