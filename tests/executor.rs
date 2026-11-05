@@ -251,6 +251,63 @@ async fn default_services_run_on_the_host_under_the_policy() {
     session.close().await.expect("close");
 }
 
+/// Start `sleep` on a runtime of its own, supervise it, run `act` on its
+/// handle, drop the runtime at once, and report whether the process
+/// group is still there afterwards.
+fn group_survives_runtime_shutdown(act: impl FnOnce(&acpsub::ProcessHandle)) -> bool {
+    use futures_lite::io::{AsyncBufReadExt, BufReader};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let pid = runtime.block_on(async {
+        let process = HostExecutor
+            .spawn_agent(SpawnSpec {
+                program: "sh".into(),
+                args: vec!["-c".into(), "echo $$; exec sleep 30".into()],
+                env: std::collections::BTreeMap::new(),
+                cwd: std::env::temp_dir(),
+            })
+            .await
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(process.stdout)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        let handle = acpsub::ProcessHandle::supervise(process.control);
+        act(&handle);
+        line.trim().parse::<libc::pid_t>().unwrap()
+    });
+    // Shutdown right after: the supervising task may never run again.
+    drop(runtime);
+    // SAFETY: kill(2) with signal 0 only probes the group.
+    let alive = || unsafe { libc::kill(-pid, 0) == 0 };
+    for _ in 0..100 {
+        if !alive() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: the test's own leftover group.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    true
+}
+
+#[test]
+fn killed_handle_then_runtime_shutdown_leaves_no_process() {
+    assert!(!group_survives_runtime_shutdown(
+        acpsub::ProcessHandle::kill
+    ));
+}
+
+#[test]
+fn runtime_shutdown_kills_a_supervised_process() {
+    assert!(!group_survives_runtime_shutdown(|_| {}));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_runs_through_the_supplied_executor() {
     if !python3() {

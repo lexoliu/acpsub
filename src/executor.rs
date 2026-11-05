@@ -154,16 +154,19 @@ impl ProcessHandle {
     pub fn supervise(control: impl ProcessControl) -> Self {
         let (kill, mut requests) = mpsc::unbounded_channel();
         let (publish, exit) = watch::channel(None);
+        // Wrapped before the spawn, so the tree is killed when the task ends
+        // or is dropped unpolled, as a runtime shutting down does.
+        let control = KillOnDrop(control);
         tokio::spawn(async move {
-            let mut waiting = std::pin::pin!(control.wait());
+            let mut waiting = std::pin::pin!(control.0.wait());
             let mut exited = false;
             loop {
                 tokio::select! {
                     request = requests.recv() => {
-                        control.kill();
                         if request.is_none() {
                             return;
                         }
+                        control.0.kill();
                     }
                     status = &mut waiting, if !exited => {
                         exited = true;
@@ -201,6 +204,17 @@ impl ProcessHandle {
             .await
             .map_err(|_| io::Error::other("the process's exit status could not be collected"))?;
         (*status).ok_or_else(|| io::Error::other("the process's exit status is missing"))
+    }
+}
+
+/// A [`ProcessControl`] that kills its process tree when dropped. The kill
+/// also sweeps descendants a reaped leader orphaned, and is harmless when
+/// the group is gone.
+struct KillOnDrop<C: ProcessControl>(C);
+
+impl<C: ProcessControl> Drop for KillOnDrop<C> {
+    fn drop(&mut self) {
+        self.0.kill();
     }
 }
 
