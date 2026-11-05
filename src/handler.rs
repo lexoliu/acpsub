@@ -1,5 +1,6 @@
 //! The per-subagent [`ClientHandler`]: transcripts every `session/update`,
-//! applies the permission policy, and serves `fs/*`/`terminal/*` requests.
+//! applies the permission policy, and serves `terminal/*` requests and,
+//! unless the agent's file access is off, `fs/*` requests.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use aither_mcp::protocol::JsonRpcError;
 use tokio::sync::oneshot;
 use tracing::warn;
 
-use crate::config::PermissionPolicy;
+use crate::config::{FileAccess, PermissionPolicy};
 use crate::permission::PermissionRequest;
 use crate::services::{ServiceCall, ServiceCalls};
 use crate::state::{Status, SubRuntime, ToolCallSummary, Turn, now, oldest_steer, terminal_status};
@@ -27,13 +28,13 @@ use crate::terminal::Terminal;
 pub struct SubagentHandler {
     /// Shared mutable state.
     rt: Arc<SubRuntime>,
-    /// Session working directory; fs paths must stay under it unless
-    /// `allow_outside_cwd`.
+    /// Session working directory; fs paths must stay under it under
+    /// [`FileAccess::Cwd`].
     cwd: PathBuf,
     /// Permission policy for `session/request_permission`.
     permission: PermissionPolicy,
-    /// Allow fs access outside `cwd`.
-    allow_outside_cwd: bool,
+    /// What the `fs/*` methods serve.
+    file_access: FileAccess,
     /// The host's services, which start terminal commands and answer
     /// permission requests.
     services: ServiceCalls,
@@ -47,14 +48,14 @@ impl SubagentHandler {
         rt: Arc<SubRuntime>,
         cwd: PathBuf,
         permission: PermissionPolicy,
-        allow_outside_cwd: bool,
+        file_access: FileAccess,
         services: ServiceCalls,
     ) -> Self {
         Self {
             rt,
             cwd,
             permission,
-            allow_outside_cwd,
+            file_access,
             services,
         }
     }
@@ -62,10 +63,11 @@ impl SubagentHandler {
 
 impl ClientHandler for SubagentHandler {
     fn capabilities(&self) -> ClientCapabilities {
+        let served = self.file_access != FileAccess::Off;
         ClientCapabilities {
             fs: FileSystemCapability {
-                read_text_file: true,
-                write_text_file: true,
+                read_text_file: served,
+                write_text_file: served,
                 meta: None,
             },
             terminal: true,
@@ -183,7 +185,7 @@ impl ClientHandler for SubagentHandler {
         &self,
         params: ReadTextFileParams,
     ) -> Result<ReadTextFileResult, JsonRpcError> {
-        let path = self.resolve(&params.path)?;
+        let path = self.resolve("fs/read_text_file", &params.path)?;
         let text = tokio::fs::read_to_string(&path).await.map_err(|source| {
             JsonRpcError::internal_error(format!("cannot read {}: {source}", path.display()))
         })?;
@@ -198,7 +200,7 @@ impl ClientHandler for SubagentHandler {
         &self,
         params: WriteTextFileParams,
     ) -> Result<WriteTextFileResult, JsonRpcError> {
-        let path = self.resolve(&params.path)?;
+        let path = self.resolve("fs/write_text_file", &params.path)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|source| {
                 JsonRpcError::internal_error(format!(
@@ -335,17 +337,21 @@ impl SubagentHandler {
             .ok_or_else(|| JsonRpcError::invalid_params(format!("unknown terminal '{id}'")))
     }
 
-    /// Resolve `path` against the session cwd and enforce the
-    /// `allow_outside_cwd` boundary. Symlinks are resolved when the path (or
-    /// its parent) exists.
-    fn resolve(&self, path: &Path) -> Result<PathBuf, JsonRpcError> {
+    /// Resolve the path of a `method` request against the session cwd and
+    /// enforce the file access: every request is refused when it is off,
+    /// and one outside the cwd when it is confined there. Symlinks are
+    /// resolved when the path (or its parent) exists.
+    fn resolve(&self, method: &str, path: &Path) -> Result<PathBuf, JsonRpcError> {
+        if self.file_access == FileAccess::Off {
+            return Err(JsonRpcError::method_not_found(method));
+        }
         let candidate = if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.cwd.join(path)
         };
         let normalized = canonicalize_lenient(&candidate);
-        if !self.allow_outside_cwd && !normalized.starts_with(&self.cwd) {
+        if self.file_access == FileAccess::Cwd && !normalized.starts_with(&self.cwd) {
             return Err(JsonRpcError::internal_error(format!(
                 "{} is outside the session cwd {}",
                 path.display(),

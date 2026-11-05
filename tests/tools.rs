@@ -2351,7 +2351,7 @@ async fn forget_during_in_flight_adopt() {
 
 /// `WRITE <path>` has the agent call `fs/write_text_file`: writes inside the
 /// session cwd succeed, writes outside are refused unless the agent sets
-/// `allow_outside_cwd`.
+/// `file_access = "anywhere"`.
 #[tokio::test(flavor = "multi_thread")]
 async fn fs_write_inside_and_outside_cwd() {
     if !python3() {

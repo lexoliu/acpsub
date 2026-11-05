@@ -305,10 +305,39 @@ pub enum SteerSemantics {
     Folded,
 }
 
+/// What the client's `fs/read_text_file` and `fs/write_text_file` serve an
+/// agent.
+///
+/// The host serves them with its own filesystem access, so a host
+/// that confines the agent through its [`Executor`](crate::Executor) turns
+/// them [`Off`](Self::Off) and the agent does its file IO in its own,
+/// confined, process.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum FileAccess {
+    /// Advertise both methods and serve paths under the session cwd.
+    #[default]
+    Cwd,
+    /// Advertise both methods and serve any path.
+    Anywhere,
+    /// Advertise neither method and refuse every `fs/*` request.
+    Off,
+}
+
 /// A configured ACP agent: how to launch it.
 ///
-/// The command, its arguments and environment, the cwd boundary, and the
-/// permission policy. Session options (`model`, `mode`, other
+/// The command, its arguments and environment, the client file access,
+/// and the permission policy. Session options (`model`, `mode`, other
 /// `session/set_config_option` values) are `spawn`/`adopt` arguments,
 /// never configured here.
 #[derive(Debug, Clone)]
@@ -319,8 +348,8 @@ pub struct AgentConfig {
     pub args: Vec<String>,
     /// Extra environment variables for the agent process.
     pub env: BTreeMap<String, String>,
-    /// Whether the agent may read/write files outside the session `cwd`.
-    pub allow_outside_cwd: bool,
+    /// What the client's `fs/*` methods serve the agent.
+    pub file_access: FileAccess,
     /// Per-agent permission policy override.
     pub permission: Option<PermissionPolicy>,
     /// Steer contract: what a `session/prompt` sent mid-turn (a `send`
@@ -338,15 +367,15 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     /// An agent running `command` with no arguments, no extra
-    /// environment, confined to the session cwd, with the default
-    /// permission and steer contracts.
+    /// environment, file access confined to the session cwd, with the
+    /// default permission and steer contracts.
     #[must_use]
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
             args: Vec::new(),
             env: BTreeMap::new(),
-            allow_outside_cwd: false,
+            file_access: FileAccess::default(),
             permission: None,
             steer: SteerSemantics::default(),
             sessions_db: None,
@@ -416,7 +445,7 @@ struct RawAgentConfig {
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
-    allow_outside_cwd: bool,
+    file_access: FileAccess,
     permission: Option<PermissionPolicy>,
     #[serde(default)]
     steer: SteerSemantics,
@@ -467,7 +496,7 @@ impl RawAgentConfig {
             command: self.command,
             args: self.args,
             env: self.env,
-            allow_outside_cwd: self.allow_outside_cwd,
+            file_access: self.file_access,
             permission: self.permission,
             steer: self.steer,
             sessions_db: self.sessions_db.as_deref().map(expand_tilde),
@@ -505,13 +534,14 @@ registry = "/tmp/acpsub-registry.json"
 [agents.devin]
 command = "devin"
 args = ["acp"]
-allow_outside_cwd = false
+file_access = "off"
 
 [agents.claude]
 command = "npx"
 args = ["-y", "@zed-industries/claude-code-acp"]
 permission = "ask"
 env = { FOO = "bar" }
+file_access = "anywhere"
 "#;
         let config = Config::parse(text).expect("config parses");
         assert_eq!(config.defaults.permission, PermissionPolicy::Allow);
@@ -523,9 +553,11 @@ env = { FOO = "bar" }
         let devin = &config.agents["devin"];
         assert_eq!(devin.command, "devin");
         assert_eq!(devin.args, ["acp"]);
+        assert_eq!(devin.file_access, FileAccess::Off);
         let claude = &config.agents["claude"];
         assert_eq!(claude.permission, Some(PermissionPolicy::Ask));
         assert_eq!(claude.env["FOO"], "bar");
+        assert_eq!(claude.file_access, FileAccess::Anywhere);
     }
 
     #[test]
@@ -539,7 +571,7 @@ env = { FOO = "bar" }
                 .ends_with("acpsub/transcripts")
         );
         assert_eq!(config.agents["a"].args, Vec::<String>::new());
-        assert!(!config.agents["a"].allow_outside_cwd);
+        assert_eq!(config.agents["a"].file_access, FileAccess::Cwd);
     }
 
     #[test]

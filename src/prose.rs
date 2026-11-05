@@ -445,8 +445,10 @@ pub fn agents(view: &Value) -> String {
         if agent["default"].as_bool() == Some(true) {
             text.push_str(" (default)");
         }
-        if agent["allow_outside_cwd"].as_bool() == Some(true) {
-            text.push_str(", allows outside cwd");
+        match agent["file_access"].as_str() {
+            Some("anywhere") => text.push_str(", file access outside cwd"),
+            Some("off") => text.push_str(", no file access"),
+            _ => {}
         }
         text.push('\n');
         let subs = ids(&agent["subagents"]);

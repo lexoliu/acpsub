@@ -29,7 +29,7 @@ registry = "~/.local/share/acpsub/registry.json"
 [agents.devin]
 command = "devin"
 args = ["acp"]
-allow_outside_cwd = false                # refuse fs/* paths outside cwd
+file_access = "cwd"                      # cwd | anywhere | off — what fs/* serves
 # env = { API_KEY = "..." }              # extra environment for the process
 # permission = "ask"                     # per-agent override of the default
 # steer = "folded"                       # answered | folded — what a mid-turn

@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use acpsub::config::PermissionPolicy;
+use acpsub::config::{FileAccess, PermissionPolicy};
 use acpsub::{
     AppState, Config, FileConfigSource, RenderOptions, build_tools, default_config_path, render,
 };
@@ -851,7 +851,7 @@ fn agents(config: Option<PathBuf>, as_json: bool) -> Result<(), Box<dyn std::err
                     "name": name,
                     "command": agent.command,
                     "args": agent.args,
-                    "allow_outside_cwd": agent.allow_outside_cwd,
+                    "file_access": agent.file_access,
                     "permission": agent.permission,
                 })
             })
@@ -862,8 +862,12 @@ fn agents(config: Option<PathBuf>, as_json: bool) -> Result<(), Box<dyn std::err
     let mut out = String::new();
     for (name, agent) in &config.agents {
         let mut line = format!("{name}\t{} {}", agent.command, agent.args.join(" "));
-        if agent.allow_outside_cwd {
-            line.push_str("\tallow_outside_cwd");
+        if agent.file_access != FileAccess::Cwd {
+            let name = serde_json::to_value(agent.file_access)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let _ = write!(line, "\tfile_access={name}");
         }
         if let Some(permission) = agent.permission {
             let name = serde_json::to_value(permission)
