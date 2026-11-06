@@ -20,6 +20,7 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 
 use futures_lite::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
@@ -137,7 +138,9 @@ pub trait Executor: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ProcessHandle {
     kill: mpsc::UnboundedSender<()>,
-    exit: watch::Receiver<Option<ExitStatus>>,
+    /// The outcome of the control's wait, published once: its status, or
+    /// why it could not be collected.
+    exit: watch::Receiver<Option<Result<ExitStatus, Arc<io::Error>>>>,
 }
 
 impl fmt::Debug for ProcessHandle {
@@ -170,9 +173,10 @@ impl ProcessHandle {
                     }
                     status = &mut waiting, if !exited => {
                         exited = true;
-                        if let Ok(status) = status {
-                            let _ = publish.send(Some(status));
-                        }
+                        // A failed wait is published too: the sender lives
+                        // on in this loop, so withholding it would leave
+                        // every `wait` pending forever.
+                        let _ = publish.send(Some(status.map_err(Arc::new)));
                     }
                 }
             }
@@ -189,7 +193,10 @@ impl ProcessHandle {
     /// The exit status if the process has exited and was reaped.
     #[must_use]
     pub fn exited(&self) -> Option<ExitStatus> {
-        *self.exit.borrow()
+        self.exit
+            .borrow()
+            .as_ref()
+            .and_then(|outcome| outcome.as_ref().ok().copied())
     }
 
     /// Resolve when the process exits.
@@ -199,11 +206,15 @@ impl ProcessHandle {
     /// Returns an error when the process's status could not be collected.
     pub async fn wait(&self) -> io::Result<ExitStatus> {
         let mut exit = self.exit.clone();
-        let status = exit
+        let outcome = exit
             .wait_for(Option::is_some)
             .await
             .map_err(|_| io::Error::other("the process's exit status could not be collected"))?;
-        (*status).ok_or_else(|| io::Error::other("the process's exit status is missing"))
+        match outcome.as_ref() {
+            Some(Ok(status)) => Ok(*status),
+            Some(Err(error)) => Err(io::Error::new(error.kind(), error.to_string())),
+            None => Err(io::Error::other("the process's exit status is missing")),
+        }
     }
 }
 

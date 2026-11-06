@@ -308,6 +308,31 @@ fn runtime_shutdown_kills_a_supervised_process() {
     assert!(!group_survives_runtime_shutdown(|_| {}));
 }
 
+/// A control whose status cannot be collected, as a sandbox's supervisor
+/// that lost its report.
+struct Uncollectable;
+
+impl acpsub::ProcessControl for Uncollectable {
+    fn kill(&self) {}
+
+    fn wait(&self) -> impl Future<Output = io::Result<std::process::ExitStatus>> + Send {
+        std::future::ready(Err(io::Error::other(
+            "the supervisor ended without its report",
+        )))
+    }
+}
+
+#[tokio::test]
+async fn a_status_that_cannot_be_collected_fails_the_wait() {
+    let handle = acpsub::ProcessHandle::supervise(Uncollectable);
+    let error = tokio::time::timeout(Duration::from_secs(5), handle.wait())
+        .await
+        .expect("the wait resolves")
+        .expect_err("no status was collected");
+    assert_eq!(error.to_string(), "the supervisor ended without its report");
+    assert_eq!(handle.exited(), None);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_runs_through_the_supplied_executor() {
     if !python3() {
