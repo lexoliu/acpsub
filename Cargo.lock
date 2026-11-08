@@ -57,9 +57,9 @@ dependencies = [
 
 [[package]]
 name = "aither-acp"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9139e4e89a6f46b55fc3f5ffa82d582bbfba4d2b0ed93ab8ecc916200d49820b"
+checksum = "914ef275a936ceafc91e6193ecec784f91ba6d48034673dd43d3ad375e438c4d"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -78,9 +78,9 @@ dependencies = [
 
 [[package]]
 name = "aither-agent"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58b0c5e4d19e31d0065f41201da74a88597b640b626fb49e2e626a0dae420484"
+checksum = "92250ea2940e0683254aee3a7af2fa8a25a2ed4b379e85f42d998f0c3abd9ec8"
 dependencies = [
  "aho-corasick",
  "aither-attachments",
@@ -124,9 +124,9 @@ dependencies = [
 
 [[package]]
 name = "aither-attachments"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c1815c916dcd2f32ba6cecdf9e8cb7d83342778d8a8e98cef44b23db4f8cbdc"
+checksum = "9d53149f2d772c11bdf70abbdaa390b48844c7146b60627d099e9c0bc39f43a3"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -138,9 +138,9 @@ dependencies = [
 
 [[package]]
 name = "aither-core"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51eb183f6754cc69fbff1c9aeb63bf2e2f639f847e77bcd938517b447a137b20"
+checksum = "87702a6af93b3b9a2e2294d32f50e20244f546d2e92240a85f772f040860d339"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -151,14 +151,15 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "thiserror",
  "url",
 ]
 
 [[package]]
 name = "aither-derive"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "285139458b727374d8c7ffe7c9d8cc4372322af2bf5e0e2388923586ed33a5bc"
+checksum = "bda7eebf5563de2d5e71da34e5e132f7e35963c06ac9372cf51800ae55087893"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -168,9 +169,9 @@ dependencies = [
 
 [[package]]
 name = "aither-mcp"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c955853a94b45140e3dc22022408ff6cfd6bda823cb84d92fa3ec4e3e2396bf3"
+checksum = "0859d347adab65e73f22379877c67a3f5eaa122fc9cfbb1629050d7fb5f951d4"
 dependencies = [
  "aither-core",
  "aither-sandbox",
@@ -193,9 +194,9 @@ dependencies = [
 
 [[package]]
 name = "aither-sandbox"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8272b1b0b29a56f2757782b5757f9c60a3d33802a85c035d04a2113da0b7392d"
+checksum = "07dd6e75d5f9601874ccc0ac2207a44ce6a8aa4864150a5609f63214c5faee89"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -218,7 +219,6 @@ dependencies = [
  "globset",
  "heel",
  "hex",
- "human-hash",
  "image",
  "jiff",
  "libc",
@@ -1800,9 +1800,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9e8401f187045391a6494252c29da3663475e5819acd098e505ecd129455bd8"
+checksum = "c39ba724ff8c7e06342ef658b1154901d08eb58c84a60649b01de0177002c66a"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -1989,15 +1989,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "human-hash"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee5afc14f104d821c7dae9cabe97a19510b62532bf7d506ef14fab73c4bbf4fa"
-dependencies = [
- "uuid",
-]
 
 [[package]]
 name = "humansize"
@@ -3901,18 +3892,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
