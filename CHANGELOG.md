@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/lexoliu/acpsub/compare/v0.2.0...v0.3.0) - 2026-11-10
+
+### Added
+
+- host-supplied executor and permission handler
+- ModelRequired lists the advertised models
+- gate the session database and the CLI behind features
+- [**breaking**] library API for embedding acpsub in a host process
+- say when an unwatched turn will be stopped
+- *(daemon)* prune old transcripts and registry entries
+- [**breaking**] answer in prose by default; wait returns only the turn's reply ([#108](https://github.com/lexoliu/acpsub/pull/108))
+- [**breaking**] replace --owner pid reaping with a wait-fed watchdog
+- *(tools)* [**breaking**] report a steer as submitted and resolve it in status and wait ([#71](https://github.com/lexoliu/acpsub/pull/71))
+- *(daemon)* graceful restart — drain in-flight turns and resume every live session
+- park rate-limited turns and resume them when the limit lifts
+- *(tools)* --max-wait deadline with an activity digest on wait
+- add daemon + CLI client alongside the stdio MCP server
+- report MCP progress while wait/wait_any block ([#46](https://github.com/lexoliu/acpsub/pull/46))
+- [**breaking**] wait/wait_any take a required expect_secs and report overrun ([#44](https://github.com/lexoliu/acpsub/pull/44))
+- [**breaking**] make model and mode required spawn/adopt arguments
+- *(tools)* [**breaking**] require an explicit send policy (try|queued|steer) ([#35](https://github.com/lexoliu/acpsub/pull/35))
+
+### Fixed
+
+- *(executor)* publish a failed process wait instead of hanging
+- *(handler)* [**breaking**] let a host turn client file access off
+- supervised process dies with its supervising task
+- send a cancel that lands before session/prompt behind the prompt
+- re-issue a dropped idempotent call only against a new daemon
+- always serialize a resume report's pending turns
+- *(ci)* install the glibc release-plz build for releases ([#111](https://github.com/lexoliu/acpsub/pull/111))
+- *(wait)* refuse an --expect the turn has already passed ([#106](https://github.com/lexoliu/acpsub/pull/106))
+- *(wait)* list a turn's tool calls in start order ([#103](https://github.com/lexoliu/acpsub/pull/103))
+- surface provider rate limits from spawn, send and wait
+- *(daemon)* refuse calls for a shipped session with the handoff
+- *(daemon)* record a turn's end before reporting it
+- *(daemon)* recover when a successor dies after takeover
+- hold sends refused mid-handoff until the ship resolves
+- *(transcript)* hide session-state updates and count --tail by section
+- report a failed socket bind as itself
+- resume a session parked before its turn with its own prompt
+- refuse a live socket whose daemon holds no claim
+- [**breaking**] restart hands the socket over instead of draining
+- one daemon per socket, and tests stop the daemons they start ([#75](https://github.com/lexoliu/acpsub/pull/75))
+- a close or forget during a launch ends the session when the launch lands
+- a wait's progress is its own elapsed time
+- a closed session never resumes on its own schedule
+- *(restart)* surface failed resumes and sequence tests on real signals
+- *(restart)* race-free drain signaling, EOF restart waits, structured refusal
+- *(cli)* make --model and --mode optional on spawn and adopt
+- resume failed turns and let adopt reap exited agents
+- *(wait)* bind wait and wait_any to the turn running at call start
+- allow spawn/adopt on agents that advertise no modes or model option
+- settle steers a folding agent never answers
+- validate spawn/adopt mode, model, and config against agent advertisements ([#43](https://github.com/lexoliu/acpsub/pull/43))
+
+### Other
+
+- move onto aither 0.30
+- *(deps)* aither 0.29
+- *(deps)* aither 0.28
+- *(deps)* depend on aither 0.27
+- *(deps)* depend on aither 0.26
+- update aither to 0.24.0
+- *(deps)* depend on aither 0.22.0
+- *(deps)* depend on aither 0.21.0
+- *(deps)* depend on aither 0.20.0
+- *(deps)* depend on aither 0.19
+- depend on aither 0.18
+- generic executor and permission handler
+- *(deps)* aither 0.17.0
+- depend on aither 0.16
+- depend on aither 0.15
+- depend on aither 0.14
+- attest release artifacts with build provenance
+- depend on aither 0.13.0
+- Merge remote-tracking branch 'origin/dev' into fix/126-cancel-before-prompt
+- drop the x86_64-apple-darwin release target
+- Merge pull request #114 from lexoliu/fix/110-restart-hang
+- drive rate-limit and park tests by events, not wall-clock windows
+- Merge origin/dev into fix/87-restart-wait
+- rustfmt
+- collect clients by exit, not pipe EOF
+- rustfmt
+- Merge remote-tracking branch 'origin/dev' into fix/restart-handover
+- Merge pull request #78 from lexoliu/fix/71-steer-submitted-r2
+- Merge pull request #72 from lexoliu/fix/68-close-in-flight-launch
+- Reap whole process groups when sessions and terminals end ([#64](https://github.com/lexoliu/acpsub/pull/64))
+- reject expectations over 30 minutes unless --long
+- terminate files with a newline
+- *(tools)* type the activity digest and require tool-call start times
+- Merge remote-tracking branch 'origin/dev' into fix/cli-optional-model-mode
+- *(tools)* drop intra-doc link to private PROGRESS_INTERVAL
+- wait on the real signal in progress tests
+- *(wait)* cover turn binding across a chained queued turn
+- Merge remote-tracking branch 'origin/fix/agents-without-modes' into HEAD
+- *(tools)* wait on the turn-end signal in the steer-turn test
+
 ### Added
 
 - *(cli)* `acpsub daemon` serves the tool set over a Unix socket
