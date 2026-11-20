@@ -40,7 +40,7 @@ dependencies = [
 [[package]]
 name = "aither-acp"
 version = "0.31.0"
-source = "git+https://github.com/May-Agent/aither?branch=feat%2Facp-v1v2-redesign#ac0cfd294c3917c03bbe5079fcfa0bcc6b3a2311"
+source = "git+https://github.com/May-Agent/aither?branch=main#530d6e8d4a9610ace1edb5e02ecd2f653424bd0c"
 dependencies = [
  "async-channel",
  "async-process",
