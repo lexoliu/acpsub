@@ -570,8 +570,10 @@ async fn handover_watch(
             let live = state.live.lock().expect("live poisoned");
             let reserved = state.reserved.lock().expect("reserved poisoned");
             for (id, sub) in live.iter() {
-                let in_flight = sub.rt.inner.lock().expect("inner poisoned").in_flight()
-                    || sub.rt.closing.get().is_some();
+                let in_flight = {
+                    let inner = sub.rt.inner.lock().expect("inner poisoned");
+                    inner.in_flight()
+                } || sub.rt.closing.get().is_some();
                 if in_flight {
                     owned.insert(id.clone());
                 } else {

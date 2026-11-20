@@ -407,7 +407,7 @@ async fn next_report(reports: &mut ReportRx) -> (Progress, Instant) {
     tokio::time::timeout(Duration::from_secs(5), reports.recv())
         .await
         .expect("a progress report within 5 s")
-        .expect("sink alive while the call waits")
+        .expect("sink closed: the wait call already returned")
 }
 
 /// Collect the reports still arriving until `waiting` resolves,

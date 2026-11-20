@@ -30,6 +30,7 @@ use crate::permission::PermissionHandler;
 use crate::registry::{Registry, ResumePlan};
 use crate::state::{
     AppState, Gate, Launch, Status, Subagent, begin_turn, launch, now, spawn_turn_task, start_turn,
+    transcript_append,
 };
 
 /// The JSON-RPC code a provider rate-limit rejection carries — inside
@@ -98,10 +99,10 @@ pub(crate) struct RateLimit {
 /// clause there is nothing to schedule on: `None`, so the caller fails
 /// the turn with the original error — the daemon never guesses a delay.
 pub(crate) fn parse(error: &ClientError) -> Option<RateLimit> {
-    let ClientError::JsonRpc(error) = error else {
+    let ClientError::Rejected(error) = error else {
         return None;
     };
-    if error.code.0 != RATE_LIMIT_CODE {
+    if error.code != i64::from(RATE_LIMIT_CODE) {
         return None;
     }
     let data = error.data.as_ref()?;
@@ -285,7 +286,7 @@ async fn record_park<E: Executor, P: PermissionHandler>(
     queued: Vec<String>,
 ) {
     let record = json!({"ts": now(), "park": prompt, "resume_at": resume_at.to_string()});
-    if let Err(error) = sub.rt.transcript.lock().await.append(&record).await {
+    if let Err(error) = transcript_append(&sub.rt, &record).await {
         warn!(%error, "transcript write failed");
     }
     let reason = reason.to_string();

@@ -11,11 +11,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use aither_acp::{PermissionOptionKind, RequestPermissionOutcome, RequestPermissionParams};
+use aither_acp::domain::PermissionOptionKind;
+use aither_acp::{Open, PermissionOutcome, domain::PermissionRequest as AgentRequest};
 use tokio::sync::oneshot;
 use tracing::debug;
 
 use crate::config::PermissionPolicy;
+use crate::handler;
 use crate::state::{PendingPermission, Status, SubRuntime};
 
 /// One permission request of an agent.
@@ -28,9 +30,9 @@ pub struct PermissionRequest {
     pub cwd: PathBuf,
     /// The session's permission policy.
     pub policy: PermissionPolicy,
-    /// The request as the agent sent it: the tool call and the options to
-    /// choose from.
-    pub params: RequestPermissionParams,
+    /// The request as the agent sent it: title, subject and the options
+    /// to choose from.
+    pub params: AgentRequest,
     rt: Arc<SubRuntime>,
 }
 
@@ -51,7 +53,7 @@ impl PermissionRequest {
         session_id: String,
         cwd: PathBuf,
         policy: PermissionPolicy,
-        params: RequestPermissionParams,
+        params: AgentRequest,
         rt: Arc<SubRuntime>,
     ) -> Self {
         Self {
@@ -70,16 +72,27 @@ impl PermissionRequest {
     /// # Panics
     ///
     /// Panics if a state mutex is poisoned.
-    pub async fn queue_for_permit(self) -> RequestPermissionOutcome {
+    pub async fn queue_for_permit(self) -> PermissionOutcome {
         let rt = self.rt;
         let (tx, rx) = oneshot::channel();
         let request_id = {
             let mut inner = rt.inner.lock().expect("inner poisoned");
             let id = format!("perm-{}", rt.next_perm.fetch_add(1, Ordering::Relaxed));
+            let tool_call_id = self
+                .params
+                .subject
+                .as_ref()
+                .and_then(|subject| match subject {
+                    Open::Known(aither_acp::domain::PermissionSubject::ToolCall(call)) => {
+                        Some(call.tool_call.tool_call_id.as_str().to_string())
+                    }
+                    _ => None,
+                });
             inner.pending.push(PendingPermission {
                 request_id: id.clone(),
-                tool_call: self.params.tool_call.clone(),
-                options: self.params.options,
+                title: self.params.title.clone(),
+                tool_call_id,
+                options: self.params.options.clone(),
                 answer: tx,
             });
             inner.status = Status::NeedsPermission;
@@ -87,7 +100,7 @@ impl PermissionRequest {
         };
         debug!(subagent = %rt.session_label(), %request_id, "permission request queued");
         rt.notify.notify_waiters();
-        let outcome = rx.await.unwrap_or(RequestPermissionOutcome::Cancelled);
+        let outcome = rx.await.unwrap_or_else(|_| handler::cancelled());
         {
             let mut inner = rt.inner.lock().expect("inner poisoned");
             if inner.pending.is_empty() && matches!(inner.status, Status::NeedsPermission) {
@@ -101,13 +114,10 @@ impl PermissionRequest {
 
 /// Answers permission requests for a host.
 pub trait PermissionHandler: Send + Sync + 'static {
-    /// The outcome for `request`: [`RequestPermissionOutcome::Selected`]
+    /// The outcome for `request`: [`PermissionOutcome::Selected`]
     /// with one of the request's option ids, or
-    /// [`RequestPermissionOutcome::Cancelled`].
-    fn decide(
-        &self,
-        request: PermissionRequest,
-    ) -> impl Future<Output = RequestPermissionOutcome> + Send;
+    /// [`PermissionOutcome::Cancelled`].
+    fn decide(&self, request: PermissionRequest) -> impl Future<Output = PermissionOutcome> + Send;
 }
 
 /// The default [`PermissionHandler`]: answers from the session's
@@ -117,7 +127,7 @@ pub trait PermissionHandler: Send + Sync + 'static {
 pub struct PolicyPermissions;
 
 impl PermissionHandler for PolicyPermissions {
-    async fn decide(&self, request: PermissionRequest) -> RequestPermissionOutcome {
+    async fn decide(&self, request: PermissionRequest) -> PermissionOutcome {
         let kinds = match request.policy {
             PermissionPolicy::Allow => [
                 PermissionOptionKind::AllowOnce,
@@ -133,11 +143,9 @@ impl PermissionHandler for PolicyPermissions {
             .params
             .options
             .iter()
-            .find(|option| kinds.contains(&option.kind))
-            .map_or(RequestPermissionOutcome::Cancelled, |option| {
-                RequestPermissionOutcome::Selected {
-                    option_id: option.option_id.clone(),
-                }
+            .find(|option| matches!(&option.kind, Open::Known(kind) if kinds.contains(kind)))
+            .map_or_else(handler::cancelled, |option| {
+                handler::selected(option.option_id.as_str())
             })
     }
 }

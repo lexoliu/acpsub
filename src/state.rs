@@ -9,13 +9,15 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use aither_acp::{
-    AcpClient, ClientError, ConfigOption, ConfigOptionValue, ConfigSelectOptions, ContentBlock,
-    Implementation, InitializeResult, PlanEntry, PromptParams, PromptResult,
-    RequestPermissionOutcome, SessionLoadParams, SessionModeState, SessionNewParams,
-    SessionSetConfigOptionParams, SessionSetModeParams, SessionUpdate, StopReason, TextContent,
-    ToolCall, ToolCallLocation, ToolCallStatus, ToolKind,
+use aither_acp::client::{Client, ClientError, ClientSession, TurnOutcome};
+use aither_acp::domain::ids::{ConfigId, ConfigValueId};
+use aither_acp::domain::tool::{Location, ToolKind};
+use aither_acp::domain::{
+    ConfigKind, ConfigOption, ConfigValueBoolean, ConfigValueById, Implementation, Open, PlanEntry,
+    SelectConfig, SelectOptions, StopReason, ToolCallStatus,
 };
+use aither_acp::wire::v1;
+use aither_acp::{PermissionOutcome, SessionUpdate};
 use serde::Serialize;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
@@ -27,7 +29,7 @@ use crate::config::{
 };
 use crate::error::{Error, Result};
 use crate::executor::{AgentProcess, Executor, HostExecutor, ProcessHandle, SpawnSpec};
-use crate::handler::{SubagentHandler, note_tool_call, note_tool_call_update};
+use crate::handler;
 use crate::permission::{PermissionHandler, PolicyPermissions};
 use crate::registry::{LastTurn, Registry, RegistryEntry, persist};
 use crate::services::Services;
@@ -534,7 +536,7 @@ pub struct ToolCallSummary {
     pub status: Option<ToolCallStatus>,
     /// Affected locations.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub locations: Vec<ToolCallLocation>,
+    pub locations: Vec<Location>,
     /// When the call first appeared in a `session/update`. Always set: a
     /// summary exists only because an update carrying the call's id was
     /// seen.
@@ -545,10 +547,14 @@ pub struct ToolCallSummary {
     pub ended_at: Option<jiff::Timestamp>,
 }
 
-/// Whether a tool call status ends the call — `completed` or `failed`.
-/// `pending`/`in_progress` (or no status) leave it open.
+/// Whether a tool call status ends the call — `completed`, `failed` or
+/// `cancelled`. `pending`/`in_progress`/`paused` (or no status) leave it
+/// open.
 pub(crate) const fn terminal_status(status: ToolCallStatus) -> bool {
-    matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed)
+    matches!(
+        status,
+        ToolCallStatus::Completed | ToolCallStatus::Failed | ToolCallStatus::Cancelled
+    )
 }
 
 /// One prompt turn's accumulated state.
@@ -636,12 +642,14 @@ pub enum SteerOutcome {
 pub struct PendingPermission {
     /// Minted request id (`perm-N`), passed to the `permit` tool.
     pub request_id: String,
-    /// The tool call the agent wants to run.
-    pub tool_call: ToolCall,
+    /// The request's title — what the agent wants to run.
+    pub title: String,
+    /// The tool call id the request is about, when it names one.
+    pub tool_call_id: Option<String>,
     /// Options the agent offered.
-    pub options: Vec<aither_acp::PermissionOption>,
+    pub options: Vec<aither_acp::domain::PermissionOption>,
     /// Channel answering the agent's request.
-    pub answer: oneshot::Sender<RequestPermissionOutcome>,
+    pub answer: oneshot::Sender<PermissionOutcome>,
 }
 
 /// Mutable subagent state shared between the tools and the handler.
@@ -653,8 +661,9 @@ pub struct Inner {
     pub session_id: String,
     /// `agentInfo` from `initialize`.
     pub agent_info: Option<Implementation>,
-    /// Modes reported by `session/new`/`session/load`.
-    pub modes: Option<SessionModeState>,
+    /// The session's current mode value id (mode-category option's
+    /// current value or a `current_mode_update`).
+    pub current_mode: Option<ConfigValueId>,
     /// Config options reported by the session calls.
     pub config_options: Vec<ConfigOption>,
     /// Turns from a resumed session's earlier life (registry `turns`); in-memory
@@ -695,6 +704,22 @@ pub struct Inner {
     /// when `current` was not opened by a `send`/`spawn`/`adopt` prompt but
     /// synthesized for untracked `session/update` traffic.
     pub steer_owner: Option<u64>,
+    /// The turn whose end response arrived but whose settle has not run:
+    /// untracked traffic that lands after it belongs to a next turn, so
+    /// the materializers hold it until the settle frees `current` rather
+    /// than attributing to the dying one.
+    pub ending: Option<u64>,
+    /// The highest turn whose end the streams already reported: the
+    /// session broadcast's `TurnEnded` and the tee's prompt-response
+    /// boundary both set it. Untracked traffic that precedes it still
+    /// belongs to that turn — a v1-synthesized state event reaches the
+    /// materializers behind its own end — while traffic after it can
+    /// materialize a steered prompt's own turn.
+    pub turn_ended: Option<u64>,
+    /// A materialized steer turn staged while the turn it follows still
+    /// occupies `current`: untracked post-end traffic lands here until
+    /// the settle promotes it.
+    pub next_turn: Option<Turn>,
     /// The turn whose end is settled here but not yet recorded in the
     /// registry. Until `finish_turn` records it, every client-facing
     /// report treats the turn as still in flight: `wait` and `wait_any`
@@ -787,6 +812,9 @@ pub struct SubRuntime {
     pub steer: SteerSemantics,
     /// The JSONL transcript file.
     pub transcript: tokio::sync::Mutex<TranscriptWriter>,
+    /// `session/update` payloads teed off the transport for the
+    /// transcript.
+    pub(crate) tee: crate::transport::UpdateTee,
     /// Live terminals by id.
     pub terminals: Terminals,
     /// Last `STDERR_TAIL_LINES` lines of agent stderr.
@@ -907,7 +935,9 @@ pub struct Subagent {
     /// The transcript file path.
     pub transcript_path: PathBuf,
     /// The ACP client handle.
-    pub client: AcpClient<SubagentHandler>,
+    pub client: Client,
+    /// The ACP session handle.
+    pub session: ClientSession,
     /// Connection driver task; also marks the subagent `exited` on disconnect.
     /// Taken by `close`/`forget` to await shutdown.
     pub conn: Mutex<Option<JoinHandle<()>>>,
@@ -955,19 +985,27 @@ fn replay_transcript(text: &str) -> Vec<Turn> {
             turn.started_at = ts;
         }
         if let Some(update) = record.get("update")
-            && let Ok(update) = serde_json::from_value::<SessionUpdate>(update.clone())
+            && let Some(update) = parse_update(update)
         {
             match update {
                 SessionUpdate::AgentMessageChunk(chunk) => {
-                    if let ContentBlock::Text(text) = chunk.content {
-                        turn.reply.push_str(&text.text);
+                    if let Some(text) = chunk.content.as_text() {
+                        turn.reply.push_str(text);
                     }
                 }
-                SessionUpdate::ToolCall(call) => note_tool_call(turn, call),
-                SessionUpdate::ToolCallUpdate(update) => note_tool_call_update(turn, update),
-                SessionUpdate::Plan(plan) => turn.plan = plan.entries,
+                SessionUpdate::ToolCallUpdate(call) => {
+                    note_call_update(turn, &call);
+                }
+                SessionUpdate::ToolCallContentChunk(chunk) => {
+                    turn.latest_tool_call = Some(chunk.tool_call_id.as_str().to_string());
+                }
+                SessionUpdate::PlanUpdate(plan) => {
+                    if let Open::Known(aither_acp::domain::Plan::Items(items)) = plan.plan {
+                        turn.plan = items.entries;
+                    }
+                }
                 SessionUpdate::CurrentModeUpdate(mode) => {
-                    turn.mode = Some(mode.current_mode_id);
+                    turn.mode = Some(mode.current_mode_id.as_str().to_string());
                 }
                 _ => {}
             }
@@ -987,6 +1025,189 @@ fn replay_transcript(text: &str) -> Vec<Turn> {
         }
     }
     turns.into_values().collect()
+}
+
+/// Parse a transcript `update` payload: the canonical domain shape (v2
+/// wire, or v1 transcripts written before the dual-stack migration) into
+/// one domain `SessionUpdate`, via the codec for v1-shaped records.
+pub(crate) fn parse_update(value: &serde_json::Value) -> Option<SessionUpdate> {
+    // The domain enum's catch-all parses any tagged update, so a v1 shape
+    // shows up as `Unknown` — re-parse those through the v1 codec.
+    match serde_json::from_value::<SessionUpdate>(value.clone()) {
+        Ok(SessionUpdate::Unknown(..)) | Err(_) => {
+            let update = serde_json::from_value::<v1::SessionUpdate>(value.clone()).ok()?;
+            Some(aither_acp::wire::V1Codec::new().update_from_v1(update))
+        }
+        Ok(update) => Some(update),
+    }
+}
+
+/// Drain the transcript tee and append `update` records for every queued
+/// payload, in wire order. Caller holds `writer`.
+async fn drain_teed(rt: &SubRuntime, writer: &mut TranscriptWriter) {
+    loop {
+        let item = rt.tee.queue.lock().expect("tee queue poisoned").pop_front();
+        let Some(item) = item else {
+            break;
+        };
+        let turn_n = {
+            let mut inner = rt.inner.lock().expect("inner poisoned");
+            if matches!(item, crate::transport::TeeItem::PromptEnd) {
+                // The ended turn's settle still holds `current`: the
+                // updates queued behind the boundary belong to a next
+                // turn, so leave them teed — the post-settle flush drains
+                // them into the materialized turn. Once the settle ran
+                // (`current` is gone or a newer turn), the marker is
+                // spent.
+                let settling = inner
+                    .current
+                    .as_ref()
+                    .is_some_and(|turn| inner.ending == Some(turn.n));
+                if settling {
+                    rt.tee
+                        .queue
+                        .lock()
+                        .expect("tee queue poisoned")
+                        .push_front(crate::transport::TeeItem::PromptEnd);
+                    return;
+                }
+                // The boundary is spent: every teed update after it
+                // belongs to a next turn.
+                inner.turn_ended = inner.turns.last().map(|turn| turn.n);
+                continue;
+            }
+            let crate::transport::TeeItem::Update(update) = item else {
+                continue;
+            };
+            // Untracked traffic means the agent is running a turn we did
+            // not open: a steered prompt that landed after its target
+            // ended. Only teed traffic past the turn's end marker counts
+            // — updates ahead of it belong to the settled turn — and only
+            // turn traffic at that: a mode, config, info or usage update
+            // arrives outside turns too. While the settle holds
+            // `current` the steered turn stages into `next_turn`.
+            let post_end = inner
+                .current
+                .as_ref()
+                .is_some_and(|turn| inner.turn_ended == Some(turn.n))
+                || (inner.current.is_none()
+                    && inner.turn_ended.is_some()
+                    && inner.turn_ended == inner.turns.last().map(|turn| turn.n));
+            if post_end
+                && parse_update(&update).is_some_and(|update| tee_activity(&update))
+                && let Some(owner) = oldest_steer(&inner)
+            {
+                let staged = Turn {
+                    n: next_turn_number(&inner) + u64::from(inner.current.is_some()),
+                    started_at: Some(jiff::Timestamp::now()),
+                    ..Turn::default()
+                };
+                inner.pending_turn_start = None;
+                inner.steer_owner = Some(owner);
+                if inner.current.is_none() {
+                    inner.current = Some(staged);
+                    inner.status = Status::Running;
+                } else if inner.next_turn.is_none() {
+                    inner.next_turn = Some(staged);
+                }
+            }
+            (
+                inner
+                    .next_turn
+                    .as_ref()
+                    .or(inner.current.as_ref())
+                    .map_or(0, |turn| turn.n),
+                update,
+            )
+        };
+        let record = serde_json::json!({
+            "ts": now(),
+            "turn": turn_n.0,
+            "update": turn_n.1,
+        });
+        if let Err(error) = writer.append(&record).await {
+            warn!(subagent = %rt.session_label(), %error, "transcript append failed");
+        }
+    }
+}
+
+/// Whether a parsed `session/update` signals agent turn activity — what
+/// the steer-turn materialization triggers on. Session-state reports
+/// (mode, config, info, usage, commands, compaction, replay, notice)
+/// arrive outside turns too and do not count.
+const fn tee_activity(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::UserMessageChunk(_)
+            | SessionUpdate::AgentMessageChunk(_)
+            | SessionUpdate::AgentThoughtChunk(_)
+            | SessionUpdate::UserMessage(_)
+            | SessionUpdate::AgentMessage(_)
+            | SessionUpdate::AgentThought(_)
+            | SessionUpdate::ToolCallUpdate(_)
+            | SessionUpdate::ToolCallContentChunk(_)
+            | SessionUpdate::TerminalUpdate(_)
+            | SessionUpdate::TerminalOutputChunk(_)
+            | SessionUpdate::PlanUpdate(_)
+            | SessionUpdate::SubagentUpdate(_)
+    )
+}
+
+/// Flush queued teed updates into the transcript.
+pub(crate) async fn flush_teed(rt: &SubRuntime) {
+    let mut writer = rt.transcript.lock().await;
+    drain_teed(rt, &mut writer).await;
+}
+
+/// Append `record` to `rt`'s transcript after draining the update tee:
+/// teed `session/update` payloads always land ahead of the records a
+/// later wire message produces (a prompt response's `stop_reason`, say).
+pub(crate) async fn transcript_append(
+    rt: &SubRuntime,
+    record: &serde_json::Value,
+) -> std::io::Result<()> {
+    let mut writer = rt.transcript.lock().await;
+    drain_teed(rt, &mut writer).await;
+    writer.append(record).await
+}
+
+/// Fold a domain `tool_call_update` into the turn's summary (used by
+/// [`replay_transcript`]; live traffic arrives as `SessionEvent::ToolCall`
+/// snapshots through [`handler::note_tool_call`]).
+fn note_call_update(turn: &mut Turn, update: &aither_acp::domain::ToolCallUpdate) {
+    let seen = jiff::Timestamp::now();
+    turn.latest_tool_call = Some(update.tool_call_id.as_str().to_string());
+    let entry = turn
+        .tool_calls
+        .entry(update.tool_call_id.as_str().to_string())
+        .or_insert_with(|| ToolCallSummary {
+            id: update.tool_call_id.as_str().to_string(),
+            title: String::new(),
+            kind: None,
+            status: None,
+            locations: Vec::new(),
+            started_at: seen,
+            ended_at: None,
+        });
+    if let aither_acp::domain::Patch::Set(status) = &update.status
+        && let Some(status) = status.as_known()
+    {
+        entry.status = Some(*status);
+        if terminal_status(*status) && entry.ended_at.is_none() {
+            entry.ended_at = Some(seen);
+        }
+    }
+    if let aither_acp::domain::Patch::Set(title) = &update.title {
+        entry.title.clone_from(title);
+    }
+    if let aither_acp::domain::Patch::Set(kind) = &update.kind
+        && let Some(kind) = kind.as_known()
+    {
+        entry.kind = Some(*kind);
+    }
+    if let aither_acp::domain::Patch::Set(locations) = &update.locations {
+        entry.locations.clone_from(locations);
+    }
 }
 
 /// Reject an empty session id.
@@ -1109,7 +1330,7 @@ pub(crate) fn new_runtime(session_id: String, steer: SteerSemantics) -> Arc<SubR
             status: Status::Idle,
             session_id,
             agent_info: None,
-            modes: None,
+            current_mode: None,
             config_options: Vec::new(),
             turn_offset: 0,
             turns: Vec::new(),
@@ -1120,12 +1341,16 @@ pub(crate) fn new_runtime(session_id: String, steer: SteerSemantics) -> Arc<SubR
             steer_pending: VecDeque::new(),
             steer_folded: VecDeque::new(),
             steer_owner: None,
+            ending: None,
+            turn_ended: None,
+            next_turn: None,
             recording: None,
         }),
         notify: Notify::new(),
         prompt_send: Arc::new(tokio::sync::Mutex::new(())),
         steer,
         transcript: tokio::sync::Mutex::new(TranscriptWriter::deferred()),
+        tee: crate::transport::UpdateTee::new(),
         terminals: Terminals::new(HashMap::new()),
         stderr_tail: Mutex::new(VecDeque::new()),
         next_perm: AtomicU64::new(1),
@@ -1157,12 +1382,12 @@ async fn launch_inner<E: Executor, P: PermissionHandler>(
         connect(&state.services, &agent_cfg, &cwd, permission, rt.clone()).await?;
 
     // On any handshake failure, kill the child before returning the error.
-    let accepted = match handshake(state, &client, &rt, args).await {
-        Ok(accepted) => accepted,
+    let (session, accepted) = match handshake(state, &client, &rt, args).await {
+        Ok(pair) => pair,
         Err(error) => {
             rt.closing.set(Closing::Ending);
             rt.kill_process_tree();
-            client.close();
+            client.close().await;
             let _ = conn.await;
             return Err(error);
         }
@@ -1176,7 +1401,7 @@ async fn launch_inner<E: Executor, P: PermissionHandler>(
     if let Err(source) = rt.transcript.lock().await.bind(&transcript_path).await {
         rt.closing.set(Closing::Ending);
         rt.kill_process_tree();
-        client.close();
+        client.close().await;
         let _ = conn.await;
         return Err(Error::io(
             format!("cannot open {}", transcript_path.display()),
@@ -1216,10 +1441,14 @@ async fn launch_inner<E: Executor, P: PermissionHandler>(
         mode: accepted.mode,
         transcript_path,
         client,
+        session: session.clone(),
         conn: Mutex::new(Some(conn)),
         stderr_pump: Mutex::new(Some(stderr_pump)),
-        rt,
+        rt: rt.clone(),
     });
+    // The event driver feeds the session's updates into the turn state;
+    // it ends when the connection or session does.
+    tokio::spawn(handler::drive_events(session, rt));
     go_live(state, &sub).await?;
     tokio::spawn(crate::watchdog::run(state.clone(), sub.clone()));
     if let Some(session_id) = &args.load {
@@ -1260,7 +1489,7 @@ async fn go_live<E: Executor, P: PermissionHandler>(
     // shadow the first; refuse and kill this process.
     sub.rt.closing.set(Closing::Ending);
     sub.rt.kill_process_tree();
-    sub.client.clone().close();
+    sub.client.close().await;
     let conn = sub.conn.lock().expect("conn poisoned").take();
     if let Some(conn) = conn {
         let _ = conn.await;
@@ -1359,7 +1588,7 @@ pub(crate) async fn connect<E: Executor, P: PermissionHandler>(
     cwd: &std::path::Path,
     permission: PermissionPolicy,
     rt: Arc<SubRuntime>,
-) -> Result<(AcpClient<SubagentHandler>, JoinHandle<()>, JoinHandle<()>)> {
+) -> Result<(Client, JoinHandle<()>, JoinHandle<()>)> {
     let AgentProcess {
         stdin,
         stdout,
@@ -1384,9 +1613,11 @@ pub(crate) async fn connect<E: Executor, P: PermissionHandler>(
         rt.agent_process.set(process.clone()).is_ok(),
         "a runtime connects one agent process"
     );
-    let transport = ProcessTransport::new(stdout, stdin, process);
-    // The handler is one concrete type; the host's services answer it over
-    // a channel, for as long as the handler lives.
+    // The transcript tee: `session/update` payloads queue for the
+    // flusher ahead of the client's own demux.
+    let transport = ProcessTransport::new(stdout, stdin, process, rt.tee.clone());
+    // The hooks are one concrete type; the host's services answer them
+    // over a channel, for as long as the connection lives.
     let (calls, requests) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(crate::services::serve(
         services.clone(),
@@ -1394,18 +1625,43 @@ pub(crate) async fn connect<E: Executor, P: PermissionHandler>(
         rt.clone(),
         requests,
     ));
-    let handler = SubagentHandler::new(
-        rt.clone(),
-        cwd.to_path_buf(),
-        permission,
-        agent_cfg.file_access,
-        calls,
-    );
-    let (client, connection) = AcpClient::connect(transport, handler);
+    let builder = Client::builder(Implementation::new("acpsub", env!("CARGO_PKG_VERSION")))
+        .permissions(handler::SubPermissions::new(
+            rt.clone(),
+            cwd.to_path_buf(),
+            permission,
+            calls.clone(),
+        ))
+        .v1_terminal(handler::SubTerminals::new(rt.clone(), calls));
+    let builder = if agent_cfg.file_access == crate::config::FileAccess::Off {
+        builder
+    } else {
+        builder.v1_fs(handler::SubFs::new(
+            cwd.to_path_buf(),
+            agent_cfg.file_access,
+        ))
+    };
+    let (client, connection) = builder
+        .connect(transport)
+        .await
+        .map_err(|source| Error::Agent {
+            agent: agent_cfg.command.clone(),
+            source,
+        })?;
     let conn_rt = rt.clone();
     let conn = tokio::spawn(async move {
         connection.await;
         on_disconnect(&conn_rt);
+    });
+    // The flusher ends itself when the runtime is dropped (its `inner`
+    // lock fails only on poison) or the connection ends the tee's work.
+    let tee_rt = rt.clone();
+    let tee = rt.tee.clone();
+    tokio::spawn(async move {
+        loop {
+            tee.notify.notified().await;
+            flush_teed(&tee_rt).await;
+        }
     });
     let stderr_pump = tokio::spawn(pump_stderr(stderr, rt));
     Ok((client, conn, stderr_pump))
@@ -1428,55 +1684,68 @@ struct Accepted {
 }
 
 /// `session/new` or `session/load` — the latter only when the agent
-/// advertised `loadSession`. Returns the session id and the modes and
-/// config options the agent advertised.
+/// advertised `loadSession`. Returns the session handle.
 async fn open_session(
-    client: &AcpClient<SubagentHandler>,
-    init: &InitializeResult,
+    client: &Client,
     args: &Launch,
     agent_error: &(impl Fn(ClientError) -> Error + Sync),
-) -> Result<(String, Option<SessionModeState>, Option<Vec<ConfigOption>>)> {
+) -> Result<ClientSession> {
     if let Some(load) = &args.load {
-        if !init.agent_capabilities.load_session {
+        if !load_session_advertised(client) {
             return Err(Error::LoadUnsupported(args.agent.clone()));
         }
-        let result = client
-            .load_session(SessionLoadParams::new(load.clone(), args.cwd.clone()))
+        client
+            .resume_session(
+                aither_acp::SessionId::from_string(load.clone()),
+                args.cwd.clone(),
+            )
+            .replay_from_start()
+            .open()
             .await
-            .map_err(agent_error)?;
-        Ok((load.clone(), result.modes, result.config_options))
+            .map_err(agent_error)
     } else {
-        let result = client
-            .new_session(SessionNewParams::new(args.cwd.clone()))
+        client
+            .new_session(args.cwd.clone())
+            .open()
             .await
-            .map_err(agent_error)?;
-        Ok((result.session_id, result.modes, result.config_options))
+            .map_err(agent_error)
     }
 }
 
-/// `initialize`, `session/new` or `session/load`, `set_mode` when a mode
-/// was given, and the `set_config_option` calls; upserts the registry
-/// entry. Returns the session id and the model/mode the agent accepted.
+/// Whether the agent advertised `loadSession` at `initialize` — a v1
+/// capability the codec folds into `capabilities.session.extra`.
+fn load_session_advertised(client: &Client) -> bool {
+    client
+        .agent_capabilities()
+        .session
+        .as_ref()
+        .and_then(|caps| caps.extra.get("loadSession"))
+        .is_some_and(|v| v.is_object() || v.as_bool().unwrap_or(false))
+}
+
+/// `session/new` or `session/load`, `set_mode` when a mode was given, and
+/// the `set_config_option` calls; upserts the registry entry. Returns the
+/// session handle and the model/mode the agent accepted.
 async fn handshake<E: Executor, P: PermissionHandler>(
     state: &Arc<AppState<E, P>>,
-    client: &AcpClient<SubagentHandler>,
+    client: &Client,
     rt: &SubRuntime,
     args: &Launch,
-) -> Result<Accepted> {
+) -> Result<(ClientSession, Accepted)> {
     let agent_error = |source: ClientError| Error::Agent {
         agent: args.agent.clone(),
         source,
     };
-    let init = client.initialize().await.map_err(agent_error)?;
-    let (session_id, modes, config_options) =
-        open_session(client, &init, args, &agent_error).await?;
+    let session = open_session(client, args, &agent_error).await?;
+    let session_id = session.id().as_str().to_string();
+    // The setup result's options already seeded the session's reducer.
+    let config_options = session.state().config_options;
     // Check every requested value against what the agent advertised before
     // applying anything: an unverifiable or unknown value fails the launch
     // and the process is closed by the caller, so no half-configured
     // session is registered.
-    let config_options = config_options.unwrap_or_default();
-    let (modes, options) = check_advertised(&args.agent, args, modes, &config_options)?;
-    let current_mode = modes.as_ref().map(|modes| modes.current_mode_id.clone());
+    let options = check_advertised(&args.agent, args, &config_options)?;
+    let prior_mode = session.state().current_mode;
     let turn_offset = state
         .registry
         .lock()
@@ -1486,67 +1755,78 @@ async fn handshake<E: Executor, P: PermissionHandler>(
     {
         let mut inner = rt.inner.lock().expect("inner poisoned");
         inner.session_id.clone_from(&session_id);
-        inner.agent_info = init.agent_info;
-        inner.modes = modes;
-        inner.config_options = config_options;
+        inner.agent_info = client.agent_info().cloned();
+        inner.current_mode.clone_from(&prior_mode);
+        inner.config_options.clone_from(&config_options);
         inner.turn_offset = turn_offset;
     }
     // `set_mode` runs only for a requested mode — `check_advertised`
     // already paired it with an advertised mode list.
     if let Some(mode) = args.mode.as_deref() {
-        client
-            .set_mode(SessionSetModeParams::new(
-                session_id.clone(),
-                mode.to_string(),
-            ))
+        session
+            .set_mode(ConfigValueId::from_string(mode.to_string()))
             .await
             .map_err(agent_error)?;
         note_set_mode(
             &mut rt.inner.lock().expect("inner poisoned"),
-            current_mode.as_deref(),
+            prior_mode.as_ref(),
             mode,
         );
     }
     let mut accepted_model = options.get("model").map(|value| match value {
-        ConfigValue::Select(value) => serde_json::Value::from(value.clone()),
-        ConfigValue::Toggle(flag) => serde_json::Value::from(*flag),
+        crate::config::ConfigValue::Select(value) => serde_json::Value::from(value.clone()),
+        crate::config::ConfigValue::Toggle(flag) => serde_json::Value::from(*flag),
     });
     for (id, value) in options {
         let value = match value {
-            ConfigValue::Select(value) => aither_acp::SessionConfigValue::from(value),
-            ConfigValue::Toggle(value) => aither_acp::SessionConfigValue::from(value),
+            crate::config::ConfigValue::Select(value) => {
+                aither_acp::domain::ConfigValue::Id(ConfigValueById {
+                    value: ConfigValueId::from_string(value),
+                })
+            }
+            crate::config::ConfigValue::Toggle(value) => {
+                aither_acp::domain::ConfigValue::Boolean(ConfigValueBoolean { value })
+            }
         };
-        let updated = client
-            .set_config_option(SessionSetConfigOptionParams::new(
-                session_id.clone(),
-                id.clone(),
-                value,
-            ))
+        session
+            .set_config(ConfigId::from_string(id.clone()), value)
             .await
             .map_err(agent_error)?;
-        // The option list the agent returns is what it accepted; the
+        let updated = session.state().config_options;
+        // The option list the agent reports is what it accepted; the
         // reported model is the `model` option's value after that call.
         if id == "model"
-            && let Some(current) = updated
+            && let Some(value) = updated
                 .iter()
-                .find(|option| option.id == "model")
-                .and_then(|option| option.current_value.as_ref())
-            && let Ok(value) = serde_json::to_value(current)
+                .find(|option| option.config_id.as_str() == "model")
+                .and_then(|option| match &option.kind {
+                    ConfigKind::Select(select) => {
+                        Some(serde_json::Value::from(select.current_value.as_str()))
+                    }
+                    ConfigKind::Boolean(flag) => Some(serde_json::Value::from(flag.current_value)),
+                    ConfigKind::Custom(..) | ConfigKind::Unknown(..) => None,
+                })
         {
             accepted_model = Some(value);
         }
         rt.inner.lock().expect("inner poisoned").config_options = updated;
     }
-    let accepted_mode = confirmed_mode(&mut rt.inner.lock().expect("inner poisoned"));
+    let accepted_mode = {
+        let mut inner = rt.inner.lock().expect("inner poisoned");
+        confirmed_mode(&mut inner, &session)
+    };
     // A registered session keeps its `created` timestamp and turn count;
     // a new one gets a fresh entry.
     register_session(state, &session_id, args).await?;
     debug!(%session_id, agent = %args.agent, "subagent session established");
-    Ok(Accepted {
-        session_id,
-        model: accepted_model,
-        mode: accepted_mode,
-    })
+    Ok((
+        session,
+        Accepted {
+            session_id,
+            model: accepted_model,
+            mode: accepted_mode,
+        },
+    ))
 }
 
 /// Upsert `args`' session in the registry after a handshake: an existing
@@ -1595,27 +1875,22 @@ async fn register_session<E: Executor, P: PermissionHandler>(
 /// Check `args`' mode, model and config values against what the agent
 /// advertised in `session/new`/`session/load`, before anything is applied.
 /// Each of `mode`/`model` pairs with its advertisement: required when the
-/// agent advertises the surface (a mode list / a `model` config option),
-/// rejected when passed to an agent that advertises none, and otherwise
-/// checked the same as before — a mode the agent does not list, a config
-/// id it does not advertise, or a select value outside the advertised set
-/// fails the launch.
+/// agent advertises the surface (a mode-category option / a `model`
+/// config option), rejected when passed to an agent that advertises
+/// none, and otherwise checked the same as before — a mode the agent
+/// does not list, a config id it does not advertise, or a select value
+/// outside the advertised set fails the launch.
 ///
-/// Returns the advertised mode state (when there is one) and the merged
-/// `model` + `config` option map to apply.
+/// Returns the merged `model` + `config` option map to apply.
 fn check_advertised(
     agent: &str,
     args: &Launch,
-    modes: Option<SessionModeState>,
     config_options: &[ConfigOption],
-) -> Result<(Option<SessionModeState>, BTreeMap<String, ConfigValue>)> {
-    let modes = match (modes, args.mode.as_deref()) {
-        (Some(modes), Some(mode)) => {
-            let valid: Vec<String> = modes
-                .available_modes
-                .iter()
-                .map(|mode| mode.id.clone())
-                .collect();
+) -> Result<BTreeMap<String, crate::config::ConfigValue>> {
+    let mode_option = config_options.iter().find(|o| o.is_mode());
+    match (mode_option, args.mode.as_deref()) {
+        (Some(option), Some(mode)) => {
+            let valid = select_values(option);
             if !valid.iter().any(|id| id == mode) {
                 return Err(Error::UnknownMode {
                     agent: agent.to_string(),
@@ -1623,16 +1898,11 @@ fn check_advertised(
                     valid,
                 });
             }
-            Some(modes)
         }
-        (Some(modes), None) => {
+        (Some(option), None) => {
             return Err(Error::ModeRequired {
                 agent: agent.to_string(),
-                valid: modes
-                    .available_modes
-                    .iter()
-                    .map(|mode| mode.id.clone())
-                    .collect(),
+                valid: select_values(option),
             });
         }
         (None, Some(mode)) => {
@@ -1641,16 +1911,22 @@ fn check_advertised(
                 value: mode.to_string(),
             });
         }
-        (None, None) => None,
-    };
+        (None, None) => {}
+    }
     // `model` pairs with the `model` config option the same way: required
     // when the agent advertises one, rejected when given to an agent that
     // advertises none. A `config`-supplied `model` key counts as given.
     let mut options = args.config.clone();
     if let Some(model) = args.model.as_deref() {
-        options.insert("model".to_string(), ConfigValue::Select(model.to_string()));
+        options.insert(
+            "model".to_string(),
+            crate::config::ConfigValue::Select(model.to_string()),
+        );
     }
-    if let Some(option) = config_options.iter().find(|option| option.id == "model") {
+    if let Some(option) = config_options
+        .iter()
+        .find(|option| option.config_id.as_str() == "model")
+    {
         if !options.contains_key("model") {
             return Err(Error::ModelRequired {
                 agent: agent.to_string(),
@@ -1666,64 +1942,55 @@ fn check_advertised(
     for (id, value) in &options {
         check_config_option(agent, config_options, id, value)?;
     }
-    Ok((modes, options))
+    Ok(options)
 }
 
 /// Record the mode `set_mode` left in effect: a `current_mode_update`
 /// received while the call was in flight already reported it; with none,
 /// the agent's acceptance of the request stands.
-fn note_set_mode(inner: &mut Inner, prior: Option<&str>, requested: &str) {
-    let modes = inner.modes.as_mut().expect("modes recorded");
-    if Some(modes.current_mode_id.as_str()) == prior {
-        requested.clone_into(&mut modes.current_mode_id);
+fn note_set_mode(inner: &mut Inner, prior: Option<&ConfigValueId>, requested: &str) {
+    if inner.current_mode.as_ref() == prior {
+        inner.current_mode = Some(ConfigValueId::from_string(requested.to_string()));
     }
 }
 
-/// The agent-confirmed mode after every set call: a `mode` config option's
-/// current value, when the agent exposes one, is its own post-set report —
-/// it can differ from the request when `set_mode` succeeded but kept
-/// another mode. Without such an option the modes state's current id —
-/// a `current_mode_update` when one arrived, else the accepted request —
-/// is the report.
-fn confirmed_mode(inner: &mut Inner) -> Option<String> {
-    let confirmed = inner
-        .config_options
-        .iter()
-        .find(|option| option.id == "mode" || option.category.as_deref() == Some("mode"))
-        .and_then(|option| option.current_value.as_ref())
-        .and_then(|value| match value {
-            ConfigOptionValue::Selected(id) => Some(id.clone()),
-            ConfigOptionValue::Toggle(_) => None,
-        });
-    match inner.modes.as_mut() {
-        Some(modes) => {
-            if let Some(confirmed) = confirmed {
-                modes.current_mode_id = confirmed;
-            }
-            Some(modes.current_mode_id.clone())
-        }
-        // An agent with no mode list can still report a `mode` config
-        // option's current value; otherwise there is no mode to report.
-        None => confirmed,
+/// The agent-confirmed mode after every set call: the session state's
+/// `current_mode` — a `current_mode_update`/`mode`-category option's
+/// post-set value when one arrived — else `inner`'s recorded acceptance.
+/// A `set_mode` the agent silently ignored keeps the confirmed value, and
+/// `inner.current_mode` is corrected to it — it is what the `agents` view
+/// reports between updates.
+fn confirmed_mode(inner: &mut Inner, session: &ClientSession) -> Option<String> {
+    if let Some(confirmed) = session.state().current_mode {
+        inner.current_mode = Some(confirmed);
     }
+    inner
+        .current_mode
+        .as_ref()
+        .map(|id| id.as_str().to_string())
 }
 
 /// The values a select config option advertises, flat or grouped; empty for
-/// an option that lists none.
-fn select_values(option: &ConfigOption) -> Vec<String> {
-    option
-        .options
-        .as_ref()
-        .map(|options| match options {
-            ConfigSelectOptions::Flat(flat) => {
-                flat.iter().map(|option| option.value.clone()).collect()
-            }
-            ConfigSelectOptions::Grouped(groups) => groups
+/// an option that lists none or is not a select.
+pub(crate) fn select_values(option: &ConfigOption) -> Vec<String> {
+    match &option.kind {
+        ConfigKind::Select(SelectConfig { options, .. }) => match options {
+            SelectOptions::Ungrouped(flat) => flat
                 .iter()
-                .flat_map(|group| group.options.iter().map(|option| option.value.clone()))
+                .map(|option| option.value.as_str().to_string())
                 .collect(),
-        })
-        .unwrap_or_default()
+            SelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| {
+                    group
+                        .options
+                        .iter()
+                        .map(|option| option.value.as_str().to_string())
+                })
+                .collect(),
+        },
+        ConfigKind::Boolean(_) | ConfigKind::Custom(..) | ConfigKind::Unknown(..) => Vec::new(),
+    }
 }
 
 /// Check a `model`/`config` value against the options the agent advertised
@@ -1734,15 +2001,18 @@ fn check_config_option(
     agent: &str,
     options: &[ConfigOption],
     id: &str,
-    value: &ConfigValue,
+    value: &crate::config::ConfigValue,
 ) -> Result<()> {
     let option = options
         .iter()
-        .find(|option| option.id == id)
+        .find(|option| option.config_id.as_str() == id)
         .ok_or_else(|| Error::UnknownConfigOption {
             agent: agent.to_string(),
             id: id.to_string(),
-            known: options.iter().map(|option| option.id.clone()).collect(),
+            known: options
+                .iter()
+                .map(|option| option.config_id.as_str().to_string())
+                .collect(),
         })?;
     let valid = select_values(option);
     let uncheckable = |value: String| Error::ConfigOptionValuesMissing {
@@ -1757,7 +2027,7 @@ fn check_config_option(
         valid: valid.clone(),
     };
     match value {
-        ConfigValue::Select(value) => {
+        crate::config::ConfigValue::Select(value) => {
             if valid.is_empty() {
                 Err(uncheckable(value.clone()))
             } else if valid.contains(value) {
@@ -1768,10 +2038,8 @@ fn check_config_option(
         }
         // A `boolean` option advertises no `options`; true/false is its
         // whole domain. For anything else a toggle cannot be checked.
-        ConfigValue::Toggle(flag) => {
-            if option.kind.as_deref() == Some("boolean")
-                || matches!(option.current_value, Some(ConfigOptionValue::Toggle(_)))
-            {
+        crate::config::ConfigValue::Toggle(flag) => {
+            if matches!(&option.kind, ConfigKind::Boolean(_)) {
                 Ok(())
             } else if valid.is_empty() {
                 Err(uncheckable(flag.to_string()))
@@ -1800,6 +2068,9 @@ fn on_disconnect(rt: &SubRuntime) {
     inner.steer_pending.clear();
     inner.steer_folded.clear();
     inner.steer_owner = None;
+    inner.ending = None;
+    inner.turn_ended = None;
+    inner.next_turn = None;
     inner.current = None;
     drop(inner);
     // The agent died unsupervised: its exec'd children outlive it as
@@ -1888,12 +2159,17 @@ pub async fn close_sub(sub: &Subagent) {
     {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         for pending in inner.pending.drain(..) {
-            let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
+            let _ = pending.answer.send(PermissionOutcome::Cancelled(
+                aither_acp::domain::CancelledOutcome { meta: None },
+            ));
         }
         inner.queue.clear();
         inner.steer_pending.clear();
         inner.steer_folded.clear();
         inner.steer_owner = None;
+        inner.ending = None;
+        inner.turn_ended = None;
+        inner.next_turn = None;
         if matches!(
             inner.status,
             Status::Running | Status::NeedsPermission | Status::RateLimited { .. }
@@ -1901,7 +2177,7 @@ pub async fn close_sub(sub: &Subagent) {
             inner.status = Status::Cancelled;
         }
     }
-    sub.client.clone().close();
+    sub.client.close().await;
     let conn = sub.conn.lock().expect("conn poisoned").take();
     if let Some(conn) = conn
         && let Err(error) = conn.await
@@ -2072,13 +2348,13 @@ pub(crate) const fn next_turn_number(inner: &Inner) -> u64 {
 /// # Panics
 ///
 /// Panics if a state mutex is poisoned.
-pub(crate) async fn begin_turn<E: Executor, P: PermissionHandler>(
+/// Wait for the prompt slot and open the turn under `inner`: the gate
+/// verdict, `HandingOff` waits, and `NotPromptable` refusals.
+async fn await_prompt_slot<E: Executor, P: PermissionHandler>(
     state: &Arc<AppState<E, P>>,
     sub: &Arc<Subagent>,
-    prompt: String,
     gate: Gate,
-    queued: bool,
-) -> Result<(u64, PromptFut)> {
+) -> Result<(u64, jiff::Timestamp)> {
     /// The gate's verdict under `inner`.
     enum Verdict {
         /// The turn starts with this number and start stamp.
@@ -2086,7 +2362,7 @@ pub(crate) async fn begin_turn<E: Executor, P: PermissionHandler>(
         /// `HandingOff` is set: hold until `handoff_one` resolves.
         HoldHandoff,
     }
-    let (turn_n, started) = loop {
+    loop {
         let verdict = {
             let mut inner = sub.rt.inner.lock().expect("inner poisoned");
             let closing = sub.rt.closing.get();
@@ -2128,7 +2404,7 @@ pub(crate) async fn begin_turn<E: Executor, P: PermissionHandler>(
             }
         };
         match verdict {
-            Verdict::Start(n, started) => break (n, started),
+            Verdict::Start(n, started) => return Ok((n, started)),
             // A `HandingOff` refusal holds until `handoff_one` resolves
             // rather than answering at once: the successor removed its
             // `foreign` route before it answered the handoff, so a refusal
@@ -2138,12 +2414,22 @@ pub(crate) async fn begin_turn<E: Executor, P: PermissionHandler>(
             Verdict::HoldHandoff if wait_out_handoff(state, sub).await => {}
             Verdict::HoldHandoff => return Err(Error::HandedOff(sub.session_id.clone())),
         }
-    };
+    }
+}
+
+pub(crate) async fn begin_turn<E: Executor, P: PermissionHandler>(
+    state: &Arc<AppState<E, P>>,
+    sub: &Arc<Subagent>,
+    prompt: String,
+    gate: Gate,
+    queued: bool,
+) -> Result<(u64, PromptFut)> {
+    let (turn_n, started) = await_prompt_slot(state, sub, gate).await?;
     let mut record = serde_json::json!({"ts": now(), "turn": turn_n, "prompt": prompt});
     if queued {
         record["queued"] = serde_json::json!(true);
     }
-    if let Err(source) = sub.rt.transcript.lock().await.append(&record).await {
+    if let Err(source) = transcript_append(&sub.rt, &record).await {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         inner.current = None;
         // `failed`, not `exited`: the agent process is still alive — the
@@ -2171,7 +2457,22 @@ pub(crate) async fn begin_turn<E: Executor, P: PermissionHandler>(
     }
     sub.rt.notify.notify_waiters();
 
-    let fut = enqueue_prompt(&sub.client, &sub.session_id, prompt).await;
+    let fut = match enqueue_prompt(&sub.session, prompt).await {
+        Ok(fut) => fut,
+        Err(source) => {
+            let mut inner = sub.rt.inner.lock().expect("inner poisoned");
+            inner.current = None;
+            if !matches!(inner.status, Status::Exited(_)) {
+                inner.status = Status::Failed(format!("cannot send prompt: {source}"));
+            }
+            drop(inner);
+            sub.rt.notify.notify_waiters();
+            return Err(Error::Agent {
+                agent: sub.agent.clone(),
+                source,
+            });
+        }
+    };
     // The prompt is on the wire: a cancel that landed before it was
     // recorded, not sent, and goes out now, behind the prompt.
     let cancel_now = {
@@ -2185,7 +2486,7 @@ pub(crate) async fn begin_turn<E: Executor, P: PermissionHandler>(
                 std::mem::take(&mut turn.cancel_requested)
             })
     };
-    if cancel_now && let Err(error) = sub.client.cancel(sub.session_id.as_str()).await {
+    if cancel_now && let Err(error) = sub.session.cancel().await {
         warn!(%error, "deferred cancel failed");
     }
     Ok((turn_n, fut))
@@ -2232,37 +2533,27 @@ pub(crate) fn spawn_turn_task<E: Executor, P: PermissionHandler>(
     tokio::spawn(turn_task(state, prompt, turn_n, sub.clone()));
 }
 
-/// Build a `session/prompt` call and drive it once so the request is on the
-/// wire: `AcpClient` enqueues the request on its unbounded outbound channel
-/// inside the first poll, so a `cancel` or steer issued right after cannot
-/// overtake the prompt it is meant to follow.
+/// Start a `session/prompt` turn and drive it once so the request is on the
+/// wire: a `PromptTurn` enqueues its `session/prompt` on the outbound
+/// channel inside the first poll, so a `cancel` or steer issued right
+/// after cannot overtake the prompt it is meant to follow.
 async fn enqueue_prompt(
-    client: &AcpClient<SubagentHandler>,
-    session_id: &str,
+    session: &ClientSession,
     prompt: String,
-) -> PromptFut {
-    let client = client.clone();
-    let session_id = session_id.to_string();
-    let mut prompt: PromptFut = Box::pin(async move {
-        client
-            .prompt(PromptParams::new(
-                session_id,
-                vec![ContentBlock::Text(TextContent {
-                    text: prompt,
-                    annotations: None,
-                    meta: None,
-                })],
-            ))
-            .await
-    });
-    let ready = futures_lite::future::poll_fn(|cx| match prompt.as_mut().poll(cx) {
-        std::task::Poll::Ready(outcome) => std::task::Poll::Ready(Some(outcome)),
-        std::task::Poll::Pending => std::task::Poll::Ready(None),
-    })
-    .await;
-    // A synchronously-failed send resolves on the first poll; wrap the
-    // outcome so the same turn-end path handles it.
-    ready.map_or(prompt, |outcome| Box::pin(async move { outcome }))
+) -> std::result::Result<PromptFut, ClientError> {
+    use futures_lite::StreamExt;
+    let mut turn = session.prompt(prompt)?;
+    // One drive puts the request on the wire: `poll_next`'s first poll
+    // runs the pending `session/prompt` far enough to enqueue it.
+    // Driving until `Ready` would instead hold the turn's start hostage
+    // to the first session event — a silent agent (a rate-limit answer
+    // the provider holds back, a turn that produces no update before
+    // its response) sends none until it answers, stalling the turn's
+    // start — and the `spawn`/`send` call behind it — for the whole
+    // turn. The event a lucky poll yields is dropped — the shared
+    // event stream reports it too.
+    let _ = futures_lite::future::poll_once(turn.next()).await;
+    Ok(Box::pin(async move { turn.finish().await }))
 }
 
 /// Inject `prompt` into the running turn as a steering message: a second
@@ -2306,25 +2597,48 @@ pub(crate) async fn steer_turn(
     };
     let record =
         serde_json::json!({"ts": now(), "turn": turn_n, "steer": prompt, "steer_id": steer_id});
-    if let Err(error) = sub.rt.transcript.lock().await.append(&record).await {
+    if let Err(error) = transcript_append(&sub.rt, &record).await {
         warn!(%error, "transcript write failed");
     }
-    let fut = enqueue_prompt(&sub.client, &sub.session_id, prompt).await;
+    let fut = enqueue_steer(&sub.session, prompt)
+        .await
+        .map_err(|source| Error::Agent {
+            agent: sub.agent.clone(),
+            source,
+        })?;
     Ok((steer_id, turn_n, fut))
+}
+
+/// Send a steering `session/prompt` (or `_session/steering` where the
+/// agent advertises it) and drive it onto the wire.
+async fn enqueue_steer(
+    session: &ClientSession,
+    prompt: String,
+) -> std::result::Result<PromptFut, ClientError> {
+    use futures_lite::StreamExt;
+    let mut turn = session.steer(prompt).await?;
+    // One drive, as in `enqueue_prompt`: a steer prompt put on the wire
+    // here stays behind the running turn's own prompt and ahead of any
+    // later `send`. Waiting for `Ready` would instead stall `send` on
+    // the first session event — a detached (`_session/steering`) turn
+    // waits only on `rx`, and a folded or rejected steer may produce
+    // no event until the turn it rides answers.
+    let _ = futures_lite::future::poll_once(turn.next()).await;
+    Ok(Box::pin(async move { turn.finish().await }))
 }
 
 /// The `steer_end` transcript record for a resolved steer call.
 pub(crate) fn steer_end_record(
     steer_id: u64,
     turn_n: u64,
-    outcome: &std::result::Result<PromptResult, ClientError>,
+    outcome: &std::result::Result<StopReason, ClientError>,
 ) -> serde_json::Value {
     match outcome {
-        Ok(result) => serde_json::json!({
+        Ok(reason) => serde_json::json!({
             "ts": now(),
             "turn": turn_n,
             "steer_id": steer_id,
-            "steer_end": serde_json::to_value(result.stop_reason).unwrap_or_default(),
+            "steer_end": serde_json::to_value(reason).unwrap_or_default(),
         }),
         Err(error) => serde_json::json!({
             "ts": now(),
@@ -2385,7 +2699,7 @@ pub(crate) async fn steer_resolved<E: Executor, P: PermissionHandler>(
     sub: &Arc<Subagent>,
     steer_id: u64,
     target_turn: u64,
-    outcome: std::result::Result<PromptResult, ClientError>,
+    outcome: std::result::Result<StopReason, ClientError>,
 ) {
     // A steered prompt rejected by a rate limit tells the scope about the
     // quota: later prompts park instead of burning a request. The steer
@@ -2395,6 +2709,17 @@ pub(crate) async fn steer_resolved<E: Executor, P: PermissionHandler>(
     {
         crate::ratelimit::note_limit(&state, &sub.agent, &hit).await;
     }
+    // Serialize against the target turn's `finish_turn`: it holds
+    // `prompt_send` through its settle, so acquiring it here means the
+    // target's `current` is already cleared — and any untracked traffic
+    // the steer opened lands in the materialization window instead of
+    // being attributed to a turn whose end is still being recorded.
+    // The tee holds every `session/update` that preceded this
+    // resolution on the wire; draining it now materializes the steer's
+    // own turn (`steer_owner`) before `mine` is decided, rather than
+    // racing `drive_events`' or the flusher's lag.
+    let wire = sub.rt.prompt_send.clone().lock_owned().await;
+    flush_teed(&sub.rt).await;
     let (mine, kick, turn_n) = {
         let mut inner = sub.rt.inner.lock().expect("inner poisoned");
         inner.steer_pending.retain(|steer| steer.id != steer_id);
@@ -2414,11 +2739,16 @@ pub(crate) async fn steer_resolved<E: Executor, P: PermissionHandler>(
         };
         // An answer outside a turn of its own means the agent folded the
         // steer into the turn it targeted.
-        let resolution = match (&outcome, inner.current.as_ref().filter(|_| mine)) {
+        let materialized_n = inner
+            .next_turn
+            .as_ref()
+            .or(inner.current.as_ref())
+            .map(|turn| turn.n);
+        let resolution = match (&outcome, materialized_n.filter(|_| mine)) {
             (Err(error), _) => SteerOutcome::Rejected {
                 error: error.to_string(),
             },
-            (Ok(_), Some(turn)) => SteerOutcome::Turn { turn: turn.n },
+            (Ok(_), Some(n)) => SteerOutcome::Turn { turn: n },
             (Ok(_), None) => SteerOutcome::Folded,
         };
         record_steer_end(&mut inner, steer_id, target_turn, resolution);
@@ -2435,14 +2765,18 @@ pub(crate) async fn steer_resolved<E: Executor, P: PermissionHandler>(
         } else {
             None
         };
-        let turn_n = inner.current.as_ref().map_or(target_turn, |turn| turn.n);
+        let turn_n = materialized_n.unwrap_or(target_turn);
         drop(inner);
         (mine, prompt, turn_n)
     };
     if mine {
-        finish_turn(state, sub, turn_n, outcome.clone()).await;
+        // `finish_turn` takes `prompt_send` itself; releasing it first is
+        // safe — the materialized `current` keeps the prompt slot closed
+        // to any `send` that lands in the gap.
+        drop(wire);
         let record = steer_end_record(steer_id, turn_n, &outcome);
-        if let Err(error) = sub.rt.transcript.lock().await.append(&record).await {
+        finish_turn(state, sub, turn_n, outcome).await;
+        if let Err(error) = transcript_append(&sub.rt, &record).await {
             warn!(%error, "transcript write failed");
         }
     } else {
@@ -2453,11 +2787,12 @@ pub(crate) async fn steer_resolved<E: Executor, P: PermissionHandler>(
         // path.
         state.handover.progressed.notify_waiters();
         if let Some(prompt) = kick {
-            let wire = sub.rt.prompt_send.clone().lock_owned().await;
             spawn_chained(state, sub.session_id.clone(), prompt, wire);
+        } else {
+            drop(wire);
         }
         let record = steer_end_record(steer_id, turn_n, &outcome);
-        if let Err(error) = sub.rt.transcript.lock().await.append(&record).await {
+        if let Err(error) = transcript_append(&sub.rt, &record).await {
             warn!(%error, "transcript write failed");
         }
         // The resolution is the event a wait bound to the target turn is
@@ -2474,13 +2809,29 @@ pub(crate) async fn steer_waiter<E: Executor, P: PermissionHandler>(
     target_turn: u64,
     prompt: PromptFut,
 ) {
-    let outcome = prompt.await;
+    let outcome = settle_outcome(prompt.await);
     steer_resolved(state, &sub, steer_id, target_turn, outcome).await;
 }
 
 /// The in-flight `session/prompt` call, already enqueued by `start_turn`.
-pub(crate) type PromptFut =
-    Pin<Box<dyn Future<Output = std::result::Result<PromptResult, ClientError>> + Send>>;
+/// The future a started turn's driver awaits: the turn's [`TurnOutcome`].
+pub(crate) type PromptFut = Pin<Box<dyn Future<Output = TurnOutcome> + Send>>;
+
+/// Collapse a [`TurnOutcome`] into the settle/fail shape `finish_turn`
+/// consumes: a stop reason, or the wire error that ended the call.
+pub(crate) fn settle_outcome(outcome: TurnOutcome) -> std::result::Result<StopReason, ClientError> {
+    match outcome {
+        TurnOutcome::Finished {
+            stop_reason, error, ..
+        } => match (stop_reason.and_then(Open::into_known), error) {
+            (Some(StopReason::Error), Some(error)) => Err(ClientError::Rejected(error)),
+            (Some(reason), _) => Ok(reason),
+            (None, _) => Ok(StopReason::EndTurn),
+        },
+        TurnOutcome::Cancelled => Ok(StopReason::Cancelled),
+        TurnOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+    }
+}
 
 /// Push the finished turn into `turns` and pick the follow-up state: a
 /// `cancelled` turn drops the queue, a queued prompt becomes the next turn
@@ -2502,8 +2853,23 @@ fn settle_turn(
         inner.recording = Some(turn.n);
         inner.turns.push(turn);
     }
+    inner.ending = None;
+    // A steered turn staged behind the end takes the freed slot: the
+    // session is running it, so neither `done` nor a queued prompt's
+    // chain applies.
+    let promoted = if let Some(next) = inner.next_turn.take()
+        && !matches!(inner.status, Status::Exited(_))
+    {
+        inner.current = Some(next);
+        inner.status = Status::Running;
+        true
+    } else {
+        false
+    };
     let folded = fold_pending_steers(rt, &mut inner);
-    let (next, dropped) = if matches!(inner.status, Status::Exited(_)) {
+    let (next, dropped) = if promoted {
+        (None, VecDeque::new())
+    } else if matches!(inner.status, Status::Exited(_)) {
         // The process died while the turn was in flight; `on_disconnect`
         // already cleared the queue and steers and owns the status.
         (None, VecDeque::new())
@@ -2559,8 +2925,15 @@ fn fail_turn(rt: &SubRuntime, reason: String) -> (VecDeque<String>, Vec<u64>) {
         inner.recording = Some(turn.n);
         inner.turns.push(turn);
     }
+    inner.ending = None;
+    if let Some(next) = inner.next_turn.take()
+        && !matches!(inner.status, Status::Exited(_))
+    {
+        inner.current = Some(next);
+        inner.status = Status::Running;
+    }
     let folded = fold_pending_steers(rt, &mut inner);
-    if !matches!(inner.status, Status::Exited(_)) {
+    if !matches!(inner.status, Status::Exited(_)) && inner.current.is_none() {
         inner.status = Status::Failed(reason);
     }
     (std::mem::take(&mut inner.queue), folded)
@@ -2578,9 +2951,16 @@ fn park_turn(rt: &SubRuntime, hit: &crate::ratelimit::RateLimit) -> Vec<u64> {
         inner.recording = Some(turn.n);
         inner.turns.push(turn);
     }
+    inner.ending = None;
+    if let Some(next) = inner.next_turn.take()
+        && !matches!(inner.status, Status::Exited(_))
+    {
+        inner.current = Some(next);
+        inner.status = Status::Running;
+    }
     let folded = fold_pending_steers(rt, &mut inner);
     inner.pending_turn_start = None;
-    if !matches!(inner.status, Status::Exited(_)) {
+    if !matches!(inner.status, Status::Exited(_)) && inner.current.is_none() {
         inner.status = Status::RateLimited {
             resume_at: hit.resume_at,
             reason: hit.reason.clone(),
@@ -2603,7 +2983,7 @@ pub(crate) async fn record_queue_dropped(
     if let Some(turn_n) = turn_n {
         record["turn"] = serde_json::json!(turn_n);
     }
-    if let Err(error) = rt.transcript.lock().await.append(&record).await {
+    if let Err(error) = transcript_append(rt, &record).await {
         warn!(%error, "transcript write failed");
     }
 }
@@ -2618,7 +2998,7 @@ async fn record_steers_folded(rt: &SubRuntime, turn_n: u64, steers: Vec<u64>) {
             "steer_id": steer_id,
             "steer_end": "folded",
         });
-        if let Err(error) = rt.transcript.lock().await.append(&record).await {
+        if let Err(error) = transcript_append(rt, &record).await {
             warn!(%error, "transcript write failed");
         }
     }
@@ -2631,7 +3011,7 @@ async fn turn_task<E: Executor, P: PermissionHandler>(
     turn_n: u64,
     sub: Arc<Subagent>,
 ) {
-    let outcome = prompt.await;
+    let outcome = settle_outcome(prompt.await);
     finish_turn(state, &sub, turn_n, outcome).await;
 }
 
@@ -2685,24 +3065,28 @@ async fn finish_turn<E: Executor, P: PermissionHandler>(
     state: Arc<AppState<E, P>>,
     sub: &Arc<Subagent>,
     turn_n: u64,
-    outcome: std::result::Result<PromptResult, ClientError>,
+    outcome: std::result::Result<StopReason, ClientError>,
 ) {
     let rt = &sub.rt;
     let session_id = &sub.session_id;
+    // Mark the end before any await: traffic landing after this turn's
+    // response belongs to the turn that follows it — the materializers
+    // hold it until the settle frees `current` rather than attributing
+    // to this one while its settle is in flight.
+    rt.inner.lock().expect("inner poisoned").ending = Some(turn_n);
     let wire = rt.prompt_send.clone().lock_owned().await;
     // A provider rate limit ends the turn parked, not failed — the
     // session resumes on its own when the quota lifts.
     let hit = outcome.as_ref().err().and_then(crate::ratelimit::parse);
     let mut chained = None;
     match outcome {
-        Ok(result) => {
-            let reason = result.stop_reason;
+        Ok(reason) => {
             let record = serde_json::json!({
                 "ts": now(),
                 "turn": turn_n,
                 "stop_reason": serde_json::to_value(reason).unwrap_or_default(),
             });
-            if let Err(error) = rt.transcript.lock().await.append(&record).await {
+            if let Err(error) = transcript_append(rt, &record).await {
                 warn!(%error, "transcript write failed");
             }
             let (next, dropped, folded) = settle_turn(
@@ -2732,7 +3116,7 @@ async fn finish_turn<E: Executor, P: PermissionHandler>(
                 record["stop_reason"] = serde_json::json!("rate_limited");
                 record["resume_at"] = serde_json::json!(hit.resume_at.to_string());
             }
-            if let Err(error) = rt.transcript.lock().await.append(&record).await {
+            if let Err(error) = transcript_append(rt, &record).await {
                 warn!(%error, "transcript write failed");
             }
             if let Some(hit) = &hit {

@@ -19,7 +19,7 @@ use acpsub::{
     AgentProcess, Config, Executor, Host, HostExecutor, PermissionHandler, PermissionRequest,
     PolicyPermissions, Services, SessionSpec, SpawnSpec, TerminalProcess, TurnEnd, probe_with,
 };
-use aither_acp::{RequestPermissionOutcome, StopReason};
+use aither_acp::{PermissionOutcome, StopReason};
 use common::*;
 
 struct MemorySource(Config);
@@ -101,14 +101,14 @@ struct Selecting {
 }
 
 impl PermissionHandler for Selecting {
-    fn decide(
-        &self,
-        request: PermissionRequest,
-    ) -> impl Future<Output = RequestPermissionOutcome> + Send {
+    fn decide(&self, request: PermissionRequest) -> impl Future<Output = PermissionOutcome> + Send {
         self.requests.lock().unwrap().push(request);
-        std::future::ready(RequestPermissionOutcome::Selected {
-            option_id: self.option.into(),
-        })
+        std::future::ready(PermissionOutcome::Selected(
+            aither_acp::domain::SelectedOutcome {
+                option_id: self.option.into(),
+                meta: None,
+            },
+        ))
     }
 }
 
@@ -223,12 +223,22 @@ async fn supplied_permission_handler_answers_instead_of_the_policy() {
     assert_eq!(request.session_id, session.session_id());
     assert_eq!(request.cwd, cwd);
     assert_eq!(request.policy, PermissionPolicy::Deny);
-    assert_eq!(request.params.tool_call.tool_call_id, "tc-1");
+    let subject = request
+        .params
+        .subject
+        .as_ref()
+        .expect("a tool_call subject");
+    match subject {
+        aither_acp::Open::Known(aither_acp::domain::PermissionSubject::ToolCall(call)) => {
+            assert_eq!(call.tool_call.tool_call_id.as_str(), "tc-1");
+        }
+        other => panic!("expected a tool_call subject, got {other:?}"),
+    }
     let options: Vec<_> = request
         .params
         .options
         .iter()
-        .map(|option| option.option_id.clone())
+        .map(|option| option.option_id.as_str().to_string())
         .collect();
     assert_eq!(options, ["allow-1", "allow-2", "deny-1"]);
     session.close().await.expect("close");
@@ -347,7 +357,7 @@ async fn probe_runs_through_the_supplied_executor() {
     )
     .await
     .expect("fake speaks ACP");
-    assert!(init.agent_info.is_some());
+    assert!(init.info.is_some());
     let seen = recorded(&spawns);
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].0, Start::Agent);

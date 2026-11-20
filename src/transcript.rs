@@ -5,9 +5,9 @@ use std::fmt::Write;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use aither_acp::{
-    ContentBlock, CurrentModeUpdate, Plan, PlanEntryStatus, SessionUpdate, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+use aither_acp::domain::{
+    ContentBlock, Open, Patch, Plan, PlanEntryStatus, SessionUpdate, ToolCallContent,
+    ToolCallContentChunk, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
@@ -129,9 +129,7 @@ pub fn render(text: &str, options: &RenderOptions) -> String {
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let record: Value =
             serde_json::from_str(line).unwrap_or_else(|_| Value::String(line.to_string()));
-        let update = record
-            .get("update")
-            .and_then(|u| serde_json::from_value::<SessionUpdate>(u.clone()).ok());
+        let update = record.get("update").and_then(crate::state::parse_update);
         match hidden(update.as_ref(), options) {
             // A hidden thought still ends the message run around it.
             Some(Hidden::Boundary) => {
@@ -185,7 +183,12 @@ const fn hidden(update: Option<&SessionUpdate>, options: &RenderOptions) -> Opti
             SessionUpdate::SessionInfoUpdate(_)
             | SessionUpdate::ConfigOptionUpdate(_)
             | SessionUpdate::AvailableCommandsUpdate(_)
-            | SessionUpdate::UsageUpdate(_),
+            | SessionUpdate::UsageUpdate(_)
+            | SessionUpdate::StateUpdate(_)
+            | SessionUpdate::CompactionUpdate(_)
+            | SessionUpdate::CompactionSummaryChunk(_)
+            | SessionUpdate::ReplayComplete(_)
+            | SessionUpdate::Notice(_),
         ) if !options.meta => Some(Hidden::Transparent),
         _ => None,
     }
@@ -231,8 +234,11 @@ fn chunk_text(update: &SessionUpdate) -> Option<String> {
         ContentBlock::Text(text) => Some(text.text.clone()),
         ContentBlock::Image(_) => Some("[image]".to_string()),
         ContentBlock::Audio(_) => Some("[audio]".to_string()),
-        ContentBlock::Resource(resource) => Some(format!("[resource {}]", resource.resource.uri)),
+        ContentBlock::Resource(resource) => {
+            Some(format!("[resource {}]", resource_uri(&resource.resource)))
+        }
         ContentBlock::ResourceLink(link) => Some(format!("[resource {}]", link.uri)),
+        _ => Some("[content]".to_string()),
     }
 }
 
@@ -299,10 +305,16 @@ fn render_record(
         return;
     };
     match update {
-        SessionUpdate::ToolCall(call) => render_call(call, out, options),
-        SessionUpdate::ToolCallUpdate(call) => render_result(call, out, options),
-        SessionUpdate::Plan(plan) => render_plan(plan, out, options.full),
-        SessionUpdate::CurrentModeUpdate(mode) => render_mode(mode, out),
+        SessionUpdate::ToolCallUpdate(update) => render_call_update(update, out, options),
+        SessionUpdate::ToolCallContentChunk(chunk) => render_content_chunk(chunk, out, options),
+        SessionUpdate::PlanUpdate(update) => {
+            if let Open::Known(Plan::Items(items)) = &update.plan {
+                render_plan(&items.entries, out, options.full);
+            }
+        }
+        SessionUpdate::CurrentModeUpdate(mode) => {
+            let _ = writeln!(out, "--- MODE {}", mode.current_mode_id);
+        }
         other => render_unknown(other, out, options.full),
     }
 }
@@ -349,51 +361,46 @@ fn render_unparsable(record: &Value, out: &mut String, full: bool) {
     let _ = writeln!(out, "--- UPDATE unparsable\n    {}", clip(&raw, full));
 }
 
-/// `--- CALL <kind> <title> (<id>) [status]` + locations, raw input, content.
-fn render_call(call: &ToolCall, out: &mut String, options: &RenderOptions) {
-    let kind = call.kind.map_or("other", kind_str);
-    let status = call.status.map_or("pending", status_str);
-    let _ = writeln!(
-        out,
-        "--- CALL {kind} {} ({}) [{status}]",
-        clip(&call.title, options.full),
-        call.tool_call_id
-    );
-    for location in &call.locations {
-        match location.line {
-            Some(line) => {
-                let _ = writeln!(out, "    {}:{line}", location.path.display());
-            }
-            None => {
-                let _ = writeln!(out, "    {}", location.path.display());
+/// `--- CALL <kind> <title> (<id>) [status]` / `--- RESULT (<id>) [status]`
+/// for a `tool_call_update`: a patch that announces the call (title, name
+/// or kind set) reads as the call, otherwise as the result.
+fn render_call_update(update: &ToolCallUpdate, out: &mut String, options: &RenderOptions) {
+    let announces =
+        update.title.is_changed() || update.name.is_changed() || update.kind.is_changed();
+    let label = if announces { "CALL" } else { "RESULT" };
+    let mut head = format!("--- {label}");
+    if let Patch::Set(kind) = &update.kind {
+        let _ = write!(head, " {}", open_str(kind, kind_str));
+    }
+    if let Patch::Set(title) = &update.title {
+        let _ = write!(head, " {}", clip(title, options.full));
+    } else if let Patch::Set(name) = &update.name {
+        let _ = write!(head, " {}", clip(name, options.full));
+    }
+    let _ = write!(head, " ({})", update.tool_call_id);
+    if let Patch::Set(status) = &update.status {
+        let _ = write!(head, " [{}]", open_str(status, status_str));
+    }
+    let _ = writeln!(out, "{head}");
+    if let Patch::Set(locations) = &update.locations {
+        for location in locations {
+            match location.line {
+                Some(line) => {
+                    let _ = writeln!(out, "    {}:{line}", location.path.display());
+                }
+                None => {
+                    let _ = writeln!(out, "    {}", location.path.display());
+                }
             }
         }
     }
-    if let Some(input) = &call.raw_input {
+    if let Patch::Set(input) = &update.raw_input {
         let _ = writeln!(out, "    input: {}", clip(&input.to_string(), options.full));
     }
-    render_tool_content(&call.content, out, options);
-}
-
-/// `--- RESULT (<id>) [status]` + content and raw output.
-fn render_result(call: &ToolCallUpdate, out: &mut String, options: &RenderOptions) {
-    match call.status {
-        Some(status) => {
-            let _ = writeln!(
-                out,
-                "--- RESULT ({}) [{}]",
-                call.tool_call_id,
-                status_str(status)
-            );
-        }
-        None => {
-            let _ = writeln!(out, "--- RESULT ({})", call.tool_call_id);
-        }
-    }
-    if let Some(content) = &call.content {
+    if let Patch::Set(content) = &update.content {
         render_tool_content(content, out, options);
     }
-    if let Some(output) = &call.raw_output {
+    if let Patch::Set(output) = &update.raw_output {
         let _ = writeln!(
             out,
             "    output: {}",
@@ -402,22 +409,22 @@ fn render_result(call: &ToolCallUpdate, out: &mut String, options: &RenderOption
     }
 }
 
-/// `--- PLAN` + one `[status] entry` line per plan entry.
-fn render_plan(plan: &Plan, out: &mut String, full: bool) {
-    let _ = writeln!(out, "--- PLAN");
-    for entry in &plan.entries {
-        let status = match entry.status {
-            PlanEntryStatus::Pending => "pending",
-            PlanEntryStatus::InProgress => "in_progress",
-            PlanEntryStatus::Completed => "completed",
-        };
-        let _ = writeln!(out, "    [{status}] {}", clip(&entry.content, full));
-    }
+/// `--- RESULT (<id>)` + the chunk's one content item.
+fn render_content_chunk(chunk: &ToolCallContentChunk, out: &mut String, options: &RenderOptions) {
+    let _ = writeln!(out, "--- RESULT ({})", chunk.tool_call_id);
+    render_tool_content(std::slice::from_ref(&chunk.content), out, options);
 }
 
-/// `--- MODE <id>` for a `current_mode_update`.
-fn render_mode(mode: &CurrentModeUpdate, out: &mut String) {
-    let _ = writeln!(out, "--- MODE {}", mode.current_mode_id);
+/// `--- PLAN` + one `[status] entry` line per plan entry.
+fn render_plan(entries: &[aither_acp::domain::PlanEntry], out: &mut String, full: bool) {
+    let _ = writeln!(out, "--- PLAN");
+    for entry in entries {
+        let status = entry
+            .status
+            .as_ref()
+            .map_or("pending", |status| open_str(status, plan_status_str));
+        let _ = writeln!(out, "    [{status}] {}", clip(&entry.content, full));
+    }
 }
 
 /// `--- UPDATE <tag>` with the clipped JSON for updates without a section.
@@ -438,17 +445,15 @@ fn render_unknown(update: &SessionUpdate, out: &mut String, full: bool) {
 fn render_tool_content(content: &[ToolCallContent], out: &mut String, options: &RenderOptions) {
     for item in content {
         let text = match item {
-            ToolCallContent::Content { content } => match content {
+            ToolCallContent::Content(content) => match &content.content {
                 ContentBlock::Text(text) => text.text.clone(),
-                ContentBlock::Image(_) => "[image]".to_string(),
-                ContentBlock::Audio(_) => "[audio]".to_string(),
-                ContentBlock::Resource(resource) => {
-                    format!("[resource {}]", resource.resource.uri)
-                }
-                ContentBlock::ResourceLink(link) => format!("[resource {}]", link.uri),
+                other => format!("[{}]", block_kind(other)),
             },
-            ToolCallContent::Diff(diff) => format!("diff {}", diff.path.display()),
-            ToolCallContent::Terminal { terminal_id } => format!("terminal {terminal_id}"),
+            ToolCallContent::Diff(diff) => format!("diff {}", diff_label(diff)),
+            ToolCallContent::Terminal(terminal) => {
+                format!("terminal {}", terminal.terminal_id)
+            }
+            ToolCallContent::Custom(..) | ToolCallContent::Unknown(..) => "[content]".to_string(),
         };
         let _ = writeln!(out, "    {}", clip(&text, options.full));
     }
@@ -483,8 +488,54 @@ const fn status_str(status: ToolCallStatus) -> &'static str {
     match status {
         ToolCallStatus::Pending => "pending",
         ToolCallStatus::InProgress => "in_progress",
+        ToolCallStatus::Paused => "paused",
         ToolCallStatus::Completed => "completed",
         ToolCallStatus::Failed => "failed",
+        ToolCallStatus::Cancelled => "cancelled",
+    }
+}
+
+const fn plan_status_str(status: PlanEntryStatus) -> &'static str {
+    match status {
+        PlanEntryStatus::Pending => "pending",
+        PlanEntryStatus::InProgress => "in_progress",
+        PlanEntryStatus::Completed => "completed",
+        PlanEntryStatus::Cancelled => "cancelled",
+    }
+}
+
+/// The display string of an `Open` enum: the known variant's label via
+/// `str`, else the preserved wire tag, else `"other"`.
+fn open_str<T: Copy>(open: &Open<T>, str: fn(T) -> &'static str) -> &str {
+    match open {
+        Open::Known(value) => str(*value),
+        Open::Custom(tag, _) => tag.as_str(),
+        Open::Unknown(tag, _) => tag.as_str(),
+    }
+}
+
+/// An embedded resource's uri, whichever contents variant carries it.
+fn resource_uri(contents: &aither_acp::domain::ResourceContents) -> &str {
+    match contents {
+        aither_acp::domain::ResourceContents::Text(text) => &text.uri,
+        aither_acp::domain::ResourceContents::Blob(_) => "",
+    }
+}
+
+/// A diff's display label: its first changed path, else `patch`.
+fn diff_label(diff: &aither_acp::domain::Diff) -> String {
+    let _ = diff;
+    "patch".to_string()
+}
+
+/// A non-text content block's bracket label.
+const fn block_kind(block: &ContentBlock) -> &'static str {
+    match block {
+        ContentBlock::Text(_) => "text",
+        ContentBlock::Image(_) => "image",
+        ContentBlock::Audio(_) => "audio",
+        ContentBlock::Resource(_) | ContentBlock::ResourceLink(_) => "resource",
+        _ => "content",
     }
 }
 
