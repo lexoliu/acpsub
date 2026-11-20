@@ -1,349 +1,147 @@
-//! The per-subagent [`ClientHandler`]: transcripts every `session/update`,
-//! applies the permission policy, and serves `terminal/*` requests and,
-//! unless the agent's file access is off, `fs/*` requests.
+//! The per-subagent client hooks: applies the permission policy, serves
+//! `terminal/*` and — unless the agent's file access is off — `fs/*`
+//! requests, and drives the session's event stream into the turn state.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aither_acp::client::{FsHandler, PermissionHandler, V1Terminal};
+use aither_acp::rpc::RpcError;
+use aither_acp::state::{MessageKind, SessionEvent};
+use aither_acp::wire::v1;
 use aither_acp::{
-    ClientCapabilities, ClientHandler, ContentBlock, FileSystemCapability, ReadTextFileParams,
-    ReadTextFileResult, RequestPermissionOutcome, RequestPermissionParams, RequestPermissionResult,
-    SessionNotification, SessionUpdate, TerminalCreateParams, TerminalCreateResult,
-    TerminalExitStatus, TerminalKillParams, TerminalKillResult, TerminalOutputParams,
-    TerminalOutputResult, TerminalReleaseParams, TerminalReleaseResult, TerminalWaitForExitParams,
-    ToolCall, ToolCallUpdate, WriteTextFileParams, WriteTextFileResult,
+    ClientSession, PermissionOutcome, PermissionRequest,
+    domain::{CancelledOutcome, Open, Plan, SelectedOutcome, ToolCall},
 };
-use aither_mcp::protocol::JsonRpcError;
 use tokio::sync::oneshot;
-use tracing::warn;
 
 use crate::config::{FileAccess, PermissionPolicy};
-use crate::permission::PermissionRequest;
+use crate::permission::PermissionRequest as SubPermissionRequest;
 use crate::services::{ServiceCall, ServiceCalls};
-use crate::state::{Status, SubRuntime, ToolCallSummary, Turn, now, oldest_steer, terminal_status};
+use crate::state::{
+    Inner, Status, SubRuntime, ToolCallSummary, Turn, oldest_steer, terminal_status,
+};
 use crate::terminal::Terminal;
 
-/// Handles one subagent's agent-to-client traffic.
+/// Answers `session/request_permission` through the host's services.
 #[derive(Debug)]
-pub struct SubagentHandler {
+pub(crate) struct SubPermissions {
     /// Shared mutable state.
     rt: Arc<SubRuntime>,
-    /// Session working directory; fs paths must stay under it under
-    /// [`FileAccess::Cwd`].
+    /// Session working directory.
     cwd: PathBuf,
     /// Permission policy for `session/request_permission`.
     permission: PermissionPolicy,
-    /// What the `fs/*` methods serve.
-    file_access: FileAccess,
-    /// The host's services, which start terminal commands and answer
-    /// permission requests.
+    /// The host's services, which answer permission requests.
     services: ServiceCalls,
 }
 
-impl SubagentHandler {
-    /// Construct the handler for a subagent being launched; `services`
-    /// reaches the task serving the host's [`Services`](crate::Services).
+impl SubPermissions {
+    /// Construct the permission hook for a subagent being launched.
     #[must_use]
     pub(crate) const fn new(
         rt: Arc<SubRuntime>,
         cwd: PathBuf,
         permission: PermissionPolicy,
-        file_access: FileAccess,
         services: ServiceCalls,
     ) -> Self {
         Self {
             rt,
             cwd,
             permission,
-            file_access,
             services,
         }
     }
 }
 
-impl ClientHandler for SubagentHandler {
-    fn capabilities(&self) -> ClientCapabilities {
-        let served = self.file_access != FileAccess::Off;
-        ClientCapabilities {
-            fs: FileSystemCapability {
-                read_text_file: served,
-                write_text_file: served,
-                meta: None,
-            },
-            terminal: true,
-            meta: None,
-            ..ClientCapabilities::default()
-        }
-    }
-
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the `inner` guard must stay alive while `turn` borrows it"
-    )]
-    async fn session_update(&self, notification: SessionNotification) {
-        // A `session/update` with no current turn means the agent is running
-        // a turn we did not open: a steered prompt that landed after its
-        // target turn ended. Materialize `current` for the oldest
-        // outstanding steer — pending or settled-folded — so the update and
-        // the turn are tracked; `steer_resolved` settles it when the
-        // steer's `session/prompt` resolves.
-        let (turn_n, materialized) = {
-            let mut inner = self.rt.inner.lock().expect("inner poisoned");
-            // `failed` is not excluded: the agent is still live, so a steer
-            // that was already on the wire when the turn failed can still
-            // run — and be tracked — as a turn of its own.
-            let materialized = inner.current.is_none() && oldest_steer(&inner).is_some();
-            if materialized {
-                let n = inner.turn_offset + inner.turns.len() as u64 + 1;
-                inner.current = Some(Turn {
-                    n,
-                    started_at: Some(jiff::Timestamp::now()),
-                    ..Turn::default()
-                });
-                inner.pending_turn_start = None;
-                inner.steer_owner = oldest_steer(&inner);
-                inner.status = Status::Running;
-            }
-            (
-                inner.current.as_ref().map_or(0, |turn| turn.n),
-                materialized,
-            )
-        };
-        if materialized {
-            self.rt.notify.notify_waiters();
-        }
-        let record = serde_json::json!({
-            "ts": now(),
-            "turn": turn_n,
-            "update": notification.update,
-        });
-        if let Err(error) = self.rt.transcript.lock().await.append(&record).await {
-            warn!(subagent = %self.rt.session_label(), %error, "transcript append failed");
-        }
-        let mut inner = self.rt.inner.lock().expect("inner poisoned");
-        // Mode and config updates are agent-reported session state, not
-        // turn data: they apply even when no turn is open (e.g. during the
-        // launch handshake, where `set_mode` is answered by an update).
-        match &notification.update {
-            SessionUpdate::CurrentModeUpdate(mode) => {
-                if let Some(modes) = inner.modes.as_mut() {
-                    modes.current_mode_id.clone_from(&mode.current_mode_id);
-                }
-            }
-            SessionUpdate::ConfigOptionUpdate(update) => {
-                inner.config_options.clone_from(&update.config_options);
-            }
-            _ => {}
-        }
-        let Some(turn) = inner.current.as_mut() else {
-            return;
-        };
-        match notification.update {
-            SessionUpdate::AgentMessageChunk(chunk) => {
-                if let ContentBlock::Text(text) = chunk.content {
-                    turn.reply.push_str(&text.text);
-                }
-            }
-            SessionUpdate::ToolCall(call) => note_tool_call(turn, call),
-            SessionUpdate::ToolCallUpdate(update) => note_tool_call_update(turn, update),
-            SessionUpdate::Plan(plan) => turn.plan = plan.entries,
-            SessionUpdate::CurrentModeUpdate(mode) => {
-                turn.mode = Some(mode.current_mode_id);
-            }
-            _ => {}
-        }
-    }
-
-    async fn request_permission(
-        &self,
-        params: RequestPermissionParams,
-    ) -> Result<RequestPermissionResult, JsonRpcError> {
+impl PermissionHandler for SubPermissions {
+    async fn request(&self, request: PermissionRequest) -> PermissionOutcome {
         let (reply, answer) = oneshot::channel();
-        let request = PermissionRequest::new(
+        let request = SubPermissionRequest::new(
             self.rt.session_label(),
             self.cwd.clone(),
             self.permission,
-            params,
+            request,
             self.rt.clone(),
         );
-        let outcome = if self
+        if self
             .services
             .send(ServiceCall::Permission { request, reply })
             .is_ok()
         {
-            answer.await.unwrap_or(RequestPermissionOutcome::Cancelled)
+            answer
+                .await
+                .unwrap_or(PermissionOutcome::Cancelled(CancelledOutcome {
+                    meta: None,
+                }))
         } else {
-            RequestPermissionOutcome::Cancelled
-        };
-        Ok(RequestPermissionResult {
-            outcome,
-            meta: None,
-        })
+            PermissionOutcome::Cancelled(CancelledOutcome { meta: None })
+        }
     }
+}
 
-    async fn read_text_file(
+/// Serves the agent's `fs/*` requests under the session's file-access
+/// policy.
+#[derive(Debug)]
+pub(crate) struct SubFs {
+    /// Session working directory; fs paths must stay under it under
+    /// [`FileAccess::Cwd`].
+    cwd: PathBuf,
+    /// What the `fs/*` methods serve.
+    file_access: FileAccess,
+}
+
+impl SubFs {
+    /// Construct the fs hook for a subagent being launched.
+    #[must_use]
+    pub(crate) const fn new(cwd: PathBuf, file_access: FileAccess) -> Self {
+        Self { cwd, file_access }
+    }
+}
+
+impl FsHandler for SubFs {
+    async fn read(
         &self,
-        params: ReadTextFileParams,
-    ) -> Result<ReadTextFileResult, JsonRpcError> {
+        params: v1::ReadTextFileParams,
+    ) -> Result<v1::ReadTextFileResult, RpcError> {
         let path = self.resolve("fs/read_text_file", &params.path)?;
         let text = tokio::fs::read_to_string(&path).await.map_err(|source| {
-            JsonRpcError::internal_error(format!("cannot read {}: {source}", path.display()))
+            RpcError::internal_error(format!("cannot read {}: {source}", path.display()))
         })?;
         let content = slice_lines(&text, params.line, params.limit);
-        Ok(ReadTextFileResult {
+        Ok(v1::ReadTextFileResult {
             content,
             meta: None,
         })
     }
 
-    async fn write_text_file(
+    async fn write(
         &self,
-        params: WriteTextFileParams,
-    ) -> Result<WriteTextFileResult, JsonRpcError> {
+        params: v1::WriteTextFileParams,
+    ) -> Result<v1::WriteTextFileResult, RpcError> {
         let path = self.resolve("fs/write_text_file", &params.path)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|source| {
-                JsonRpcError::internal_error(format!(
-                    "cannot create {}: {source}",
-                    parent.display()
-                ))
+                RpcError::internal_error(format!("cannot create {}: {source}", parent.display()))
             })?;
         }
         tokio::fs::write(&path, &params.content)
             .await
             .map_err(|source| {
-                JsonRpcError::internal_error(format!("cannot write {}: {source}", path.display()))
+                RpcError::internal_error(format!("cannot write {}: {source}", path.display()))
             })?;
-        Ok(WriteTextFileResult { meta: None })
-    }
-
-    async fn terminal_create(
-        &self,
-        params: TerminalCreateParams,
-    ) -> Result<TerminalCreateResult, JsonRpcError> {
-        let (reply, answer) = oneshot::channel();
-        self.services
-            .send(ServiceCall::Terminal { params, reply })
-            .map_err(|_| JsonRpcError::internal_error("the session's services have shut down"))?;
-        answer.await.map_err(|_| {
-            JsonRpcError::internal_error("the session's services dropped the terminal request")
-        })?
-    }
-
-    async fn terminal_output(
-        &self,
-        params: TerminalOutputParams,
-    ) -> Result<TerminalOutputResult, JsonRpcError> {
-        Ok(self.terminal(&params.terminal_id).await?.output())
-    }
-
-    async fn terminal_wait_for_exit(
-        &self,
-        params: TerminalWaitForExitParams,
-    ) -> Result<TerminalExitStatus, JsonRpcError> {
-        self.terminal(&params.terminal_id)
-            .await?
-            .wait_for_exit()
-            .await
-    }
-
-    async fn terminal_kill(
-        &self,
-        params: TerminalKillParams,
-    ) -> Result<TerminalKillResult, JsonRpcError> {
-        self.terminal(&params.terminal_id).await?.kill();
-        Ok(TerminalKillResult { meta: None })
-    }
-
-    async fn terminal_release(
-        &self,
-        params: TerminalReleaseParams,
-    ) -> Result<TerminalReleaseResult, JsonRpcError> {
-        // Kill explicitly, not by drop: orphaned grandchildren hold the
-        // output pipes open, which keeps pump-held `Arc`s — and therefore
-        // the terminal — alive until they exit.
-        let terminal = self.rt.terminals.lock().await.remove(&params.terminal_id);
-        if let Some(terminal) = terminal {
-            terminal.kill();
-        }
-        Ok(TerminalReleaseResult { meta: None })
+        Ok(v1::WriteTextFileResult { meta: None })
     }
 }
 
-/// Record a `tool_call` update: insert the call's summary with the
-/// sighting as `started_at`, and `ended_at` when it arrives already
-/// terminal.
-pub(crate) fn note_tool_call(turn: &mut Turn, call: ToolCall) {
-    let seen = jiff::Timestamp::now();
-    turn.latest_tool_call = Some(call.tool_call_id.clone());
-    turn.tool_calls.insert(
-        call.tool_call_id.clone(),
-        ToolCallSummary {
-            id: call.tool_call_id,
-            title: call.title,
-            kind: call.kind,
-            status: call.status,
-            locations: call.locations,
-            started_at: seen,
-            ended_at: call.status.filter(|s| terminal_status(*s)).map(|_| seen),
-        },
-    );
-}
-
-/// Record a `tool_call_update`: refresh the call's summary, stamping
-/// `ended_at` on the first terminal status — later updates keep the
-/// original end.
-pub(crate) fn note_tool_call_update(turn: &mut Turn, update: ToolCallUpdate) {
-    let seen = jiff::Timestamp::now();
-    turn.latest_tool_call = Some(update.tool_call_id.clone());
-    let entry = turn
-        .tool_calls
-        .entry(update.tool_call_id.clone())
-        .or_insert_with(|| ToolCallSummary {
-            id: update.tool_call_id.clone(),
-            title: String::new(),
-            kind: None,
-            status: None,
-            locations: Vec::new(),
-            started_at: seen,
-            ended_at: None,
-        });
-    if let Some(status) = update.status {
-        entry.status = Some(status);
-        if terminal_status(status) && entry.ended_at.is_none() {
-            entry.ended_at = Some(seen);
-        }
-    }
-    if let Some(title) = update.title {
-        entry.title = title;
-    }
-    if let Some(kind) = update.kind {
-        entry.kind = Some(kind);
-    }
-    if let Some(locations) = update.locations {
-        entry.locations = locations;
-    }
-}
-
-impl SubagentHandler {
-    /// Look up a terminal by id.
-    async fn terminal(&self, id: &str) -> Result<Arc<Terminal>, JsonRpcError> {
-        self.rt
-            .terminals
-            .lock()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| JsonRpcError::invalid_params(format!("unknown terminal '{id}'")))
-    }
-
+impl SubFs {
     /// Resolve the path of a `method` request against the session cwd and
     /// enforce the file access: every request is refused when it is off,
     /// and one outside the cwd when it is confined there. Symlinks are
     /// resolved when the path (or its parent) exists.
-    fn resolve(&self, method: &str, path: &Path) -> Result<PathBuf, JsonRpcError> {
+    fn resolve(&self, method: &str, path: &Path) -> Result<PathBuf, RpcError> {
         if self.file_access == FileAccess::Off {
-            return Err(JsonRpcError::method_not_found(method));
+            return Err(RpcError::method_not_found(method));
         }
         let candidate = if path.is_absolute() {
             path.to_path_buf()
@@ -352,13 +150,266 @@ impl SubagentHandler {
         };
         let normalized = canonicalize_lenient(&candidate);
         if self.file_access == FileAccess::Cwd && !normalized.starts_with(&self.cwd) {
-            return Err(JsonRpcError::internal_error(format!(
+            return Err(RpcError::internal_error(format!(
                 "{} is outside the session cwd {}",
                 path.display(),
                 self.cwd.display()
             )));
         }
         Ok(normalized)
+    }
+}
+
+/// Serves the agent's `terminal/*` requests through the host's executor.
+#[derive(Debug)]
+pub(crate) struct SubTerminals {
+    /// Shared mutable state (the terminals registry).
+    rt: Arc<SubRuntime>,
+    /// The host's services, which start terminal commands.
+    services: ServiceCalls,
+}
+
+impl SubTerminals {
+    /// Construct the terminal hook for a subagent being launched.
+    #[must_use]
+    pub(crate) const fn new(rt: Arc<SubRuntime>, services: ServiceCalls) -> Self {
+        Self { rt, services }
+    }
+}
+
+impl V1Terminal for SubTerminals {
+    async fn create(
+        &self,
+        params: v1::TerminalCreateParams,
+    ) -> Result<v1::TerminalCreateResult, RpcError> {
+        let (reply, answer) = oneshot::channel();
+        self.services
+            .send(ServiceCall::Terminal { params, reply })
+            .map_err(|_| RpcError::internal_error("the session's services have shut down"))?;
+        answer.await.map_err(|_| {
+            RpcError::internal_error("the session's services dropped the terminal request")
+        })?
+    }
+
+    async fn output(
+        &self,
+        params: v1::TerminalOutputParams,
+    ) -> Result<v1::TerminalOutputResult, RpcError> {
+        Ok(self.terminal(&params.terminal_id).await?.output())
+    }
+
+    async fn wait_for_exit(
+        &self,
+        params: v1::TerminalWaitForExitParams,
+    ) -> Result<v1::TerminalExitStatus, RpcError> {
+        self.terminal(&params.terminal_id)
+            .await?
+            .wait_for_exit()
+            .await
+    }
+
+    async fn kill(
+        &self,
+        params: v1::TerminalKillParams,
+    ) -> Result<v1::TerminalKillResult, RpcError> {
+        self.terminal(&params.terminal_id).await?.kill();
+        Ok(v1::TerminalKillResult { meta: None })
+    }
+
+    async fn release(
+        &self,
+        params: v1::TerminalReleaseParams,
+    ) -> Result<v1::TerminalReleaseResult, RpcError> {
+        // Kill explicitly, not by drop: orphaned grandchildren hold the
+        // output pipes open, which keeps pump-held `Arc`s — and therefore
+        // the terminal — alive until they exit.
+        let terminal = self.rt.terminals.lock().await.remove(&params.terminal_id);
+        if let Some(terminal) = terminal {
+            terminal.kill();
+        }
+        Ok(v1::TerminalReleaseResult { meta: None })
+    }
+}
+
+impl SubTerminals {
+    /// Look up a terminal by id.
+    async fn terminal(&self, id: &str) -> Result<Arc<Terminal>, RpcError> {
+        self.rt
+            .terminals
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| RpcError::invalid_params(format!("unknown terminal '{id}'")))
+    }
+}
+
+/// Whether an event signals agent turn activity — the materialization
+/// triggers for a steered prompt's turn. Session-state events (config,
+/// commands, info, usage, replay) do not count: they arrive outside
+/// turns too.
+const fn turn_activity(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::MessageDelta { .. }
+            | SessionEvent::ToolCall(_)
+            | SessionEvent::Plan { .. }
+            | SessionEvent::TerminalUpsert(_)
+            | SessionEvent::TerminalOutput { .. }
+            | SessionEvent::Subagent(_)
+    )
+}
+
+/// Drive a session's event stream into the turn state: materialize a
+/// `current` turn when an untracked update arrives (a steered prompt
+/// running as a turn of its own), then apply the event's data.
+///
+/// Runs until the event stream ends (connection or session gone).
+pub(crate) async fn drive_events(session: ClientSession, rt: Arc<SubRuntime>) {
+    use futures_lite::StreamExt;
+    let mut events = session.subscribe();
+    // This stream's own position: the last `TurnEnded` it consumed. Only
+    // events after it can open a steered turn — the tee's wire boundary
+    // (`inner.turn_ended`) races ahead, so `drive_events` tracks its own.
+    let mut seen_end: Option<u64> = None;
+    while let Some(event) = events.next().await {
+        if turn_activity(&event) {
+            // Untracked traffic means the agent is running a turn we did
+            // not open: a steered prompt that landed after its target
+            // ended. Only traffic that postdates that turn's own end can
+            // open one — the broadcast reports `TurnEnded` before a next
+            // turn's updates arrive, so an event still queued behind it
+            // (a v1-synthesized state event, say) belongs to the settled
+            // turn. While the settle holds `current`, the steered turn
+            // stages into `next_turn`.
+            let mut inner = rt.inner.lock().expect("inner poisoned");
+            let post_end = inner
+                .current
+                .as_ref()
+                .is_some_and(|turn| seen_end == Some(turn.n))
+                || (inner.current.is_none()
+                    && seen_end.is_some()
+                    && seen_end == inner.turns.last().map(|turn| turn.n));
+            if post_end && let Some(owner) = oldest_steer(&inner) {
+                let staged = Turn {
+                    n: inner.turn_offset
+                        + inner.turns.len() as u64
+                        + 1
+                        + u64::from(inner.current.is_some()),
+                    started_at: Some(jiff::Timestamp::now()),
+                    ..Turn::default()
+                };
+                inner.pending_turn_start = None;
+                inner.steer_owner = Some(owner);
+                if inner.current.is_none() {
+                    inner.current = Some(staged);
+                    inner.status = Status::Running;
+                } else if inner.next_turn.is_none() {
+                    inner.next_turn = Some(staged);
+                }
+                drop(inner);
+                rt.notify.notify_waiters();
+            } else {
+                drop(inner);
+            }
+        }
+        let mut inner = rt.inner.lock().expect("inner poisoned");
+        // Mode and config updates are agent-reported session state, not
+        // turn data: they apply even when no turn is open (e.g. during the
+        // launch handshake, where `set_mode` is answered by an update).
+        match &event {
+            SessionEvent::ModeChanged(mode) => {
+                inner.current_mode = Some(mode.clone());
+            }
+            SessionEvent::ConfigChanged => {
+                inner
+                    .config_options
+                    .clone_from(&session.state().config_options);
+            }
+            // The broadcast's own end marker: untracked traffic after it
+            // belongs to a next turn, traffic queued behind it still to
+            // the settled one — the steer-turn materialization gates on
+            // it, not just on `current` being free.
+            SessionEvent::TurnEnded { .. } => {
+                seen_end = inner
+                    .current
+                    .as_ref()
+                    .or_else(|| inner.turns.last())
+                    .map(|turn| turn.n);
+            }
+            _ => {}
+        }
+        // A chunk arriving just behind the turn's end still belongs to
+        // that turn — and one staged past it (`next_turn`) belongs to the
+        // steered turn it opens: `finish_turn` may clear `current` before
+        // this task drains events that preceded the end on the wire.
+        let Inner {
+            next_turn,
+            current,
+            turns,
+            ..
+        } = &mut *inner;
+        let turn = next_turn
+            .as_mut()
+            .or(current.as_mut())
+            .or_else(|| turns.last_mut());
+        let Some(turn) = turn else {
+            continue;
+        };
+        match event {
+            SessionEvent::MessageDelta {
+                kind: MessageKind::Agent,
+                text: Some(text),
+                ..
+            } => turn.reply.push_str(&text),
+            SessionEvent::ToolCall(call) => note_tool_call(turn, call),
+            SessionEvent::Plan { plan, .. } => {
+                let Plan::Items(items) = plan;
+                turn.plan = items.entries;
+            }
+            SessionEvent::ModeChanged(mode) => {
+                turn.mode = Some(mode.as_str().to_string());
+            }
+            _ => {}
+        }
+        drop(inner);
+    }
+}
+
+/// Record a `tool_call_update`/`tool_call_content_chunk` event: upsert
+/// the call's summary from the materialized snapshot, stamping
+/// `ended_at` when a terminal status first shows.
+pub(crate) fn note_tool_call(turn: &mut Turn, call: ToolCall) {
+    let seen = jiff::Timestamp::now();
+    let id = call.tool_call_id.as_str().to_string();
+    turn.latest_tool_call = Some(id.clone());
+    let status = call.status.and_then(Open::into_known);
+    let entry = turn
+        .tool_calls
+        .entry(id.clone())
+        .or_insert_with(|| ToolCallSummary {
+            id,
+            title: String::new(),
+            kind: None,
+            status: None,
+            locations: Vec::new(),
+            started_at: seen,
+            ended_at: None,
+        });
+    if let Some(status) = status {
+        entry.status = Some(status);
+        if terminal_status(status) && entry.ended_at.is_none() {
+            entry.ended_at = Some(seen);
+        }
+    }
+    if !call.title.is_empty() {
+        entry.title = call.title;
+    }
+    if let Some(kind) = call.kind {
+        entry.kind = kind.into_known();
+    }
+    if !call.locations.is_empty() {
+        entry.locations = call.locations;
     }
 }
 
@@ -401,4 +452,19 @@ fn slice_lines(text: &str, line: Option<u32>, limit: Option<u32>) -> String {
         None => &lines,
     };
     window.join("\n")
+}
+
+/// The option id a `selected` permission outcome reports.
+#[must_use]
+pub(crate) fn selected(option_id: &str) -> PermissionOutcome {
+    PermissionOutcome::Selected(SelectedOutcome {
+        option_id: option_id.into(),
+        meta: None,
+    })
+}
+
+/// The `cancelled` permission outcome.
+#[must_use]
+pub(crate) const fn cancelled() -> PermissionOutcome {
+    PermissionOutcome::Cancelled(CancelledOutcome { meta: None })
 }

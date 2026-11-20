@@ -24,13 +24,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aither_acp::{InitializeResult, StopReason};
+use aither_acp::StopReason;
+use aither_acp::domain::InitResult;
 use tokio::task::JoinHandle;
 
 use crate::config::{AgentConfig, Config, ConfigSource, ConfigValue, PermissionPolicy};
 use crate::error::{Error, Result};
 use crate::executor::{Executor, HostExecutor};
-use crate::handler::SubagentHandler;
+
 use crate::permission::{PermissionHandler, PolicyPermissions};
 use crate::services::Services;
 use crate::state::{AppState, Launch, Subagent, connect, launch, new_runtime, start_turn};
@@ -367,7 +368,7 @@ impl WaitReporter for Silent {
 ///
 /// Returns [`Error::SpawnFailed`] when the process cannot start and
 /// [`Error::Agent`] when it does not answer `initialize`.
-pub fn probe(agent: &AgentConfig) -> impl Future<Output = Result<InitializeResult>> + Send {
+pub fn probe(agent: &AgentConfig) -> impl Future<Output = Result<InitResult>> + Send {
     probe_with(
         agent,
         Services::<HostExecutor, PolicyPermissions>::default(),
@@ -383,7 +384,7 @@ pub fn probe(agent: &AgentConfig) -> impl Future<Output = Result<InitializeResul
 pub fn probe_with<E: Executor, P: PermissionHandler>(
     agent: &AgentConfig,
     services: Services<E, P>,
-) -> impl Future<Output = Result<InitializeResult>> + Send {
+) -> impl Future<Output = Result<InitResult>> + Send {
     let agent = agent.clone();
     async move {
         let cwd = std::env::current_dir()
@@ -398,12 +399,17 @@ pub fn probe_with<E: Executor, P: PermissionHandler>(
             conn: Some(conn),
             pump,
         };
-        let answer = client.initialize().await.map_err(|source| Error::Agent {
-            agent: agent.command.clone(),
-            source,
-        });
+        // `connect` already ran `initialize`; rebuild its result from the
+        // client's getters (`init.meta` is not exposed upstream).
+        let answer = InitResult {
+            protocol_version: client.protocol_version(),
+            capabilities: client.agent_capabilities().clone(),
+            info: client.agent_info().cloned(),
+            auth_methods: client.auth_methods().to_vec(),
+            meta: None,
+        };
         process.finish().await;
-        answer
+        Ok(answer)
     }
 }
 
@@ -411,7 +417,7 @@ pub fn probe_with<E: Executor, P: PermissionHandler>(
 /// future is dropped mid-flight.
 struct Probed {
     rt: Arc<crate::state::SubRuntime>,
-    client: aither_acp::AcpClient<SubagentHandler>,
+    client: aither_acp::Client,
     conn: Option<JoinHandle<()>>,
     pump: JoinHandle<()>,
 }
@@ -421,13 +427,18 @@ impl Probed {
     fn kill(&self) {
         self.rt.closing.set(crate::state::Closing::Ending);
         self.rt.kill_process_tree();
-        self.client.clone().close();
         self.pump.abort();
+    }
+
+    /// Kill, close the client, then wait for the connection task to end.
+    async fn close(&self) {
+        self.kill();
+        self.client.close().await;
     }
 
     /// Kill, then wait for the connection task to end.
     async fn finish(&mut self) {
-        self.kill();
+        self.close().await;
         if let Some(conn) = self.conn.take() {
             let _ = conn.await;
         }

@@ -11,9 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use aither_acp::{
-    ConfigOption, ConfigOptionValue, ConfigSelectOptions, RequestPermissionOutcome, StopReason,
-};
+use aither_acp::domain::{ConfigKind, ConfigOption, SelectOptions, StopReason};
 use aither_core::llm::tool::{Progress, Tool, ToolContext, ToolResult, Tools};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -538,10 +536,8 @@ fn pending_view(perm: &crate::state::PendingPermission) -> Value {
     json!({
         "request_id": perm.request_id,
         "tool_call": {
-            "id": perm.tool_call.tool_call_id,
-            "title": perm.tool_call.title,
-            "kind": perm.tool_call.kind,
-            "status": perm.tool_call.status,
+            "id": perm.tool_call_id,
+            "title": perm.title,
         },
         "options": perm.options.iter().map(|o| json!({
             "option_id": o.option_id,
@@ -770,7 +766,7 @@ fn wait_snapshot(sub: &Subagent, awaited: Option<u64>) -> WaitSnapshot {
         pending_request: inner
             .pending
             .first()
-            .map(|perm| (perm.request_id.clone(), perm.tool_call.title.clone())),
+            .map(|perm| (perm.request_id.clone(), perm.title.clone())),
         turn_n,
         queued: inner.queue.len(),
         elapsed: turn
@@ -1900,7 +1896,7 @@ pub(crate) async fn cancel_turn(sub: &Subagent) -> Result<()> {
             return Err(Error::NotRunning(sub.session_id.clone()));
         }
         for pending in inner.pending.drain(..) {
-            let _ = pending.answer.send(RequestPermissionOutcome::Cancelled);
+            let _ = pending.answer.send(crate::handler::cancelled());
         }
         // A turn whose prompt is not on the wire yet would see the cancel
         // first and ignore it: `begin_turn` sends it behind the prompt.
@@ -1920,13 +1916,10 @@ pub(crate) async fn cancel_turn(sub: &Subagent) -> Result<()> {
     if deferred {
         return Ok(());
     }
-    sub.client
-        .cancel(sub.session_id.as_str())
-        .await
-        .map_err(|source| Error::Agent {
-            agent: sub.session_id.clone(),
-            source,
-        })
+    sub.session.cancel().await.map_err(|source| Error::Agent {
+        agent: sub.session_id.clone(),
+        source,
+    })
 }
 
 /// Answer a permission request queued by the `ask` policy.
@@ -1988,7 +1981,7 @@ impl PermitTool {
             if pending
                 .options
                 .iter()
-                .all(|o| o.option_id != args.option_id)
+                .all(|o| o.option_id.as_str() != args.option_id)
             {
                 return Err(Error::BadOption {
                     request: args.request_id.clone(),
@@ -1996,15 +1989,15 @@ impl PermitTool {
                     offered: pending
                         .options
                         .iter()
-                        .map(|o| o.option_id.clone())
+                        .map(|o| o.option_id.as_str().to_string())
                         .collect(),
                 });
             }
             inner.pending.remove(position)
         };
-        let _ = pending.answer.send(RequestPermissionOutcome::Selected {
-            option_id: args.option_id.clone(),
-        });
+        let _ = pending
+            .answer
+            .send(crate::handler::selected(&args.option_id));
         // The handler recomputes this too once its await resumes, but callers
         // read the state as soon as `permit` returns.
         {
@@ -2451,14 +2444,18 @@ impl AgentsTool {
                             .agent_info
                             .as_ref()
                             .map(|info| serde_json::to_value(info).unwrap_or_default()),
-                        inner.modes.as_ref().map(|modes| {
-                            json!({
-                                "current": modes.current_mode_id,
-                                "available": modes.available_modes.iter().map(|m| json!({
-                                    "id": m.id, "name": m.name,
-                                })).collect::<Vec<_>>(),
-                            })
-                        }),
+                        inner
+                            .config_options
+                            .iter()
+                            .find(|o| o.is_mode())
+                            .map(|option| {
+                                json!({
+                                    "current": inner.current_mode,
+                                    "available": crate::state::select_values(option).iter().map(|id| json!({
+                                        "id": id,
+                                    })).collect::<Vec<_>>(),
+                                })
+                            }),
                         inner
                             .config_options
                             .iter()
@@ -2484,24 +2481,27 @@ impl AgentsTool {
 
 /// Compact view of a session `ConfigOption`.
 fn config_option_view(option: &ConfigOption) -> Value {
-    let current = option.current_value.as_ref().map(|value| match value {
-        ConfigOptionValue::Selected(id) => json!(id),
-        ConfigOptionValue::Toggle(flag) => json!(flag),
-    });
-    let options = option.options.as_ref().map(|options| match options {
-        ConfigSelectOptions::Flat(flat) => {
-            json!(flat.iter().map(|o| json!({"value": o.value, "name": o.name})).collect::<Vec<_>>())
+    let (kind, current, options) = match &option.kind {
+        ConfigKind::Select(select) => {
+            let options = match &select.options {
+                SelectOptions::Ungrouped(flat) => {
+                    json!(flat.iter().map(|o| json!({"value": o.value, "name": o.name})).collect::<Vec<_>>())
+                }
+                SelectOptions::Grouped(groups) => json!(groups.iter().map(|g| json!({
+                    "group": g.group_id,
+                    "name": g.name,
+                    "options": g.options.iter().map(|o| json!({"value": o.value, "name": o.name})).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>()),
+            };
+            ("select", json!(select.current_value), options)
         }
-        ConfigSelectOptions::Grouped(groups) => json!(groups.iter().map(|g| json!({
-            "group": g.group,
-            "name": g.name,
-            "options": g.options.iter().map(|o| json!({"value": o.value, "name": o.name})).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>()),
-    });
+        ConfigKind::Boolean(flag) => ("boolean", json!(flag.current_value), Value::Null),
+        ConfigKind::Custom(..) | ConfigKind::Unknown(..) => ("unknown", Value::Null, Value::Null),
+    };
     json!({
-        "id": option.id,
+        "id": option.config_id,
         "name": option.name,
-        "type": option.kind,
+        "type": kind,
         "category": option.category,
         "current_value": current,
         "options": options,

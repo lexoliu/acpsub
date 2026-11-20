@@ -258,9 +258,15 @@ async fn probe_tells_acp_from_other_commands() {
         return;
     }
     let init = probe(&fake_agent_config()).await.expect("fake speaks ACP");
-    let info = init.agent_info.expect("agent info");
+    let info = init.info.expect("agent info");
     assert_eq!(info.name, "fake-agent-py");
-    assert!(init.agent_capabilities.load_session);
+    let load = init
+        .capabilities
+        .session
+        .as_ref()
+        .and_then(|caps| caps.extra.get("loadSession"))
+        .is_some_and(|v| v.is_object() || v.as_bool().unwrap_or(false));
+    assert!(load, "fake agent advertises loadSession");
 
     // Exits at once.
     let silent = AgentConfig::new("true");

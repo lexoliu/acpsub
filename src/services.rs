@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aither_acp::{RequestPermissionOutcome, TerminalCreateParams, TerminalCreateResult};
-use aither_mcp::protocol::JsonRpcError;
+use aither_acp::PermissionOutcome;
+use aither_acp::rpc::RpcError;
+use aither_acp::wire::v1::{TerminalCreateParams, TerminalCreateResult};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::executor::{Executor, HostExecutor};
@@ -50,12 +51,12 @@ pub(crate) enum ServiceCall {
     /// `terminal/create`.
     Terminal {
         params: TerminalCreateParams,
-        reply: oneshot::Sender<Result<TerminalCreateResult, JsonRpcError>>,
+        reply: oneshot::Sender<Result<TerminalCreateResult, RpcError>>,
     },
     /// `session/request_permission`.
     Permission {
         request: PermissionRequest,
-        reply: oneshot::Sender<RequestPermissionOutcome>,
+        reply: oneshot::Sender<PermissionOutcome>,
     },
 }
 

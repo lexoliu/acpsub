@@ -1,24 +1,69 @@
 //! The ACP transport over an executor-started agent process.
 
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::process::ExitStatus;
+use std::sync::{Arc, Mutex};
 
-use aither_mcp::protocol::{
-    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError,
-};
-use aither_mcp::transport::{BidirectionalTransport, StreamTransport, Transport};
-use futures_lite::io::{AsyncRead, AsyncWrite, BufReader};
+use aither_acp::Lines;
+use aither_acp::rpc::{Inbound, Outbound, RequestId, RpcError, Transport};
+use futures_lite::io::{AsyncRead, AsyncWrite};
+use serde_json::Value;
+use tokio::sync::Notify;
 
 use crate::executor::ProcessHandle;
 
-type Result<T> = std::result::Result<T, McpError>;
+type Result<T> = std::result::Result<T, RpcError>;
 
-/// Newline-delimited JSON-RPC over the agent's stdout and stdin. Closing
-/// it, or asking for the exit status of a process that is still running,
-/// kills the agent's process tree and reaps it.
+/// What the wire tee queues: `session/update` payloads for the
+/// transcript, and the boundary a `session/prompt` response marks — an
+/// update before it belongs to the turn the response ended, one after it
+/// to the turn that follows.
+#[derive(Debug)]
+pub enum TeeItem {
+    /// A `session/update` payload, in wire order.
+    Update(Value),
+    /// A `session/prompt` response passed here.
+    PromptEnd,
+}
+
+/// A queue of `session/update` payloads teed off the wire for the
+/// transcript, plus the signal that wakes the flusher.
+///
+/// The transport pushes under a plain mutex — it cannot await — and the
+/// session drains the queue inside the transcript's write lock, so every
+/// teed update lands ahead of the record a later wire message (the prompt
+/// response's turn end, say) produces.
+#[derive(Debug, Clone)]
+pub struct UpdateTee {
+    /// Teed items, in wire order.
+    pub queue: Arc<Mutex<VecDeque<TeeItem>>>,
+    /// Wakes the flusher task.
+    pub notify: Arc<Notify>,
+}
+
+impl UpdateTee {
+    /// A fresh, empty tee.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
+/// Newline-delimited JSON-RPC over the agent's stdout and stdin, with a
+/// tee on inbound `session/update` notifications for the transcript.
+/// Closing it, or asking for the exit status of a process that is still
+/// running, kills the agent's process tree and reaps it.
 pub struct ProcessTransport<R, W> {
-    stream: StreamTransport<BufReader<R>, W>,
+    lines: Lines<R, W>,
     process: ProcessHandle,
+    tee: Option<UpdateTee>,
+    /// `session/prompt` request ids still unanswered: their responses
+    /// mark turn boundaries in `tee`.
+    prompt_ids: Arc<Mutex<HashSet<RequestId>>>,
 }
 
 impl<R, W> fmt::Debug for ProcessTransport<R, W> {
@@ -30,11 +75,25 @@ impl<R, W> fmt::Debug for ProcessTransport<R, W> {
 }
 
 impl<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin> ProcessTransport<R, W> {
-    /// A transport reading `stdout` and writing `stdin` of `process`.
-    pub fn new(stdout: R, stdin: W, process: ProcessHandle) -> Self {
+    /// A transport reading `stdout` and writing `stdin` of `process`,
+    /// teeing every `session/update` to `tee`.
+    pub fn new(stdout: R, stdin: W, process: ProcessHandle, tee: UpdateTee) -> Self {
         Self {
-            stream: StreamTransport::new(BufReader::new(stdout), stdin),
+            lines: Lines::new(stdout, stdin),
             process,
+            tee: Some(tee),
+            prompt_ids: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Push a teed item and wake the flusher.
+    fn tee_push(&self, item: TeeItem) {
+        if let Some(tee) = &self.tee {
+            tee.queue
+                .lock()
+                .expect("tee queue poisoned")
+                .push_back(item);
+            tee.notify.notify_one();
         }
     }
 }
@@ -42,19 +101,52 @@ impl<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin> ProcessTransport
 impl<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin> Transport
     for ProcessTransport<R, W>
 {
-    fn request(
-        &mut self,
-        req: JsonRpcRequest,
-    ) -> impl Future<Output = Result<JsonRpcResponse>> + Send {
-        self.stream.request(req)
+    async fn recv(&mut self) -> Result<Option<Inbound>> {
+        let inbound = self.lines.recv().await?;
+        match &inbound {
+            Some(Inbound::Notification(notification))
+                if notification.method == "session/update" =>
+            {
+                if let Some(update) = notification
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("update"))
+                {
+                    self.tee_push(TeeItem::Update(update.clone()));
+                }
+            }
+            Some(Inbound::Response(response)) => {
+                let boundary = response.id.as_ref().is_some_and(|id| {
+                    self.prompt_ids
+                        .lock()
+                        .expect("prompt ids poisoned")
+                        .remove(id)
+                });
+                if boundary {
+                    self.tee_push(TeeItem::PromptEnd);
+                }
+            }
+            _ => {}
+        }
+        Ok(inbound)
     }
 
-    fn notify(&mut self, notif: JsonRpcNotification) -> impl Future<Output = Result<()>> + Send {
-        self.stream.notify(notif)
+    fn send(&mut self, msg: &Outbound) -> impl Future<Output = Result<()>> + Send {
+        // Track `session/prompt` request ids so their responses mark the
+        // tee's turn boundary — updates after it belong to a next turn.
+        if let Outbound::Request(request) = msg
+            && request.method == "session/prompt"
+        {
+            self.prompt_ids
+                .lock()
+                .expect("prompt ids poisoned")
+                .insert(request.id.clone());
+        }
+        self.lines.send(msg)
     }
 
     async fn close(&mut self) -> Result<()> {
-        let closed = self.stream.close().await;
+        let closed = self.lines.close().await;
         self.process.kill();
         let _ = self.process.wait().await;
         closed
@@ -69,21 +161,5 @@ impl<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin> Transport
             self.process.kill();
             self.process.wait().await.ok()
         }
-    }
-}
-
-impl<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin> BidirectionalTransport
-    for ProcessTransport<R, W>
-{
-    fn recv(&mut self) -> impl Future<Output = Result<Option<JsonRpcMessage>>> + Send {
-        self.stream.recv()
-    }
-
-    fn respond(&mut self, response: JsonRpcResponse) -> impl Future<Output = Result<()>> + Send {
-        self.stream.respond(response)
-    }
-
-    fn send_request(&mut self, req: JsonRpcRequest) -> impl Future<Output = Result<()>> + Send {
-        self.stream.send_request(req)
     }
 }

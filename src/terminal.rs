@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aither_acp::{
+use aither_acp::rpc::RpcError;
+use aither_acp::wire::v1::{
     TerminalCreateParams, TerminalCreateResult, TerminalExitStatus, TerminalOutputResult,
 };
-use aither_mcp::protocol::JsonRpcError;
 use futures_lite::io::AsyncReadExt;
 
 use futures_lite::io::AsyncRead;
@@ -102,7 +102,7 @@ impl Terminal {
     /// # Panics
     ///
     /// Panics if the status mutex is poisoned.
-    pub async fn wait_for_exit(&self) -> Result<TerminalExitStatus, JsonRpcError> {
+    pub async fn wait_for_exit(&self) -> Result<TerminalExitStatus, RpcError> {
         let status = self
             .status
             .lock()
@@ -112,7 +112,7 @@ impl Terminal {
             return Ok(status);
         }
         let status = exit_status(self.control.wait().await.map_err(|source| {
-            JsonRpcError::internal_error(format!("cannot wait for terminal: {source}"))
+            RpcError::internal_error(format!("cannot wait for terminal: {source}"))
         })?);
         *self.status.lock().expect("terminal status poisoned") = Some(status.clone());
         Ok(status)
@@ -175,7 +175,7 @@ pub async fn create<E: Executor>(
     params: TerminalCreateParams,
     cwd: &std::path::Path,
     executor: &E,
-) -> Result<TerminalCreateResult, JsonRpcError> {
+) -> Result<TerminalCreateResult, RpcError> {
     // With no `args`, `command` is a shell command line (agents like `devin
     // acp` send e.g. "cd /repo && cargo test"), so run it through a shell.
     // With `args`, `command` is the executable per the ACP wire contract.
@@ -204,7 +204,7 @@ pub async fn create<E: Executor>(
         })
         .await
         .map_err(|source| {
-            JsonRpcError::internal_error(format!("cannot spawn '{}': {source}", params.command))
+            RpcError::internal_error(format!("cannot spawn '{}': {source}", params.command))
         })?;
     let terminal = Arc::new(Terminal {
         control: ProcessHandle::supervise(control),
