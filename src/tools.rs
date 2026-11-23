@@ -71,7 +71,7 @@ const EXPECT_LIMIT: u64 = 1800;
 ///
 /// Returns an error if a tool fails to register (duplicate name or empty
 /// description — both would be a bug in this crate).
-pub fn build_tools(state: Arc<AppState>) -> aither_core::Result<Tools> {
+pub fn build_tools(state: Arc<AppState>) -> Result<Tools> {
     build_tools_with_progress_interval(state, PROGRESS_INTERVAL)
 }
 
@@ -86,7 +86,7 @@ pub fn build_tools(state: Arc<AppState>) -> aither_core::Result<Tools> {
 pub fn build_tools_with_progress_interval(
     state: Arc<AppState>,
     progress_interval: Duration,
-) -> aither_core::Result<Tools> {
+) -> Result<Tools> {
     let mut tools = Tools::new();
     tools.register(SpawnTool(state.clone()))?;
     tools.register(AdoptTool(state.clone()))?;
@@ -118,7 +118,7 @@ pub fn build_tools_with_progress_interval(
 /// # Errors
 ///
 /// Returns an error if a tool fails to register.
-pub fn register_daemon_tools(tools: &mut Tools, state: Arc<AppState>) -> aither_core::Result<()> {
+pub fn register_daemon_tools(tools: &mut Tools, state: Arc<AppState>) -> Result<()> {
     tools.register(ResumedTool(state))?;
     Ok(())
 }
@@ -842,8 +842,9 @@ impl Tool for SpawnTool {
     }
     type Arguments = SpawnArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: SpawnArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: SpawnArgs, _cx: ToolContext) -> Result<ToolResult> {
         let spec = SessionSpec {
             agent: args.agent,
             cwd: args.cwd,
@@ -907,8 +908,9 @@ impl Tool for AdoptTool {
     }
     type Arguments = AdoptArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: AdoptArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: AdoptArgs, _cx: ToolContext) -> Result<ToolResult> {
         // A shipped session lives on in the next generation: adopting it
         // here would run it twice.
         self.0.not_shipped(&args.session_id)?;
@@ -926,8 +928,7 @@ impl Tool for AdoptTool {
                 session_id: args.session_id,
                 registered: entry.agent.clone(),
                 requested: requested.clone(),
-            }
-            .into());
+            });
         }
         let requested = args
             .agent
@@ -1032,8 +1033,9 @@ impl Tool for SendTool {
     }
     type Arguments = SendArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: SendArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: SendArgs, _cx: ToolContext) -> Result<ToolResult> {
         let sub = self.0.get(&args.session_id)?;
         // A limited quota scope refuses the prompt: it would burn a
         // request that is bound to fail, and the caller decides what to do.
@@ -1069,8 +1071,7 @@ impl Tool for SendTool {
                                 return Err(Error::NotPromptable {
                                     session_id: args.session_id.clone(),
                                     status: Closing::Ending.name().to_string(),
-                                }
-                                .into());
+                                });
                             }
                             None if prompt_slot_free(&inner) && inner.queue.is_empty() => {
                                 Action::Fresh
@@ -1079,8 +1080,7 @@ impl Tool for SendTool {
                                 return Err(Error::NotPromptable {
                                     session_id: args.session_id.clone(),
                                     status: inner.status.name().to_string(),
-                                }
-                                .into());
+                                });
                             }
                             None => {
                                 inner.queue.push_back(args.prompt.clone());
@@ -1091,7 +1091,7 @@ impl Tool for SendTool {
                     match action {
                         Action::HoldHandoff => {
                             if !wait_out_handoff(&self.0, &sub).await {
-                                return Err(Error::HandedOff(args.session_id.clone()).into());
+                                return Err(Error::HandedOff(args.session_id.clone()));
                             }
                         }
                         Action::Queued(position) => {
@@ -1110,7 +1110,7 @@ impl Tool for SendTool {
                             match start_turn(self.0.clone(), &sub, args.prompt.clone()).await {
                                 Ok(()) => break,
                                 Err(Error::NotPromptable { .. }) => {}
-                                Err(error) => return Err(error.into()),
+                                Err(error) => return Err(error),
                             }
                         }
                     }
@@ -1139,11 +1139,7 @@ impl Tool for SendTool {
 ///
 /// A steer into a running turn returns `submitted` at once: its
 /// resolution is reported by `status`/`wait`, never by this call.
-async fn steer_send(
-    state: &Arc<AppState>,
-    sub: &Arc<Subagent>,
-    args: &SendArgs,
-) -> aither_core::Result<Value> {
+async fn steer_send(state: &Arc<AppState>, sub: &Arc<Subagent>, args: &SendArgs) -> Result<Value> {
     let wire = sub.rt.prompt_send.lock().await;
     let status = {
         let inner = sub.rt.inner.lock().expect("inner poisoned");
@@ -1185,8 +1181,7 @@ async fn steer_send(
             Err(Error::NotPromptable {
                 session_id: args.session_id.clone(),
                 status: status.name().to_string(),
-            }
-            .into())
+            })
         }
     }
 }
@@ -1269,8 +1264,9 @@ impl Tool for WaitTool {
     }
     type Arguments = WaitArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: WaitArgs, mut cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: WaitArgs, mut cx: ToolContext) -> Result<ToolResult> {
         check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let sub = self.state.get(&args.session_id)?;
         let started = Instant::now();
@@ -1351,18 +1347,13 @@ struct ToolReporter<'a> {
 }
 
 impl WaitReporter for ToolReporter<'_> {
-    type Error = aither_core::Error;
+    type Error = Error;
 
     fn interval(&self) -> Option<Duration> {
         Some(self.interval)
     }
 
-    async fn report(
-        &mut self,
-        sub: &Subagent,
-        started: Instant,
-        elapsed: f64,
-    ) -> aither_core::Result<()> {
+    async fn report(&mut self, sub: &Subagent, started: Instant, elapsed: f64) -> Result<()> {
         self.cx
             .report_progress(wait_progress(sub, started, elapsed, self.expect_secs))
             .await?;
@@ -1511,12 +1502,9 @@ impl Tool for WaitAnyTool {
     }
     type Arguments = WaitAnyArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(
-        &self,
-        args: WaitAnyArgs,
-        mut cx: ToolContext,
-    ) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: WaitAnyArgs, mut cx: ToolContext) -> Result<ToolResult> {
         check_expect(&cx, args.expect_secs, args.max_wait_secs, args.long)?;
         let subs = args
             .session_ids
@@ -1628,7 +1616,7 @@ async fn report_longest(
     longest: Option<(f64, usize)>,
     started: Instant,
     expect_secs: u64,
-) -> aither_core::Result<()> {
+) -> Result<()> {
     let Some((elapsed, index)) = longest else {
         return Ok(());
     };
@@ -1662,13 +1650,13 @@ impl Tool for StatusTool {
     }
     type Arguments = StatusArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: StatusArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: StatusArgs, _cx: ToolContext) -> Result<ToolResult> {
         let json = args.json;
         self.status(args)
             .await
             .map(|view| emit(json, view, prose::status))
-            .map_err(Into::into)
     }
 }
 
@@ -1796,12 +1784,12 @@ impl Tool for ResultTool {
     }
     type Arguments = ResultArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: ResultArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: ResultArgs, _cx: ToolContext) -> Result<ToolResult> {
         self.result(&args)
             .await
             .map(|view| emit(args.json, view, prose::result))
-            .map_err(Into::into)
     }
 }
 
@@ -1866,8 +1854,9 @@ impl Tool for CancelTool {
     }
     type Arguments = CancelArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: CancelArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: CancelArgs, _cx: ToolContext) -> Result<ToolResult> {
         let sub = self.0.get(&args.session_id)?;
         cancel_turn(&sub).await?;
         Ok(emit(
@@ -1947,16 +1936,16 @@ impl Tool for PermitTool {
     }
     type Arguments = PermitArgs;
     type Res = ToolResult;
+    type Error = Error;
 
     fn call(
         &self,
         args: PermitArgs,
         _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<ToolResult>> + Send {
+    ) -> impl Future<Output = Result<ToolResult>> + Send {
         std::future::ready(
             self.permit(&args)
-                .map(|view| emit(args.json, view, prose::permit))
-                .map_err(Into::into),
+                .map(|view| emit(args.json, view, prose::permit)),
         )
     }
 }
@@ -2048,8 +2037,9 @@ impl Tool for TranscriptTool {
     }
     type Arguments = TranscriptArgs;
     type Res = String;
+    type Error = Error;
 
-    async fn call(&self, args: TranscriptArgs, _cx: ToolContext) -> aither_core::Result<String> {
+    async fn call(&self, args: TranscriptArgs, _cx: ToolContext) -> Result<String> {
         let path = match self
             .0
             .live
@@ -2163,8 +2153,9 @@ impl Tool for ListTool {
     }
     type Arguments = ListArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: ListArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: ListArgs, _cx: ToolContext) -> Result<ToolResult> {
         Ok(emit(args.json, self.list().await, prose::list))
     }
 }
@@ -2245,8 +2236,9 @@ impl Tool for CloseTool {
     }
     type Arguments = CloseArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: CloseArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: CloseArgs, _cx: ToolContext) -> Result<ToolResult> {
         let closed = close_session(&self.0, &args.session_id).await?;
         let view = match closed {
             Closed::Live => json!({"session_id": args.session_id, "closed": true}),
@@ -2338,8 +2330,9 @@ impl Tool for ForgetTool {
     }
     type Arguments = ForgetArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: ForgetArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: ForgetArgs, _cx: ToolContext) -> Result<ToolResult> {
         // Same in-flight handling as `close`: a `session/load` launch
         // holding the id gets its reservation marked closed and
         // forgotten — `release_reservation` ends the session as it lands
@@ -2366,9 +2359,7 @@ impl Tool for ForgetTool {
                 }),
                 prose::forget,
             )),
-            SessionEnd::Missing if !registered => {
-                Err(Error::UnknownSession(args.session_id).into())
-            }
+            SessionEnd::Missing if !registered => Err(Error::UnknownSession(args.session_id)),
             _ => Ok(emit(
                 args.json,
                 json!({"session_id": args.session_id, "forgotten": true}),
@@ -2395,8 +2386,9 @@ impl Tool for AgentsTool {
     }
     type Arguments = AgentsArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: AgentsArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: AgentsArgs, _cx: ToolContext) -> Result<ToolResult> {
         let view = self.agents().await?;
         Ok(emit(args.json, view, prose::agents))
     }
@@ -2532,12 +2524,13 @@ impl Tool for ResumedTool {
     }
     type Arguments = ResumedArgs;
     type Res = ToolResult;
+    type Error = Error;
 
     fn call(
         &self,
         args: ResumedArgs,
         _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<ToolResult>> + Send {
+    ) -> impl Future<Output = Result<ToolResult>> + Send {
         let mut report = self
             .0
             .resume_report
