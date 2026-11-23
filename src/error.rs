@@ -6,8 +6,8 @@ use thiserror::Error;
 
 /// Errors produced by acpsub operations.
 ///
-/// Tools convert these into `aither_core::Error` at the tool boundary so the
-/// exact cause reaches the orchestrating model as a tool error.
+/// Each tool declares this as its `Tool::Error`, so the exact cause reaches
+/// the orchestrating model as a tool error.
 #[derive(Debug, Error)]
 pub enum Error {
     /// The config file does not exist.
@@ -401,6 +401,25 @@ pub enum Error {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+
+    /// A tool failed registration — an acpsub bug (duplicate name or an
+    /// empty description), not bad input.
+    #[error("cannot register tool: {0}")]
+    ToolRegister(#[from] aither_core::llm::tool::RegisterError),
+
+    /// A progress report was rejected by the call's context.
+    #[error("progress report rejected: {0}")]
+    Progress(#[from] aither_core::llm::tool::ProgressError),
+
+    /// A call kept re-routing between daemon generations through the
+    /// whole dispatch budget.
+    #[error("handover dispatch did not settle: the session keeps moving")]
+    HandoverDidNotSettle,
+
+    /// Encoding an internal generation-protocol report to JSON failed —
+    /// an acpsub bug, the report types serialize infallibly.
+    #[error("cannot encode generation-protocol report: {0}")]
+    ReportEncode(#[from] serde_json::Error),
 }
 
 impl Error {

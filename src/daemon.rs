@@ -43,7 +43,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use aither_core::llm::tool::{Progress, ProgressSink, Tool, ToolContext, ToolResult, Tools};
+use aither_core::llm::tool::{
+    Progress, ProgressSink, Tool, ToolContext, ToolDispatchError, ToolResult, Tools,
+};
 use aither_mcp::McpServer;
 use aither_mcp::protocol::{
     CallToolParams, CallToolResult, Content, InitializeParams, JsonRpcMessage, JsonRpcNotification,
@@ -1016,7 +1018,7 @@ async fn bind(path: &Path) -> Result<async_net::unix::UnixListener> {
 /// `daemon/release`. The public socket wraps the daemon set with the
 /// forwarding dispatch, so calls for sessions an older generation still
 /// owns reach it.
-fn local_tools(state: &Arc<AppState>, internal: bool) -> aither_core::Result<Tools> {
+fn local_tools(state: &Arc<AppState>, internal: bool) -> Result<Tools> {
     let mut tools = build_tools(state.clone())?;
     crate::tools::register_daemon_tools(&mut tools, state.clone())?;
     if internal {
@@ -1060,7 +1062,7 @@ async fn serve_connection(
 // ---------------------------------------------------------------------------
 
 /// Register the generation-protocol tools.
-fn register_internal_tools(tools: &mut Tools, state: Arc<AppState>) -> aither_core::Result<()> {
+fn register_internal_tools(tools: &mut Tools, state: Arc<AppState>) -> Result<()> {
     tools.register(TakeoverTool(state.clone()))?;
     tools.register(HandoffTool(state.clone()))?;
     tools.register(ReleaseTool(state))?;
@@ -1083,8 +1085,9 @@ impl Tool for TakeoverTool {
     }
     type Arguments = TakeoverArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: TakeoverArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: TakeoverArgs, _cx: ToolContext) -> Result<ToolResult> {
         let state = &self.0;
         // The liveness connection to the successor: its private listener
         // is bound before it calls this, and the connection closes when
@@ -1104,8 +1107,7 @@ impl Tool for TakeoverTool {
             return Err(Error::io(
                 "already superseded",
                 std::io::Error::other("two successors"),
-            )
-            .into());
+            ));
         }
         *state.handover.next.lock().expect("next poisoned") = Some(args.socket.clone());
         let own_socket = state
@@ -1266,8 +1268,9 @@ impl Tool for HandoffTool {
     }
     type Arguments = HandoffArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: HandoffArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: HandoffArgs, _cx: ToolContext) -> Result<ToolResult> {
         let state = &self.0;
         // Superseded itself: the session is relayed to the newer
         // generation rather than resumed here.
@@ -1312,7 +1315,7 @@ impl Tool for HandoffTool {
                 .expect("resuming poisoned")
                 .remove(&session_id);
             state.handover.progressed.notify_waiters();
-            return Err(error.into());
+            return Err(error);
         }
         state
             .handover
@@ -1347,8 +1350,9 @@ impl Tool for ReleaseTool {
     }
     type Arguments = ReleaseArgs;
     type Res = ToolResult;
+    type Error = Error;
 
-    async fn call(&self, args: ReleaseArgs, _cx: ToolContext) -> aither_core::Result<ToolResult> {
+    async fn call(&self, args: ReleaseArgs, _cx: ToolContext) -> Result<ToolResult> {
         let state = &self.0;
         let next = state.handover.next.lock().expect("next poisoned").clone();
         if let Some(next) = next {
@@ -1398,8 +1402,8 @@ struct RelayRelease<'a> {
 
 /// Relay one generation-protocol call to the newer daemon that
 /// superseded this one and pass its result back.
-async fn relay(next: &Path, tool: &str, args: Value) -> aither_core::Result<Value> {
-    peer_json(next, tool, args).await.map_err(Into::into)
+async fn relay(next: &Path, tool: &str, args: Value) -> Result<Value> {
+    peer_json(next, tool, args).await
 }
 
 /// A relayed session left this daemon's forwarding map: wake the
@@ -1466,7 +1470,7 @@ const SESSION_TOOLS: &[&str] = &[
 /// Wrap the local tool set so session-addressed calls forward to the
 /// daemon that still owns the session. Every tool is re-registered as a
 /// dynamic handler that either forwards or delegates to the local set.
-fn forwarding_tools(state: &Arc<AppState>) -> aither_core::Result<Tools> {
+fn forwarding_tools(state: &Arc<AppState>) -> Result<Tools> {
     let inner = Arc::new(local_tools(state, false)?);
     let mut tools = Tools::new();
     for definition in inner.definitions() {
@@ -1542,7 +1546,7 @@ async fn dispatch(
     name: String,
     args: String,
     mut cx: ToolContext,
-) -> aither_core::Result<ToolResult> {
+) -> std::result::Result<ToolResult, ToolDispatchError> {
     let listening = cx.is_listening();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
     let pipe = tokio::spawn(async move {
@@ -1554,6 +1558,11 @@ async fn dispatch(
     let _ = pipe.await;
     result
 }
+
+/// A `wait_any` dispatch branch: the local registry's call or a peer's.
+type DispatchCall<'a> = std::pin::Pin<
+    Box<dyn Future<Output = std::result::Result<ToolResult, ToolDispatchError>> + Send + 'a>,
+>;
 
 /// The dispatch loop behind [`dispatch`]: classify the call's sessions,
 /// wait out a mid-resume one, forward foreign ones, run local ones.
@@ -1568,7 +1577,7 @@ async fn dispatch_inner(
     args: &str,
     listening: bool,
     tx: tokio::sync::mpsc::UnboundedSender<Progress>,
-) -> aither_core::Result<ToolResult> {
+) -> std::result::Result<ToolResult, ToolDispatchError> {
     let parsed: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
     let ids = call_sessions(name, &parsed);
     for _ in 0..DISPATCH_ATTEMPTS {
@@ -1627,18 +1636,17 @@ async fn dispatch_inner(
                         if !still_owned(state, socket, kept) {
                             continue;
                         }
-                        return Err(error.into());
+                        return Err(ToolDispatchError::Execution {
+                            tool: name.to_owned(),
+                            source: Box::new(error),
+                        });
                     }
                 }
             }
             // `wait_any` mixing local and foreign sessions: every
             // branch watches its subset; the first answer wins.
             _ => {
-                let mut calls: Vec<
-                    std::pin::Pin<
-                        Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send + '_>,
-                    >,
-                > = Vec::new();
+                let mut calls: Vec<DispatchCall<'_>> = Vec::new();
                 if !local.is_empty() {
                     let mut subset = parsed.clone();
                     subset["session_ids"] = json!(local);
@@ -1680,9 +1688,10 @@ async fn dispatch_inner(
             }
         }
     }
-    Err(aither_core::Error::msg(
-        "handover dispatch did not settle: the session keeps moving",
-    ))
+    Err(ToolDispatchError::Execution {
+        tool: name.to_owned(),
+        source: Box::new(Error::HandoverDidNotSettle),
+    })
 }
 
 /// Where a call for one session goes right now.
@@ -1748,17 +1757,20 @@ fn owner_gone(state: &AppState, socket: &Path) {
     }
 }
 
-/// `peer_call` mapped onto the local result type.
+/// `peer_call` mapped onto the dispatch result type.
 async fn peer_result(
     socket: &Path,
     name: &str,
     args: Value,
     mut cx: ToolContext,
-) -> aither_core::Result<ToolResult> {
+) -> std::result::Result<ToolResult, ToolDispatchError> {
     peer_call(socket, name, args, &mut cx)
         .await
         .map(|result| tool_result(&result))
-        .map_err(aither_core::Error::from)
+        .map_err(|source| ToolDispatchError::Execution {
+            tool: name.to_owned(),
+            source: Box::new(source),
+        })
 }
 
 /// Whether every id in `kept` still routes to `socket`'s daemon — false
